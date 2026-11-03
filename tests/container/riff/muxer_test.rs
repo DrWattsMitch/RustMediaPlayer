@@ -1,6 +1,6 @@
-use ffmpreg::container::riff::muxer::RiffMuxer;
-use ffmpreg::core::{CodecId, Metadata, Muxer, Packet, Stream, StreamId};
-use ffmpreg::io::Io;
+use rmp::container::riff::muxer::RiffMuxer;
+use rmp::core::{CodecId, Metadata, Muxer, Packet, Stream, StreamId};
+use rmp::io::Io;
 
 #[test]
 fn wav_muxer_writes_valid_header_and_payload() {
@@ -55,12 +55,12 @@ fn wav_muxer_stores_metadata_even_when_container_does_not_write_it_yet() {
 	let mut muxer = RiffMuxer::new(Box::new(io));
 
 	let metadata =
-		Metadata { title: Some("demo".into()), artist: Some("ffmpreg".into()), ..Default::default() };
+		Metadata { title: Some("demo".into()), artist: Some("rmp".into()), ..Default::default() };
 
 	muxer.set_metadata(metadata).unwrap();
 
 	assert_eq!(muxer.metadata().title.as_deref(), Some("demo"));
-	assert_eq!(muxer.metadata().artist.as_deref(), Some("ffmpreg"));
+	assert_eq!(muxer.metadata().artist.as_deref(), Some("rmp"));
 }
 
 #[test]
@@ -125,23 +125,23 @@ impl SharedIo {
 }
 
 impl Io for SharedIo {
-	fn read(&mut self, buf: &mut [u8]) -> ffmpreg::Result<usize> {
+	fn read(&mut self, buf: &mut [u8]) -> rmp::Result<usize> {
 		self.inner.lock().unwrap().read(buf)
 	}
 
-	fn write(&mut self, buf: &[u8]) -> ffmpreg::Result<usize> {
+	fn write(&mut self, buf: &[u8]) -> rmp::Result<usize> {
 		self.inner.lock().unwrap().write(buf)
 	}
 
-	fn write_all(&mut self, buf: &[u8]) -> ffmpreg::Result<()> {
+	fn write_all(&mut self, buf: &[u8]) -> rmp::Result<()> {
 		self.inner.lock().unwrap().write_all(buf)
 	}
 
-	fn seek(&mut self, pos: u64) -> ffmpreg::Result<()> {
+	fn seek(&mut self, pos: u64) -> rmp::Result<()> {
 		self.inner.lock().unwrap().seek(pos)
 	}
 
-	fn size(&self) -> ffmpreg::Result<u64> {
+	fn size(&self) -> rmp::Result<u64> {
 		self.inner.lock().unwrap().size()
 	}
 }
@@ -153,7 +153,7 @@ struct BufferIo {
 }
 
 impl Io for BufferIo {
-	fn read(&mut self, buf: &mut [u8]) -> ffmpreg::Result<usize> {
+	fn read(&mut self, buf: &mut [u8]) -> rmp::Result<usize> {
 		if self.cursor >= self.data.len() {
 			return Ok(0);
 		}
@@ -164,7 +164,7 @@ impl Io for BufferIo {
 		Ok(n)
 	}
 
-	fn write(&mut self, buf: &[u8]) -> ffmpreg::Result<usize> {
+	fn write(&mut self, buf: &[u8]) -> rmp::Result<usize> {
 		let end = self.cursor + buf.len();
 		if end > self.data.len() {
 			self.data.resize(end, 0);
@@ -174,12 +174,12 @@ impl Io for BufferIo {
 		Ok(buf.len())
 	}
 
-	fn seek(&mut self, pos: u64) -> ffmpreg::Result<()> {
+	fn seek(&mut self, pos: u64) -> rmp::Result<()> {
 		self.cursor = pos as usize;
 		Ok(())
 	}
 
-	fn size(&self) -> ffmpreg::Result<u64> {
+	fn size(&self) -> rmp::Result<u64> {
 		Ok(self.data.len() as u64)
 	}
 }

@@ -223,7 +223,7 @@ impl Demuxer for RiffDemuxer {
 		data.truncate(n);
 		self.remaining -= n as u64;
 
-		Ok(Some(Packet { stream_id: StreamId(0), data, pts: None, dts: None, duration: None }))
+		Ok(Some(Packet::new(StreamId(0), data)))
 	}
 
 	fn streams(&self) -> &StreamSet {

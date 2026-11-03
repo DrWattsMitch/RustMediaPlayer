@@ -51,6 +51,10 @@ pub struct Parameters {
 	pub width: Option<u32>,
 	pub height: Option<u32>,
 	pub pixel_format: Option<String>,
+	/// Codec-specific configuration bytes (FFmpeg's `extradata`): e.g. the
+	/// `avcC` record for H.264 or the AudioSpecificConfig for AAC. Empty when
+	/// the codec needs none.
+	pub extradata: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +110,7 @@ impl Stream {
 				width: Some(width),
 				height: Some(height),
 				pixel_format: Some(pixel_format.to_string()),
+				extradata: Vec::new(),
 			},
 			metadata: Metadata::default(),
 		}
@@ -126,6 +131,7 @@ impl Stream {
 				width: None,
 				height: None,
 				pixel_format: None,
+				extradata: Vec::new(),
 			},
 			metadata: Metadata::default(),
 		}

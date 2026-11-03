@@ -28,6 +28,7 @@ impl core::Encoder for Encoder {
 				pts: frame.pts,
 				dts: frame.pts,
 				duration: None,
+				keyframe: true,
 			},
 			Frame::Video(frame) => Packet {
 				stream_id: self.stream_id,
@@ -35,6 +36,7 @@ impl core::Encoder for Encoder {
 				pts: frame.pts,
 				dts: frame.pts,
 				duration: None,
+				keyframe: frame.keyframe == Keyframe::Key,
 			},
 		};
 

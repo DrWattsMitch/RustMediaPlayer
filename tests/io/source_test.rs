@@ -1,4 +1,4 @@
-use ffmpreg::io::source::{Source, parse_source};
+use rmp::io::source::{Source, parse_source};
 
 #[test]
 fn parse_source_detects_file_path() {

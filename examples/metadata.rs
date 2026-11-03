@@ -1,7 +1,7 @@
-use ffmpreg::Result;
-use ffmpreg::core::traits::{Demuxer, Muxer};
-use ffmpreg::core::{Metadata, Stream};
-use ffmpreg::io::{Input, Output};
+use rmp::Result;
+use rmp::core::traits::{Demuxer, Muxer};
+use rmp::core::{Metadata, Stream};
+use rmp::io::{Input, Output};
 
 pub fn main() -> Result<()> {
 	let input = Input::open("./playground/your_name_sparkle.wav")?;
@@ -20,8 +20,7 @@ pub fn main() -> Result<()> {
 		..Default::default()
 	})?;
 
-	let mut stream =
-		Stream::audio(0usize.into(), 48_000, 2, ffmpreg::core::CodecId::new("pcm_s16le"));
+	let mut stream = Stream::audio(0usize.into(), 48_000, 2, rmp::core::CodecId::new("pcm_s16le"));
 	stream.metadata = Metadata {
 		title: Some("stream title".into()),
 		comment: Some("audio stream".into()),

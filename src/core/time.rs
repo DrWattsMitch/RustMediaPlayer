@@ -32,6 +32,23 @@ impl Time {
 		Self { ticks, base }
 	}
 
+	/// Raw tick count, expressed in [`Time::base`] units.
+	pub const fn ticks(&self) -> u64 {
+		self.ticks
+	}
+
+	pub const fn base(&self) -> TimeBase {
+		self.base
+	}
+
+	/// Converts this timestamp to another time base, rounding to nearest
+	/// (FFmpeg's `av_rescale_q`). Uses 128-bit intermediates so it cannot
+	/// overflow; returns `None` only if a time base has a zero component or the
+	/// result does not fit in `u64`.
+	pub fn rescale(&self, to: TimeBase) -> Option<Time> {
+		rescale_ticks(self.ticks, self.base, to).map(|ticks| Time { ticks, base: to })
+	}
+
 	pub const fn as_seconds(&self) -> f64 {
 		self.ticks as f64 * (self.base.num as f64) / (self.base.den as f64)
 	}
@@ -72,4 +89,15 @@ impl fmt::Display for Time {
 		let (hour, minutes, seconds, _) = self.unpack();
 		write!(f, "{:02}:{:02}:{:02}", hour, minutes, seconds)
 	}
+}
+
+/// Rescales `ticks` from one time base to another with round-to-nearest,
+/// using 128-bit arithmetic (no overflow for any `u64` input).
+pub fn rescale_ticks(ticks: u64, from: TimeBase, to: TimeBase) -> Option<u64> {
+	if from.den == 0 || to.num == 0 {
+		return None;
+	}
+	let num = u128::from(ticks) * u128::from(from.num) * u128::from(to.den);
+	let den = u128::from(from.den) * u128::from(to.num);
+	u64::try_from((num + den / 2) / den).ok()
 }

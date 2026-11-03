@@ -1,4 +1,4 @@
-use crate::codecs::raw;
+use crate::codecs::{mp3, raw};
 use crate::core::{CodecId, Decoder, Demuxer, Encoder, Muxer, Stream};
 
 #[derive(Debug, Clone, Default)]
@@ -26,8 +26,13 @@ impl Resolver {
 		Self
 	}
 
+	/// Picks a decoder by codec id. Codecs without a dedicated decoder fall
+	/// back to the raw pass-through decoder.
 	pub fn decoder_for(&self, stream: &Stream) -> Option<Box<dyn Decoder>> {
-		Some(Box::new(raw::decoder::Decoder::new(stream.kind)))
+		match stream.parameters.codec.id.as_str() {
+			"mp3" => Some(Box::new(mp3::Mp3Decoder::new())),
+			_ => Some(Box::new(raw::decoder::Decoder::new(stream.kind))),
+		}
 	}
 
 	pub fn encoder_for(&self, stream: &Stream) -> Option<Box<dyn Encoder>> {

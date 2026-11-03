@@ -19,6 +19,19 @@ pub struct VideoState {
 	pub codec_state: CodecState,
 }
 
+/// Codec-private decoder/encoder state (FFmpeg's `priv_data`).
+///
+/// Stateless codecs (raw, PCM) use [`CodecPrivate::None`]. Codecs that must
+/// carry history between packets (e.g. the MP3 bit reservoir and filterbank
+/// overlap) get a typed variant here instead of hiding bytes in `buffer`, so
+/// the state stays type-checked and `Clone`.
+#[derive(Debug, Clone, Default)]
+pub enum CodecPrivate {
+	#[default]
+	None,
+	Mp3(Box<crate::codecs::mp3::Mp3DecoderState>),
+}
+
 #[derive(Debug, Clone)]
 pub struct AudioState {
 	pub sample_rate: u32,
@@ -32,6 +45,7 @@ pub struct AudioState {
 	pub samples_produced: u64,
 
 	pub buffer: Vec<u8>,
+	pub private: CodecPrivate,
 }
 
 #[derive(Debug, Clone)]

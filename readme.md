@@ -1,29 +1,36 @@
-FFmpReg is a rust-native multimedia toolkit that decodes, transforms, and
+# RMP (Rust Media Player)
+
+RMP is a Rust-native multimedia toolkit that decodes, transforms, and
 encodes audio and video without requiring FFmpeg. It provides both a
 command-line interface and a library API, allowing you to process media files
 directly from the terminal or integrate media processing into Rust applications.
 The project aims to deliver a safe, deterministic, and modular media processing
 engine with a focus on explicit pipelines and developer control.
 
-[Sponsoring](#sponsoring) | [License](/LICENSE) | [Discord](https://discord.gg/eF7WgdSc2v)
+RMP is a fork of [FFmpReg](https://github.com/yazaldefilimone/ffmpreg) by
+Yazalde Filimone. It builds on FFmpReg's foundation and expands the set of
+supported container formats and codecs, following the algorithms and
+performance standards of FFmpeg, redesigned for Rust and written in safe Rust.
+
+[Fork Notice](#fork-notice) | [License](/LICENSE) | [Upstream FFmpReg](https://github.com/yazaldefilimone/ffmpreg)
 
 ## Installation
 
 To install the command-line tool, run:
 
 ```bash
-cargo install ffmpreg
+cargo install rmp
 ```
 
-This downloads and compiles `ffmpreg`, placing the binary in your Cargo bin
+This downloads and compiles `rmp`, placing the binary in your Cargo bin
 directory.
 
-To use `ffmpreg` as a library in your Rust project, add it to your `Cargo.toml`
+To use `rmp` as a library in your Rust project, add it to your `Cargo.toml`
 dependencies:
 
 ```toml
 [dependencies]
-ffmpreg = "0.1"
+rmp = "0.2"
 ```
 
 ## Getting Started
@@ -32,7 +39,7 @@ The simplest operation is transcoding a file from one format to another. For
 example, reading a WAV file and writing it back:
 
 ```bash
-ffmpreg -i input.wav -o output.wav
+rmp -i input.wav -o output.wav
 ```
 
 You can apply transforms to modify the media during processing. Transforms
@@ -40,7 +47,7 @@ execute in the order they appear and can perform operations such as gain
 adjustment or normalization:
 
 ```bash
-ffmpreg -i input.wav -o output.wav --apply gain=2.0 --apply normalize
+rmp -i input.wav -o output.wav --apply gain=2.0 --apply normalize
 ```
 
 To inspect a media file without transcoding, use the `--show` flag. This prints
@@ -48,7 +55,7 @@ frame-level metadata, similar to `ffprobe`, including timing, sample count,
 channel configuration, and sample rate:
 
 ```bash
-ffmpreg -i input.wav --show
+rmp -i input.wav --show
 ```
 
 Output example:
@@ -62,7 +69,7 @@ Batch processing is supported using glob patterns. Each file is processed
 independently, enabling parallel execution:
 
 ```bash
-ffmpreg -i "folder/*.wav" -o out/
+rmp -i "folder/*.wav" -o out/
 ```
 
 ## Library
@@ -74,9 +81,9 @@ transforms, encodes the frames, and writes them to an output container.
 Example WAV transcoding pipeline:
 
 ```rust
-use ffmpreg::container::{WavReader, WavWriter};
-use ffmpreg::codecs::{PcmDecoder, PcmEncoder};
-use ffmpreg::core::{Decoder, Encoder, Demuxer, Muxer, Timebase};
+use rmp::container::{WavReader, WavWriter};
+use rmp::codecs::{PcmDecoder, PcmEncoder};
+use rmp::core::{Decoder, Encoder, Demuxer, Muxer, Timebase};
 use std::fs::File;
 
 fn main() -> std::io::Result<()> {
@@ -146,8 +153,8 @@ peak.
 Example of applying transforms:
 
 ```rust
-use ffmpreg::transform::{Gain, Normalize};
-use ffmpreg::core::Transform;
+use rmp::transform::{Gain, Normalize};
+use rmp::core::Transform;
 
 let mut gain = Gain::new(2.0);
 let mut normalize = Normalize::new(0.95);
@@ -182,25 +189,43 @@ impl Transform for Invert {
 CLI transforms are specified as `name=value` pairs:
 
 ```bash
-ffmpreg -i input.wav -o output.wav --apply gain=1.5 --apply normalize=0.9
+rmp -i input.wav -o output.wav --apply gain=1.5 --apply normalize=0.9
 ```
 
 ## Formats
 
+Containers:
+
 - **WAV**: uncompressed audio, suitable for lossless pipelines.
 - **Y4M**: raw video frames with a text-based header.
+- **MP3**: MPEG-1/2/2.5 audio streams with ID3v1/ID3v2 tags, Xing/Info/VBRI
+  headers (exact duration, VBR seeking) and LAME gapless info. Demux and mux.
+- **MP4 / M4A / MOV**: ISO BMFF with any number of tracks, B-frame timing,
+  edit lists, keyframe seeking and iTunes metadata/cover art. Demux, and mux
+  for H.264, HEVC, AV1, MPEG-4, AAC, MP3, ALAC, Opus and FLAC.
 
 Codecs:
 
 - **PCM**: uncompressed 16-bit audio, multi-channel support.
 - **ADPCM**: adaptive differential audio compression.
 - **Raw video**: passes through YUV frame data unchanged.
+- **MP3 (MPEG audio Layer III)**: decoder to 16-bit PCM, within ±1 LSB of
+  FFmpeg.
+
+See [docs/MP3_MP4.md](docs/MP3_MP4.md) for how MP3/MP4 support works and how to
+extend it. Try it with the examples:
+
+```bash
+cargo run --release --example probe      -- input.mp4
+cargo run --release --example remux      -- input.mp4 output.m4a
+cargo run --release --example mp3_to_wav -- input.mp3 output.wav
+```
 
 Video processing follows the same pipeline as audio:
 
 ```rust
-use ffmpreg::container::{Y4mReader, Y4mWriter};
-use ffmpreg::codecs::{RawVideoDecoder, RawVideoEncoder};
+use rmp::container::{Y4mReader, Y4mWriter};
+use rmp::codecs::{RawVideoDecoder, RawVideoEncoder};
 
 let input = File::open("input.y4m")?;
 let mut reader = Y4mReader::new(input)?;
@@ -224,25 +249,21 @@ println!("Frame rate: {}/{}", format.framerate_num, format.framerate_den);
 - `--apply`: add transform to pipeline (multiple allowed).
 - `--codec`: select output codec (default matches input).
 
-## Sponsoring
+## Fork Notice
 
-FFmpReg is an open-source project released under the [Apache 2.0](/LICENSE) License,
-free for any use, including commercial.
-A permissive license helps the project grow and be useful for everyone.
+RMP is a fork of [FFmpReg](https://github.com/yazaldefilimone/ffmpreg),
+created by Yazalde Filimone and released under the
+[Apache 2.0](/LICENSE) License. The original copyright and license are
+preserved, and this fork is distributed under the same terms.
 
-This project takes a huge amount of work,
-studying codec algorithms and implementing them from scratch.
-
-Your support helps cover internet, energy, and tools,
-and keeps me coding full-time for the community ^-^
-
-If you decide on a one-time contribution of $500 or more, and there’s something I can help you with, please let me know!
-
-[Support me on Ko-fi](https://ko-fi.com/yazaldefilimone)
+FFmpReg supports WAV and Y4M containers and the PCM, ADPCM, and raw video
+codecs. RMP extends that with additional file types and codecs, starting with
+MP3 and MP4. If you find FFmpReg useful, please consider supporting the original
+author on [Ko-fi](https://ko-fi.com/yazaldefilimone).
 
 ## Versioning
 
-FFmpReg uses `MAJOR.MINOR.PATCH`.
+RMP uses `MAJOR.MINOR.PATCH`.
 
 - **MAJOR**: incompatible API changes or major new features
 - **MINOR**: new features compatible with existing APIs
@@ -254,7 +275,7 @@ Release tags reflect tested versions; dev branches evolve faster.
 
 ## Goals
 
-FFmpReg aims to be a safe, reliable, and maintainable Rust-native alternative
+RMP aims to be a safe, reliable, and maintainable Rust-native alternative
 to FFmpeg. The project emphasizes deterministic and explicit pipelines, clear
 developer control, and minimal runtime surprises. All development prioritizes
 safety by avoiding `unsafe` code wherever possible, minimizing `unwrap`
@@ -262,6 +283,3 @@ usage, reducing panics, and keeping external dependencies to a minimum. The
 goal is to provide a high-performance media processing engine that is easy to
 understand, integrate, and extend while maintaining strong Rust safety
 guarantees.
-
-[![Star History Chart](https://api.star-history.com/chart?repos=yazaldefilimone/ffmpreg&type=date&legend=top-left)](https://www.star-history.com/?repos=yazaldefilimone%2Fffmpreg&type=date&legend=top-left)
-

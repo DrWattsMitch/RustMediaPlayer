@@ -1,4 +1,4 @@
-use ffmpreg::io::{HttpIo, Io};
+use rmp::io::{HttpIo, Io};
 
 const BASE_URL: &str = "https://samplefile.com/samples/download/audio/wav";
 const FIXTURE_DIR: &str = "tests/fixtures/wav";

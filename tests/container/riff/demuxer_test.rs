@@ -1,6 +1,6 @@
-use ffmpreg::container::riff::demuxer::RiffDemuxer;
-use ffmpreg::core::{Demuxer, StreamId};
-use ffmpreg::io::Io;
+use rmp::container::riff::demuxer::RiffDemuxer;
+use rmp::core::{Demuxer, StreamId};
+use rmp::io::Io;
 
 #[test]
 fn wav_demuxer_reads_fmt_and_data_even_with_list_chunk() {
@@ -168,7 +168,7 @@ impl CursorIo {
 }
 
 impl Io for CursorIo {
-	fn read(&mut self, buf: &mut [u8]) -> ffmpreg::Result<usize> {
+	fn read(&mut self, buf: &mut [u8]) -> rmp::Result<usize> {
 		if self.cursor >= self.data.len() {
 			return Ok(0);
 		}
@@ -180,12 +180,12 @@ impl Io for CursorIo {
 		Ok(n)
 	}
 
-	fn seek(&mut self, pos: u64) -> ffmpreg::Result<()> {
+	fn seek(&mut self, pos: u64) -> rmp::Result<()> {
 		self.cursor = pos as usize;
 		Ok(())
 	}
 
-	fn write(&mut self, _buf: &[u8]) -> ffmpreg::Result<usize> {
+	fn write(&mut self, _buf: &[u8]) -> rmp::Result<usize> {
 		unreachable!("write is not used in demuxer tests")
 	}
 }

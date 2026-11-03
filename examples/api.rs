@@ -1,9 +1,9 @@
-use ffmpreg::Result;
-use ffmpreg::core::Context;
-use ffmpreg::core::Resolver;
-use ffmpreg::core::StreamHashMap;
-use ffmpreg::core::traits::*;
-use ffmpreg::io::{Input, Output};
+use rmp::Result;
+use rmp::core::Context;
+use rmp::core::Resolver;
+use rmp::core::StreamHashMap;
+use rmp::core::traits::*;
+use rmp::io::{Input, Output};
 
 pub fn main() -> Result<()> {
 	let mut demuxer = Input::open("./playground/your_name_sparkle.wav")?;

@@ -1,5 +1,5 @@
-use ffmpreg::core::{Demuxer, Muxer};
-use ffmpreg::io::{Input, Output};
+use rmp::core::{Demuxer, Muxer};
+use rmp::io::{Input, Output};
 
 #[test]
 fn wav_fixtures_expose_expected_stream_metadata() {
@@ -53,7 +53,7 @@ fn wav_fixtures_roundtrip_payload_without_loss() {
 		let output_path = dir.path().join(case.output_name);
 		let mut output = Output::create(&output_path).unwrap();
 		output.add(&source_stream).unwrap();
-		output.write(ffmpreg::core::Packet::new(0usize.into(), source_payload.clone())).unwrap();
+		output.write(rmp::core::Packet::new(0usize.into(), source_payload.clone())).unwrap();
 		output.finish().unwrap();
 
 		let mut roundtrip = Input::open(output_path.to_str().unwrap()).unwrap();

@@ -1,4 +1,4 @@
-use ffmpreg::io::{File, Io};
+use rmp::io::{File, Io};
 
 #[test]
 fn file_io_can_write_seek_and_read_back() {

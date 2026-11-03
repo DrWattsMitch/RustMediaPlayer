@@ -1,6 +1,6 @@
-use ffmpreg::Result;
-use ffmpreg::core::traits::*;
-use ffmpreg::io::{Input, Output};
+use rmp::Result;
+use rmp::core::traits::*;
+use rmp::io::{Input, Output};
 
 const URL: &str = "https://samplefile.com/samples/download/audio/wav/wav_stereo_44k_mix_sample.wav";
 const FILE: &str = "./playground/input.wav";

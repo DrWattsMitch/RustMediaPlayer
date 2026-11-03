@@ -15,6 +15,7 @@ pub fn audio_state(params: &Parameters) -> State {
 		samples_consumed: 0,
 		samples_produced: 0,
 		buffer: Vec::new(),
+		private: CodecPrivate::None,
 	})
 }
 
