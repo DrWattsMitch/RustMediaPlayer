@@ -17,6 +17,7 @@ pub struct VideoState {
 	pub has_keyframe: bool,
 
 	pub codec_state: CodecState,
+	pub private: CodecPrivate,
 }
 
 /// Codec-private decoder/encoder state (FFmpeg's `priv_data`).
@@ -30,6 +31,8 @@ pub enum CodecPrivate {
 	#[default]
 	None,
 	Mp3(Box<crate::codecs::mp3::Mp3DecoderState>),
+	Aac(Box<crate::codecs::aac::AacDecoderState>),
+	H264(Box<crate::codecs::h264::H264DecoderState>),
 }
 
 #[derive(Debug, Clone)]

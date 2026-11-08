@@ -29,6 +29,7 @@ pub fn video_state(params: &Parameters) -> State {
 		reorder: Vec::new(),
 		has_keyframe: false,
 		codec_state,
+		private: CodecPrivate::None,
 	})
 }
 

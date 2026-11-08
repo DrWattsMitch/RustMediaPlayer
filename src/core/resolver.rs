@@ -1,4 +1,4 @@
-use crate::codecs::{mp3, raw};
+use crate::codecs::{aac, h264, mp3, raw};
 use crate::core::{CodecId, Decoder, Demuxer, Encoder, Muxer, Stream};
 
 #[derive(Debug, Clone, Default)]
@@ -31,6 +31,8 @@ impl Resolver {
 	pub fn decoder_for(&self, stream: &Stream) -> Option<Box<dyn Decoder>> {
 		match stream.parameters.codec.id.as_str() {
 			"mp3" => Some(Box::new(mp3::Mp3Decoder::new())),
+			"aac" => Some(Box::new(aac::AacDecoder::new())),
+			"h264" => Some(Box::new(h264::H264Decoder::new())),
 			_ => Some(Box::new(raw::decoder::Decoder::new(stream.kind))),
 		}
 	}
