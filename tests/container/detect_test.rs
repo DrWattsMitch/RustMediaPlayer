@@ -11,6 +11,10 @@ fn detects_each_format_from_its_first_bytes() {
 		("mp4/h264_bframes_aac.mp4", "h264"),
 		("mp4/aac_tagged_cover.m4a", "aac"),
 		("wav/wav_mono_8khz_tone_sample.wav", "pcm_s16le"),
+		("wav/pcm/alaw.wav", "pcm_alaw"),
+		("wav/adpcm/ima_stereo_22k.wav", "adpcm_ima_wav"),
+		("wav/adpcm/ms_mono_8k.wav", "adpcm_ms"),
+		("y4m/yuv420p_34x18.y4m", "rawvideo"),
 	] {
 		let data = fixture(path);
 		let head = data[..data.len().min(4096)].to_vec();
@@ -33,7 +37,7 @@ fn probes_do_not_claim_other_formats() {
 
 #[test]
 fn selects_muxers_by_extension_and_mime() {
-	for ext in ["mp4", "m4a", "MP4", "mp3"] {
+	for ext in ["mp4", "m4a", "MP4", "mp3", "wav", "y4m", "Y4M"] {
 		let hint = Hint { extension: Some(ext.into()), ..Default::default() };
 		assert!(select_muxer(hint, Box::new(MemoryIo::new())).is_ok(), "{ext}");
 	}

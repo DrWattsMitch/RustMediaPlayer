@@ -21,6 +21,12 @@ mod mp4_demuxer_test;
 #[path = "container/mp4/muxer_test.rs"]
 mod mp4_muxer_test;
 
+#[path = "container/y4m/demuxer_test.rs"]
+mod y4m_demuxer_test;
+
+#[path = "container/y4m/muxer_test.rs"]
+mod y4m_muxer_test;
+
 #[path = "container/detect_test.rs"]
 mod detect_test;
 

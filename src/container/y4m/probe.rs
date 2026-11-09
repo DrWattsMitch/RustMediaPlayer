@@ -2,16 +2,13 @@ use crate::core::{Demuxer, Hint, Muxer};
 use crate::message::Result;
 use crate::{core::Probe, io::Io};
 
-const Y4M_MAGIC: &[u8] = b"YUV4MPEG2";
+use super::header::MAGIC as Y4M_MAGIC;
 
 pub struct Y4mProbe;
 
 impl Probe for Y4mProbe {
 	fn demuxer_matches(data: &[u8]) -> bool {
-		if data.len() < Y4M_MAGIC.len() {
-			return false;
-		}
-		&data[0..Y4M_MAGIC.len()] == Y4M_MAGIC
+		data.starts_with(Y4M_MAGIC)
 	}
 
 	fn muxer_matches(hint: &Hint) -> bool {
@@ -21,17 +18,17 @@ impl Probe for Y4mProbe {
 			}
 		}
 
-		if hint.extension.as_ref().is_some_and(|e| e == "y4m") {
+		if hint.extension.as_ref().is_some_and(|e| e.eq_ignore_ascii_case("y4m")) {
 			return true;
 		}
 		false
 	}
 
-	fn create_demuxer(_io: Box<dyn Io>) -> Result<Box<dyn Demuxer>> {
-		todo!()
+	fn create_demuxer(io: Box<dyn Io>) -> Result<Box<dyn Demuxer>> {
+		Ok(Box::new(super::demuxer::Y4mDemuxer::new(io)?))
 	}
 
-	fn create_muxer(_io: Box<dyn Io>) -> Result<Box<dyn Muxer>> {
-		todo!()
+	fn create_muxer(io: Box<dyn Io>) -> Result<Box<dyn Muxer>> {
+		Ok(Box::new(super::muxer::Y4mMuxer::new(io)))
 	}
 }

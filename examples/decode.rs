@@ -13,8 +13,9 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 
 use rmp::Result;
+use rmp::codecs::pcm::convert::convert;
 use rmp::core::traits::*;
-use rmp::core::{Frame, RawValue, Resolver, Stream, StreamKind};
+use rmp::core::{Frame, RawValue, Resolver, SampleFormat, SampleLayout, Stream, StreamKind};
 use rmp::io::Input;
 
 fn open(path: Option<&String>) -> Result<Option<BufWriter<File>>> {
@@ -69,9 +70,16 @@ pub fn main() -> Result<()> {
 	let mut sink = |frames: Vec<Frame>, samples: &mut usize, pictures: &mut usize| -> Result<()> {
 		for frame in frames {
 			match frame {
-				Frame::Audio(a) => {
+				Frame::Audio(mut a) => {
 					if a.nb_samples == 0 {
 						continue;
+					}
+					// High-resolution PCM decodes to S32/F32/...; convert so the
+					// output is always S16LE, as `ffmpeg -f s16le` would write.
+					if a.format != SampleFormat::S16 || a.is_planar() {
+						a.data = convert(&a, SampleFormat::S16)?;
+						a.format = SampleFormat::S16;
+						a.layout = SampleLayout::Interleaved;
 					}
 					bytes_per_sample = a.data.len() / a.nb_samples;
 					let mut data: &[u8] = &a.data;

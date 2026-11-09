@@ -196,8 +196,10 @@ rmp -i input.wav -o output.wav --apply gain=1.5 --apply normalize=0.9
 
 Containers:
 
-- **WAV**: uncompressed audio, suitable for lossless pipelines.
-- **Y4M**: raw video frames with a text-based header.
+- **WAV**: PCM (8/16/24/32/64-bit integer, 32/64-bit float, A-law, µ-law)
+  and IMA / Microsoft ADPCM. Demux and mux (PCM), with LIST/INFO tags.
+- **Y4M (YUV4MPEG2)**: raw video in 4:2:0, 4:2:2, 4:4:4, 4:1:1, 4:4:4+alpha
+  and grayscale, 8 to 16 bits. Demux and mux, byte-identical to FFmpeg.
 - **MP3**: MPEG-1/2/2.5 audio streams with ID3v1/ID3v2 tags, Xing/Info/VBRI
   headers (exact duration, VBR seeking) and LAME gapless info. Demux and mux.
 - **MP4 / M4A / MOV**: ISO BMFF with any number of tracks, B-frame timing,
@@ -206,39 +208,47 @@ Containers:
 
 Codecs:
 
-- **PCM**: uncompressed 16-bit audio, multi-channel support.
-- **ADPCM**: adaptive differential audio compression.
-- **Raw video**: passes through YUV frame data unchanged.
+- **PCM**: decoder and encoder for every layout above plus big-endian and
+  signed 8-bit; the encoder converts from any sample format. Bit-exact with
+  FFmpeg.
+- **ADPCM**: IMA (`adpcm_ima_wav`) and Microsoft (`adpcm_ms`) decoders,
+  bit-exact with FFmpeg.
+- **Raw video**: passes planar YUV/gray frames through unchanged.
 - **MP3 (MPEG audio Layer III)**: decoder to 16-bit PCM, within ±1 LSB of
   FFmpeg.
+- **AAC-LC** and **H.264** (Baseline/Main/High, 8-bit 4:2:0) decoders.
 
-See [docs/MP3_MP4.md](docs/MP3_MP4.md) for how MP3/MP4 support works and how to
+See [docs/WAV_Y4M.md](docs/WAV_Y4M.md), [docs/MP3_MP4.md](docs/MP3_MP4.md)
+and [docs/AAC_H264.md](docs/AAC_H264.md) for how each part works and how to
 extend it. Try it with the examples:
 
 ```bash
-cargo run --release --example probe      -- input.mp4
-cargo run --release --example remux      -- input.mp4 output.m4a
-cargo run --release --example mp3_to_wav -- input.mp3 output.wav
+cargo run --release --example probe       -- input.mp4
+cargo run --release --example remux       -- input.y4m output.y4m
+cargo run --release --example decode      -- input.wav audio.s16le -
+cargo run --release --example pcm_convert -- input.wav output.wav pcm_s24le
+cargo run --release --example mp3_to_wav  -- input.mp3 output.wav
 ```
 
-Video processing follows the same pipeline as audio:
+Video uses the same pipeline as audio. A Y4M stream is `rawvideo` with its
+layout in `pixel_format`, and each packet is one planar picture:
 
 ```rust
-use rmp::container::{Y4mReader, Y4mWriter};
-use rmp::codecs::{RawVideoDecoder, RawVideoEncoder};
+use rmp::core::traits::*;
+use rmp::io::{Input, Output};
 
-let input = File::open("input.y4m")?;
-let mut reader = Y4mReader::new(input)?;
-let output = File::create("output.y4m")?;
-let mut writer = Y4mWriter::new(output, reader.format().clone())?;
-```
+let mut input = Input::open("input.y4m")?;
+let stream = input.streams().streams[0].clone();
+println!("{}x{} {:?}", stream.parameters.width.unwrap_or(0),
+	stream.parameters.height.unwrap_or(0), stream.parameters.pixel_format);
+println!("frame rate: {}/{}", stream.time_base.den, stream.time_base.num);
 
-Format metadata is accessible via the reader:
-
-```rust
-let format = reader.format();
-println!("Resolution: {}x{}", format.width, format.height);
-println!("Frame rate: {}/{}", format.framerate_num, format.framerate_den);
+let mut output = Output::create("output.y4m")?;
+output.add(&stream)?;
+while let Some(packet) = input.read()? {
+	output.write(packet)?;
+}
+output.finish()?;
 ```
 
 ## CLI Reference
@@ -256,9 +266,9 @@ created by Yazalde Filimone and released under the
 [Apache 2.0](/LICENSE) License. The original copyright and license are
 preserved, and this fork is distributed under the same terms.
 
-FFmpReg supports WAV and Y4M containers and the PCM, ADPCM, and raw video
-codecs. RMP extends that with additional file types and codecs, starting with
-MP3 and MP4. If you find FFmpReg useful, please consider supporting the original
+FFmpReg set out to support WAV and Y4M containers and the PCM, ADPCM, and raw
+video codecs. RMP completes those and extends them with additional file types
+and codecs, starting with MP3, MP4, AAC and H.264. If you find FFmpReg useful, please consider supporting the original
 author on [Ko-fi](https://ko-fi.com/yazaldefilimone).
 
 ## Versioning

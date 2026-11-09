@@ -1,3 +1,4 @@
+use crate::Message;
 use crate::core::{Metadata, Muxer, Packet, Stream};
 use crate::io::Io;
 use crate::message::Result;
@@ -50,13 +51,24 @@ impl RiffMuxer {
 	}
 
 	fn finalize(&mut self) -> Result<()> {
-		let file_size = 36 + self.written;
+		let data_size =
+			u32::try_from(self.written).map_err(|_| Message::Container("wav data exceeds 4 GiB"))?;
+		// RIFF chunks are word-aligned: an odd-sized data chunk gets a pad byte.
+		let pad = self.written & 1;
+		if pad == 1 {
+			self.io.write_all(&[0])?;
+		}
+		// RIFF size counts everything after its own 8-byte header, including
+		// the LIST chunk written before `data`.
+		let riff_size = self.data_size_offset + 4 + self.written + pad - 8;
+		let riff_size =
+			u32::try_from(riff_size).map_err(|_| Message::Container("wav data exceeds 4 GiB"))?;
 
 		self.io.seek(4)?;
-		self.io.write_all(&(file_size as u32).to_le_bytes())?;
+		self.io.write_all(&riff_size.to_le_bytes())?;
 
 		self.io.seek(self.data_size_offset)?;
-		self.io.write_all(&(self.written as u32).to_le_bytes())?;
+		self.io.write_all(&data_size.to_le_bytes())?;
 
 		Ok(())
 	}
@@ -144,8 +156,11 @@ fn wav_format_from_codec(codec: &str) -> Result<(u16, u16)> {
 		"pcm_s16" | "pcm_s16le" => Ok((1, 16)),
 		"pcm_s24" | "pcm_s24le" => Ok((1, 24)),
 		"pcm_s32" | "pcm_s32le" => Ok((1, 32)),
+		"pcm_s64" | "pcm_s64le" => Ok((1, 64)),
 		"pcm_f32" | "pcm_f32le" => Ok((3, 32)),
 		"pcm_f64" | "pcm_f64le" => Ok((3, 64)),
+		"pcm_alaw" => Ok((6, 8)),
+		"pcm_mulaw" => Ok((7, 8)),
 		_ => Err("unsupported wav codec".into()),
 	}
 }

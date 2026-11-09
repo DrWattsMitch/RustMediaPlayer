@@ -25,3 +25,24 @@ ff -f lavfi -i "sine=f=440:d=1:sample_rate=44100" -i /tmp/rmp_cover.png -map 0 -
 	-disposition:v attached_pic -metadata title="Song" -metadata artist="Band" -metadata album="Record" \
 	-metadata track="2/9" -metadata disc="1/2" -metadata genre="Jazz" -metadata date=2023 -metadata comment="m4a fixture" \
 	mp4/aac_tagged_cover.m4a
+
+# --- WAV (PCM layouts, ADPCM) and Y4M: need only FFmpeg's built-in codecs. ---
+mkdir -p wav/pcm wav/adpcm y4m
+# One 16-bit source; every PCM layout is FFmpeg's encode of it, so the PCM
+# tests check both directions (decode -> reference, encode source -> fixture).
+ff -f lavfi -i "aevalsrc='0.9*sin(2*PI*440*t)+0.1*sin(2*PI*3000*t)':s=8000:d=0.1" -c:a pcm_s16le wav/pcm/s16le.wav
+for codec in u8 s24le s32le s64le f32le f64le alaw mulaw; do
+	ff -i wav/pcm/s16le.wav -c:a pcm_$codec wav/pcm/$codec.wav
+done
+for f in wav/pcm/*.wav; do ff -i "$f" -f s16le "${f%.wav}.ffmpeg.s16le"; done
+
+ff -f lavfi -i "aevalsrc='0.6*sin(2*PI*440*t)+0.2*sin(2*PI*2500*t)*lt(mod(t,0.1),0.02)|0.5*sin(2*PI*660*t)':s=22050:d=0.25" \
+	-c:a adpcm_ima_wav wav/adpcm/ima_stereo_22k.wav
+ff -f lavfi -i "aevalsrc='0.7*sin(2*PI*300*t)+0.2*sin(2*PI*1900*t)':s=8000:d=0.5" -c:a adpcm_ms -block_size 256 \
+	wav/adpcm/ms_mono_8k.wav
+ff -f lavfi -i "aevalsrc='0.5*sin(2*PI*500*t)|0.5*sin(2*PI*750*t)':s=11025:d=0.3" -c:a adpcm_ms wav/adpcm/ms_stereo_11k.wav
+for f in wav/adpcm/*.wav; do ff -i "$f" -f s16le "${f%.wav}.ffmpeg.s16le"; done
+
+ff -f lavfi -i testsrc2=s=34x18:r=30000/1001 -frames:v 3 -pix_fmt yuv420p y4m/yuv420p_34x18.y4m
+ff -f lavfi -i testsrc2=s=16x8:r=25 -frames:v 2 -pix_fmt yuv422p10le -strict -1 y4m/yuv422p10_16x8.y4m
+for f in y4m/*.y4m; do ff -i "$f" -f rawvideo -c:v rawvideo "${f%.y4m}.ffmpeg.yuv"; done

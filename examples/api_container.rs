@@ -5,8 +5,16 @@ use rmp::io::{Input, Output};
 const URL: &str = "https://samplefile.com/samples/download/audio/wav/wav_stereo_44k_mix_sample.wav";
 const FILE: &str = "./playground/input.wav";
 
+/// Remuxes `./playground/input.wav`, a path given as the first argument, or
+/// (with `--remote`) a sample WAV streamed over HTTP.
 pub fn main() -> Result<()> {
-	let mut demuxer = Input::open(FILE)?;
+	let arg = std::env::args().nth(1);
+	let source = match arg.as_deref() {
+		Some("--remote") => URL,
+		Some(path) => path,
+		None => FILE,
+	};
+	let mut demuxer = Input::open(source)?;
 	let mut muxer = Output::create("./playground/output.wav")?;
 
 	// muxer.add_all(demuxer.streams())?;

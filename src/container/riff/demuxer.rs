@@ -1,7 +1,27 @@
 use crate::Message;
-use crate::core::{CodecId, Demuxer, Metadata, Packet, Stream, StreamId, StreamSet, Time};
+use crate::codecs::adpcm::AdpcmCodec;
+use crate::core::{
+	CodecId, Demuxer, Metadata, Packet, Stream, StreamId, StreamSet, Time, TimeBase,
+};
 use crate::io::Io;
 use crate::message::Result;
+
+/// Largest `fmt ` chunk accepted; real ones are 16-40 bytes (plus 32 bytes
+/// of coefficients for MS ADPCM).
+const MAX_FMT_SIZE: u64 = 64 * 1024;
+/// Largest `LIST` chunk parsed for tags; bigger ones are skipped unread.
+const MAX_LIST_SIZE: u64 = 1024 * 1024;
+/// Target payload of one PCM packet (FFmpeg's wav demuxer uses 4096 too).
+const PCM_PACKET_BYTES: usize = 4096;
+
+/// How `data` is cut into packets and timed.
+#[derive(Debug, Clone, Copy)]
+enum Layout {
+	/// Packets of whole sample frames; `block_align` bytes per sample frame.
+	Pcm,
+	/// One self-contained block per packet, `samples_per_block` samples each.
+	Adpcm { codec: AdpcmCodec, samples_per_block: u64 },
+}
 
 pub struct RiffDemuxer {
 	io: Box<dyn Io>,
@@ -12,6 +32,49 @@ pub struct RiffDemuxer {
 	remaining: u64,
 	byte_rate: u32,
 	block_align: u16,
+	layout: Layout,
+	time_base: TimeBase,
+	/// Total samples from the `fact` chunk, if any (ADPCM duration).
+	fact_samples: Option<u64>,
+}
+
+/// The parsed `fmt ` chunk (WAVEFORMATEX).
+struct Fmt {
+	format_tag: u16,
+	channels: u16,
+	sample_rate: u32,
+	byte_rate: u32,
+	block_align: u16,
+	bits_per_sample: u16,
+	/// Bytes after `cbSize` (FFmpeg's `extradata` for WAV codecs).
+	extension: Vec<u8>,
+}
+
+fn le16(bytes: &[u8], at: usize) -> Option<u16> {
+	Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?))
+}
+
+fn le32(bytes: &[u8], at: usize) -> Option<u32> {
+	Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+}
+
+fn parse_fmt(fmt: &[u8]) -> Result<Fmt> {
+	let bad = || Message::Container("invalid wav fmt chunk");
+	let mut parsed = Fmt {
+		format_tag: le16(fmt, 0).ok_or_else(bad)?,
+		channels: le16(fmt, 2).ok_or_else(bad)?,
+		sample_rate: le32(fmt, 4).ok_or_else(bad)?,
+		byte_rate: le32(fmt, 8).ok_or_else(bad)?,
+		block_align: le16(fmt, 12).ok_or_else(bad)?,
+		bits_per_sample: le16(fmt, 14).ok_or_else(bad)?,
+		extension: Vec::new(),
+	};
+	if let Some(cb_size) = le16(fmt, 16) {
+		// A cbSize past the chunk end is clamped, as FFmpeg does.
+		let end = (18 + usize::from(cb_size)).min(fmt.len());
+		parsed.extension = fmt.get(18..end).unwrap_or_default().to_vec();
+	}
+	Ok(parsed)
 }
 
 impl RiffDemuxer {
@@ -24,14 +87,9 @@ impl RiffDemuxer {
 
 		let mut offset = 12u64;
 		let mut metadata = Metadata::default();
-		let mut channels = None;
-		let mut sample_rate = None;
-		let mut byte_rate = None;
-		let mut block_align = None;
-		let mut bits_per_sample = None;
-		let mut codec = None;
-		let mut data_start = None;
-		let mut size = None;
+		let mut fmt = None;
+		let mut fact_samples = None;
+		let mut data = None;
 
 		loop {
 			let mut chunk_header = [0u8; 8];
@@ -41,112 +99,171 @@ impl RiffDemuxer {
 			offset += 8;
 
 			let chunk_id = &chunk_header[0..4];
-			let chunk_size = u32::from_le_bytes(chunk_header[4..8].try_into().unwrap()) as u64;
+			let chunk_size = u64::from(le32(&chunk_header, 4).unwrap_or(0));
 			let padded_size = chunk_size + (chunk_size & 1);
 
-			if chunk_id == b"fmt " {
-				if chunk_size < 16 {
-					return Err(Message::Container("invalid wav fmt chunk"));
-				}
-
-				let mut fmt = vec![0u8; chunk_size as usize];
-				read_exact(&mut *io, &mut fmt)?;
-				offset += chunk_size;
-
-				let format_tag = u16::from_le_bytes(fmt[0..2].try_into().unwrap());
-				let fmt_channels = u16::from_le_bytes(fmt[2..4].try_into().unwrap());
-				let fmt_sample_rate = u32::from_le_bytes(fmt[4..8].try_into().unwrap());
-				let fmt_byte_rate = u32::from_le_bytes(fmt[8..12].try_into().unwrap());
-				let fmt_block_align = u16::from_le_bytes(fmt[12..14].try_into().unwrap());
-				let fmt_bits_per_sample = u16::from_le_bytes(fmt[14..16].try_into().unwrap());
-
-				let resolved_codec = resolve_codec_id(format_tag, fmt_bits_per_sample, &fmt)?;
-
-				if fmt_channels == 0 {
-					return Err(Message::Container("invalid wav channel count"));
-				}
-				if fmt_sample_rate == 0 {
-					return Err(Message::Container("invalid wav sample rate"));
-				}
-				if fmt_block_align == 0 {
-					return Err(Message::Container("invalid wav block align"));
-				}
-				if fmt_byte_rate == 0 {
-					return Err(Message::Container("invalid wav byte rate"));
-				}
-
-				channels = Some(fmt_channels);
-				sample_rate = Some(fmt_sample_rate);
-				byte_rate = Some(fmt_byte_rate);
-				block_align = Some(fmt_block_align);
-				bits_per_sample = Some(fmt_bits_per_sample);
-				codec = Some(resolved_codec);
-
-				if padded_size > chunk_size {
-					skip_exact(&mut *io, padded_size - chunk_size)?;
-					offset += padded_size - chunk_size;
-				}
-				continue;
-			}
-
-			if chunk_id == b"LIST" {
-				let mut list = vec![0u8; chunk_size as usize];
-				read_exact(&mut *io, &mut list)?;
-				offset += chunk_size;
-
-				parse_list_chunk(&list, &mut metadata);
-
-				if padded_size > chunk_size {
-					skip_exact(&mut *io, padded_size - chunk_size)?;
-					offset += padded_size - chunk_size;
-				}
-				continue;
-			}
-
 			if chunk_id == b"data" {
-				data_start = Some(offset);
-				size = Some(chunk_size);
+				data = Some((offset, chunk_size));
 				break;
 			}
 
-			skip_exact(&mut *io, padded_size)?;
+			let wanted = match chunk_id {
+				b"fmt " => {
+					if !(16..=MAX_FMT_SIZE).contains(&chunk_size) {
+						return Err(Message::Container("invalid wav fmt chunk"));
+					}
+					true
+				}
+				b"fact" => (4..=64).contains(&chunk_size),
+				b"LIST" => chunk_size <= MAX_LIST_SIZE,
+				_ => false,
+			};
+			if !wanted {
+				skip_exact(&mut *io, padded_size)?;
+				offset += padded_size;
+				continue;
+			}
+
+			// Sizes are bounded above, so this allocation is small.
+			let mut body = vec![0u8; chunk_size as usize];
+			read_exact(&mut *io, &mut body)?;
+			match chunk_id {
+				b"fmt " => fmt = Some(parse_fmt(&body)?),
+				b"fact" => fact_samples = le32(&body, 0).map(u64::from),
+				_ => parse_list_chunk(&body, &mut metadata),
+			}
+			if padded_size > chunk_size {
+				skip_exact(&mut *io, padded_size - chunk_size)?;
+			}
 			offset += padded_size;
 		}
-		let fmt_err = || Message::Container("wav fmt chunk not found");
-		let data_err = || Message::Container("wav data chunk not found");
 
-		let channels = channels.ok_or_else(fmt_err)?;
-		let sample_rate = sample_rate.ok_or_else(fmt_err)?;
-		let byte_rate = byte_rate.ok_or_else(fmt_err)?;
-		let block_align = block_align.ok_or_else(fmt_err)?;
-		let bits_per_sample = bits_per_sample.ok_or_else(fmt_err)?;
-		let codec = codec.ok_or_else(fmt_err)?;
+		let fmt = fmt.ok_or(Message::Container("wav fmt chunk not found"))?;
+		let (data_start, mut size) = data.ok_or(Message::Container("wav data chunk not found"))?;
+		// Streamed or truncated files declare more data than they hold.
+		if let Ok(file_size) = io.size() {
+			size = size.min(file_size.saturating_sub(data_start));
+		}
 
-		let data_start = data_start.ok_or_else(data_err)?;
-		let size = size.ok_or_else(data_err)?;
-
-		if bits_per_sample == 0 {
+		if fmt.channels == 0 || fmt.channels > u16::from(u8::MAX) {
+			return Err(Message::Container("invalid wav channel count"));
+		}
+		if fmt.sample_rate == 0 {
+			return Err(Message::Container("invalid wav sample rate"));
+		}
+		if fmt.block_align == 0 {
+			return Err(Message::Container("invalid wav block align"));
+		}
+		if fmt.byte_rate == 0 {
+			return Err(Message::Container("invalid wav byte rate"));
+		}
+		if fmt.bits_per_sample == 0 {
 			return Err(Message::Container("invalid wav bits per sample"));
 		}
 
-		let bytes_per_sample = bits_per_sample.div_ceil(8);
-		let expected_block_align = u32::from(channels) * u32::from(bytes_per_sample);
-		if u32::from(block_align) != expected_block_align {
-			return Err(Message::Container("inconsistent wav block align"));
+		let (codec, layout) = resolve_codec(&fmt)?;
+		let channels = fmt.channels as u8;
+
+		let mut stream = Stream::audio(StreamId(0), fmt.sample_rate, channels, codec);
+		stream.parameters.bitrate = fmt.byte_rate.checked_mul(8);
+		if matches!(layout, Layout::Adpcm { .. }) {
+			stream.parameters.extradata = fmt.extension.clone();
 		}
+		let time_base = stream.time_base;
 
-		let expected_byte_rate = sample_rate * expected_block_align;
-		if byte_rate != expected_byte_rate {
-			return Err(Message::Container("inconsistent wav byte rate"));
-		}
-
-		let stream = Stream::audio(StreamId(0), sample_rate, channels as u8, codec);
-
-		let mut streams = StreamSet::default();
-		streams.add(stream);
-
-		Ok(Self { io, metadata, streams, data_start, size, remaining: size, byte_rate, block_align })
+		let mut demuxer = Self {
+			io,
+			metadata,
+			streams: StreamSet::default(),
+			data_start,
+			size,
+			remaining: size,
+			byte_rate: fmt.byte_rate,
+			block_align: fmt.block_align,
+			layout,
+			time_base,
+			fact_samples,
+		};
+		stream.duration = Some(demuxer.duration());
+		demuxer.streams.add(stream);
+		Ok(demuxer)
 	}
+
+	/// Samples per channel before `offset` bytes of `data`.
+	fn samples_before(&self, offset: u64) -> u64 {
+		let align = u64::from(self.block_align);
+		match self.layout {
+			Layout::Pcm => offset / align,
+			Layout::Adpcm { samples_per_block, .. } => offset / align * samples_per_block,
+		}
+	}
+
+	fn total_samples(&self) -> u64 {
+		match self.layout {
+			Layout::Pcm => self.samples_before(self.size),
+			Layout::Adpcm { codec, .. } => {
+				let whole = self.samples_before(self.size);
+				let tail = (self.size % u64::from(self.block_align)) as usize;
+				let channels = self.streams.streams.first().and_then(|s| s.parameters.channels);
+				let partial =
+					channels.and_then(|ch| codec.samples_in_block(tail, usize::from(ch))).unwrap_or(0) as u64;
+				let decoded = whole + partial;
+				// `fact` holds the exact length; the last block is padded.
+				self.fact_samples.filter(|n| *n > 0 && *n <= decoded).unwrap_or(decoded)
+			}
+		}
+	}
+}
+
+/// Maps the fmt chunk to a codec ID and packet layout, validating the fields
+/// that layout depends on.
+fn resolve_codec(fmt: &Fmt) -> Result<(CodecId, Layout)> {
+	let tag =
+		if fmt.format_tag == 0xFFFE { resolve_extensible_subformat(fmt)? } else { fmt.format_tag };
+	let channels = usize::from(fmt.channels);
+
+	if let Some(codec) = [AdpcmCodec::ImaWav, AdpcmCodec::Ms].into_iter().find(|c| c.wav_tag() == tag)
+	{
+		if fmt.bits_per_sample != 4 {
+			return Err(Message::Container("unsupported adpcm bits per sample"));
+		}
+		if !codec.supports_channels(channels) {
+			return Err(Message::Container("unsupported adpcm channel count"));
+		}
+		let samples_per_block = codec
+			.samples_in_block(usize::from(fmt.block_align), channels)
+			.ok_or(Message::Container("invalid adpcm block align"))?;
+		return Ok((
+			CodecId::new(codec.id()),
+			Layout::Adpcm { codec, samples_per_block: samples_per_block as u64 },
+		));
+	}
+
+	let id = match (tag, fmt.bits_per_sample) {
+		(1, 8) => "pcm_u8",
+		(1, 16) => "pcm_s16le",
+		(1, 24) => "pcm_s24le",
+		(1, 32) => "pcm_s32le",
+		(1, 64) => "pcm_s64le",
+		(1, _) => return Err(Message::Container("unsupported wav pcm bit depth")),
+		(3, 32) => "pcm_f32le",
+		(3, 64) => "pcm_f64le",
+		(3, _) => return Err(Message::Container("unsupported wav float bit depth")),
+		(6, 8) => "pcm_alaw",
+		(7, 8) => "pcm_mulaw",
+		(6 | 7, _) => return Err(Message::Container("unsupported g711 bit depth")),
+		_ => return Err(Message::Container("unsupported wav format")),
+	};
+
+	let bytes_per_sample = u32::from(fmt.bits_per_sample.div_ceil(8));
+	let expected_block_align = u32::from(fmt.channels) * bytes_per_sample;
+	if u32::from(fmt.block_align) != expected_block_align {
+		return Err(Message::Container("inconsistent wav block align"));
+	}
+	if u64::from(fmt.byte_rate) != u64::from(fmt.sample_rate) * u64::from(expected_block_align) {
+		return Err(Message::Container("inconsistent wav byte rate"));
+	}
+	Ok((CodecId::new(id), Layout::Pcm))
 }
 
 fn parse_list_chunk(list: &[u8], metadata: &mut Metadata) {
@@ -157,10 +274,12 @@ fn parse_list_chunk(list: &[u8], metadata: &mut Metadata) {
 	let mut offset = 4usize;
 	while offset + 8 <= list.len() {
 		let id = &list[offset..offset + 4];
-		let size = u32::from_le_bytes(list[offset + 4..offset + 8].try_into().unwrap()) as usize;
+		let Some(size) = le32(list, offset + 4).map(|n| n as usize) else {
+			break;
+		};
 		offset += 8;
 
-		if offset + size > list.len() {
+		if size > list.len() - offset {
 			break;
 		}
 
@@ -206,24 +325,38 @@ impl Demuxer for RiffDemuxer {
 		}
 
 		let align = usize::from(self.block_align.max(1));
-		let mut size = 4096.min(self.remaining as usize);
-		if size > align {
-			size -= size % align;
-		}
-		if size == 0 {
-			size = self.remaining as usize;
-		}
-		let mut data = vec![0u8; size];
-		let n = self.io.read(&mut data)?;
+		let remaining = usize::try_from(self.remaining).unwrap_or(usize::MAX);
+		let size = match self.layout {
+			// Whole sample frames, about PCM_PACKET_BYTES per packet.
+			Layout::Pcm => {
+				let target = (PCM_PACKET_BYTES / align).max(1) * align;
+				target.min(remaining)
+			}
+			Layout::Adpcm { .. } => align.min(remaining),
+		};
 
-		if n == 0 {
+		let offset = self.size - self.remaining;
+		let mut data = vec![0u8; size];
+		let mut filled = 0;
+		while filled < size {
+			let n = self.io.read(&mut data[filled..])?;
+			if n == 0 {
+				break;
+			}
+			filled += n;
+		}
+		if filled == 0 {
+			self.remaining = 0;
 			return Ok(None);
 		}
+		data.truncate(filled);
+		self.remaining -= filled as u64;
 
-		data.truncate(n);
-		self.remaining -= n as u64;
-
-		Ok(Some(Packet::new(StreamId(0), data)))
+		let pts = Time::new(self.samples_before(offset), self.time_base);
+		let mut packet = Packet::new(StreamId(0), data);
+		packet.pts = Some(pts);
+		packet.dts = Some(pts);
+		Ok(Some(packet))
 	}
 
 	fn streams(&self) -> &StreamSet {
@@ -234,17 +367,21 @@ impl Demuxer for RiffDemuxer {
 		&self.metadata
 	}
 
+	/// Seeks to the sample frame (PCM) or block (ADPCM) containing `time`.
 	fn seek(&mut self, time: f64) -> Result<()> {
 		if !time.is_finite() || time < 0.0 {
 			return Err("invalid seek time".into());
 		}
 
-		if self.byte_rate == 0 {
-			return Err("invalid wav byte rate".into());
-		}
-
-		let raw_offset = (time * self.byte_rate as f64).floor() as u64;
 		let align = u64::from(self.block_align.max(1));
+		let rate = f64::from(self.time_base.den) / f64::from(self.time_base.num.max(1));
+		let raw_offset = match self.layout {
+			Layout::Pcm => (time * f64::from(self.byte_rate)).floor() as u64,
+			Layout::Adpcm { samples_per_block, .. } => {
+				let block = (time * rate).floor() as u64 / samples_per_block.max(1);
+				block.saturating_mul(align)
+			}
+		};
 		let aligned_offset = (raw_offset / align) * align;
 		let clamped_offset = aligned_offset.min(self.size);
 
@@ -252,16 +389,9 @@ impl Demuxer for RiffDemuxer {
 		self.remaining = self.size.saturating_sub(clamped_offset);
 		Ok(())
 	}
+
 	fn duration(&self) -> Time {
-		let stream = self.streams.get(StreamId(0)).unwrap();
-		let tb = stream.time_base;
-
-		if self.block_align == 0 {
-			return Time::zero(tb);
-		}
-		let samples = self.size / self.block_align as u64;
-
-		Time::new(samples, tb)
+		Time::new(self.total_samples(), self.time_base)
 	}
 }
 
@@ -307,39 +437,11 @@ fn skip_exact(io: &mut dyn Io, mut size: u64) -> Result<()> {
 	Ok(())
 }
 
-fn resolve_codec_id(format_tag: u16, bits_per_sample: u16, fmt: &[u8]) -> Result<CodecId> {
-	let resolved_tag =
-		if format_tag == 0xFFFE { resolve_extensible_subformat(fmt)? } else { format_tag };
-
-	match resolved_tag {
-		1 => match bits_per_sample {
-			8 => Ok(CodecId::new("pcm_u8")),
-			16 => Ok(CodecId::new("pcm_s16le")),
-			24 => Ok(CodecId::new("pcm_s24le")),
-			32 => Ok(CodecId::new("pcm_s32le")),
-			64 => Ok(CodecId::new("pcm_s64le")),
-			_ => Err(Message::Container("unsupported wav pcm bit depth")),
-		},
-		3 => match bits_per_sample {
-			32 => Ok(CodecId::new("pcm_f32le")),
-			64 => Ok(CodecId::new("pcm_f64le")),
-			_ => Err(Message::Container("unsupported wav float bit depth")),
-		},
-		6 => Ok(CodecId::new("pcm_alaw")),
-		7 => Ok(CodecId::new("pcm_mulaw")),
-		_ => Err(Message::Container("unsupported wav format")),
-	}
-}
-
-fn resolve_extensible_subformat(fmt: &[u8]) -> Result<u16> {
-	if fmt.len() < 40 {
+fn resolve_extensible_subformat(fmt: &Fmt) -> Result<u16> {
+	// WAVEFORMATEXTENSIBLE: 22 extension bytes; the sub-format GUID starts at
+	// byte 6 of the extension and its first two bytes are the format tag.
+	if fmt.extension.len() < 22 {
 		return Err(Message::Container("invalid wav extensible chunk"));
 	}
-
-	let cb_size = u16::from_le_bytes(fmt[16..18].try_into().unwrap());
-	if cb_size < 22 {
-		return Err(Message::Container("invalid wav extensible size"));
-	}
-
-	Ok(u16::from_le_bytes(fmt[24..26].try_into().unwrap()))
+	le16(&fmt.extension, 6).ok_or(Message::Container("invalid wav extensible chunk"))
 }

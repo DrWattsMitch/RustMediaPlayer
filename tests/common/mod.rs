@@ -43,3 +43,35 @@ impl Rng {
 		(self.next() % n.max(1) as u64) as usize
 	}
 }
+
+/// Payload of a WAV file's `data` chunk.
+pub fn wav_data(wav: &[u8]) -> &[u8] {
+	let mut at = 12;
+	while at + 8 <= wav.len() {
+		let size = u32::from_le_bytes(wav[at + 4..at + 8].try_into().unwrap()) as usize;
+		if &wav[at..at + 4] == b"data" {
+			return &wav[at + 8..(at + 8 + size).min(wav.len())];
+		}
+		at += 8 + size + (size & 1);
+	}
+	panic!("no data chunk")
+}
+
+/// Decodes every packet of the first stream with the resolver's decoder and
+/// returns the concatenated frame bytes.
+pub fn decode_all(demuxer: &mut dyn Demuxer) -> Vec<u8> {
+	use rmp::core::{Frame, Resolver};
+	let stream = demuxer.streams().streams[0].clone();
+	let decoder = Resolver::new().decoder_for(&stream).expect("decoder");
+	let mut state = decoder.create_state(&stream.parameters);
+	let mut out = Vec::new();
+	while let Some(packet) = demuxer.read().expect("read packet") {
+		for frame in decoder.decode(&mut state, packet).expect("decode").value {
+			match frame {
+				Frame::Audio(a) => out.extend_from_slice(&a.data),
+				Frame::Video(v) => out.extend_from_slice(&v.data),
+			}
+		}
+	}
+	out
+}

@@ -20,7 +20,7 @@ pub fn main() -> Result<()> {
 		let state_encode = encoder.create_state(&stream.parameters);
 		let context = Context { stream_id: stream.id, decoder, encoder, state_decode, state_encode };
 		streams.insert(stream.id, context);
-		muxer.add(&stream)?;
+		muxer.add(stream)?;
 	}
 
 	while let Some(packet) = demuxer.read()? {

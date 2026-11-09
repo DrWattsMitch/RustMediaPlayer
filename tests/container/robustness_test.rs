@@ -5,7 +5,9 @@ use crate::common::{Rng, fixture, memory};
 use rmp::codecs::mp3::{Mp3Decoder, Mp3DecoderState, decoder::decode_packet};
 use rmp::container::mp3::demuxer::Mp3Demuxer;
 use rmp::container::mp4::demuxer::Mp4Demuxer;
-use rmp::core::{Decoder, Demuxer};
+use rmp::container::riff::demuxer::RiffDemuxer;
+use rmp::container::y4m::demuxer::Y4mDemuxer;
+use rmp::core::{Decoder, Demuxer, Resolver};
 
 /// Override with `RMP_FUZZ_ROUNDS=20000 cargo test robustness` for a deeper run.
 fn rounds() -> u64 {
@@ -81,6 +83,65 @@ fn mp4_demuxer_survives_corruption() {
 	}
 }
 
+/// Demuxes and decodes every packet of the first stream, ignoring errors.
+fn decode_everything(demuxer: &mut dyn Demuxer) {
+	let Some(stream) = demuxer.streams().streams.first().cloned() else {
+		return;
+	};
+	let Some(decoder) = Resolver::new().decoder_for(&stream) else {
+		return;
+	};
+	let mut state = decoder.create_state(&stream.parameters);
+	for _ in 0..10_000 {
+		match demuxer.read() {
+			Ok(Some(packet)) => {
+				let _ = decoder.decode(&mut state, packet);
+			}
+			Ok(None) | Err(_) => break,
+		}
+	}
+	drain(demuxer);
+}
+
+#[test]
+fn wav_demuxer_and_pcm_adpcm_decoders_survive_corruption() {
+	let sources = [
+		fixture("wav/adpcm/ima_stereo_22k.wav"),
+		fixture("wav/adpcm/ms_mono_8k.wav"),
+		fixture("wav/adpcm/ms_stereo_11k.wav"),
+		fixture("wav/pcm/s24le.wav"),
+		fixture("wav/pcm/f64le.wav"),
+		fixture("wav/pcm/alaw.wav"),
+	];
+	let mut rng = Rng::new(seed() ^ 5);
+	for round in 0..rounds() * 2 {
+		let data = mutate(&sources[round as usize % sources.len()], &mut rng);
+		if let Ok(mut demuxer) = RiffDemuxer::new(memory(data.clone())) {
+			decode_everything(&mut demuxer);
+		}
+		// Raw corrupted bytes straight into the block decoders.
+		use rmp::codecs::adpcm::{AdpcmCodec, decoder::decode_block};
+		let tail = &data[data.len().min(44)..];
+		for codec in [AdpcmCodec::ImaWav, AdpcmCodec::Ms] {
+			for channels in 1..=3 {
+				let _ = decode_block(codec, tail, channels);
+			}
+		}
+	}
+}
+
+#[test]
+fn y4m_demuxer_survives_corruption() {
+	let sources = [fixture("y4m/yuv420p_34x18.y4m"), fixture("y4m/yuv422p10_16x8.y4m")];
+	let mut rng = Rng::new(seed() ^ 6);
+	for round in 0..rounds() * 2 {
+		let data = mutate(&sources[(round % 2) as usize], &mut rng);
+		if let Ok(mut demuxer) = Y4mDemuxer::new(memory(data)) {
+			decode_everything(&mut demuxer);
+		}
+	}
+}
+
 #[test]
 fn random_bytes_are_rejected_cleanly() {
 	let mut rng = Rng::new(42);
@@ -89,5 +150,20 @@ fn random_bytes_are_rejected_cleanly() {
 		assert!(Mp4Demuxer::new(memory(data.clone())).is_err() || len >= 8);
 		let _ = Mp3Demuxer::new(memory(data.clone()));
 		let _ = decode_packet(&mut Mp3DecoderState::new(), &data);
+		let _ = RiffDemuxer::new(memory(data.clone()));
+		let _ = Y4mDemuxer::new(memory(data.clone()));
+	}
+	// Valid magic followed by noise.
+	for magic in [&b"RIFF\xff\xff\xff\xffWAVE"[..], b"YUV4MPEG2 "] {
+		for len in [0usize, 8, 64, 3000] {
+			let mut data = magic.to_vec();
+			data.extend((0..len).map(|_| rng.next() as u8));
+			if let Ok(mut d) = RiffDemuxer::new(memory(data.clone())) {
+				decode_everything(&mut d);
+			}
+			if let Ok(mut d) = Y4mDemuxer::new(memory(data)) {
+				decode_everything(&mut d);
+			}
+		}
 	}
 }

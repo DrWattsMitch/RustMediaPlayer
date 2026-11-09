@@ -39,8 +39,12 @@ impl Channels {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SampleFormat {
+	/// Unsigned 8-bit, silence at 128 (FFmpeg's `AV_SAMPLE_FMT_U8`).
+	U8,
 	S16,
 	S32,
+	/// Signed 64-bit (FFmpeg's `AV_SAMPLE_FMT_S64`).
+	S64,
 	F32,
 	F64,
 }
@@ -48,11 +52,17 @@ pub enum SampleFormat {
 impl SampleFormat {
 	pub const fn bytes(self) -> usize {
 		match self {
+			SampleFormat::U8 => 1,
 			SampleFormat::S16 => 2,
 			SampleFormat::S32 => 4,
+			SampleFormat::S64 => 8,
 			SampleFormat::F32 => 4,
 			SampleFormat::F64 => 8,
 		}
+	}
+
+	pub const fn is_float(self) -> bool {
+		matches!(self, SampleFormat::F32 | SampleFormat::F64)
 	}
 }
 

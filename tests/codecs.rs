@@ -8,3 +8,9 @@ mod aac_decoder_test;
 
 #[path = "codecs/h264_decoder_test.rs"]
 mod h264_decoder_test;
+
+#[path = "codecs/pcm_codec_test.rs"]
+mod pcm_codec_test;
+
+#[path = "codecs/adpcm_decoder_test.rs"]
+mod adpcm_decoder_test;

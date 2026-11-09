@@ -21,7 +21,8 @@ pub fn audio_state(params: &Parameters) -> State {
 
 pub fn video_state(params: &Parameters) -> State {
 	let codec_state = CodecState { extradata: Vec::new(), pts: None, dts: None, last_pts: None };
-	let pixel = Pixel { depth: 8, format: video::PixelFormat::YUV420 };
+	// Raw video carries its layout in `pixel_format` (Y4M, rawvideo).
+	let pixel = params.pixel_format.as_deref().and_then(Pixel::from_name).unwrap_or_default();
 	State::Video(VideoState {
 		width: params.width.unwrap_or(0),
 		height: params.height.unwrap_or(0),
