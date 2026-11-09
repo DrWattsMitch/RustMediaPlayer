@@ -196,6 +196,7 @@ fn build_stream(index: usize, kind: StreamKind, timescale: u32, info: CodecInfo)
 		height: info.height,
 		pixel_format: None,
 		extradata: info.extradata,
+		bits_per_sample: None,
 	};
 	Stream {
 		id: StreamId(index),

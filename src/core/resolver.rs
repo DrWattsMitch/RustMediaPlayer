@@ -1,4 +1,4 @@
-use crate::codecs::{aac, adpcm, h264, mp3, pcm, raw};
+use crate::codecs::{aac, adpcm, flac, h264, mp3, opus, pcm, raw};
 use crate::core::{CodecId, Decoder, Demuxer, Encoder, Muxer, Stream};
 
 #[derive(Debug, Clone, Default)]
@@ -26,6 +26,16 @@ impl Resolver {
 		Self
 	}
 
+	/// `true` when a real decoder exists for `codec` (as opposed to the raw
+	/// pass-through that [`Resolver::decoder_for`] falls back to). Raw video
+	/// codec IDs (`rawvideo` or a pixel format name) count as decodable.
+	pub fn has_decoder(&self, codec: &str) -> bool {
+		pcm::PcmCodec::from_id(codec).is_some()
+			|| adpcm::AdpcmDecoder::for_id(codec).is_some()
+			|| matches!(codec, "mp3" | "aac" | "h264" | "flac" | "opus" | "rawvideo")
+			|| crate::core::Pixel::from_name(codec).is_some()
+	}
+
 	/// Picks a decoder by codec id. Codecs without a dedicated decoder fall
 	/// back to the raw pass-through decoder.
 	pub fn decoder_for(&self, stream: &Stream) -> Option<Box<dyn Decoder>> {
@@ -40,16 +50,21 @@ impl Resolver {
 			"mp3" => Some(Box::new(mp3::Mp3Decoder::new())),
 			"aac" => Some(Box::new(aac::AacDecoder::new())),
 			"h264" => Some(Box::new(h264::H264Decoder::new())),
+			"flac" => Some(Box::new(flac::FlacDecoder::new())),
+			"opus" => Some(Box::new(opus::OpusDecoder::new())),
 			_ => Some(Box::new(raw::decoder::Decoder::new(stream.kind))),
 		}
 	}
 
-	/// Picks an encoder producing the stream's codec. PCM codecs get a real
-	/// encoder (which converts from any sample format); everything else falls
-	/// back to raw pass-through.
+	/// Picks an encoder producing the stream's codec. PCM codecs and FLAC get a
+	/// real encoder (which converts from any sample format); everything else
+	/// falls back to raw pass-through.
 	pub fn encoder_for(&self, stream: &Stream) -> Option<Box<dyn Encoder>> {
 		if let Some(encoder) = pcm::PcmEncoder::for_id(stream.id, &stream.parameters.codec.id) {
 			return Some(Box::new(encoder));
+		}
+		if stream.parameters.codec.id == "flac" {
+			return Some(Box::new(flac::FlacEncoder::new(stream.id)));
 		}
 		Some(Box::new(raw::encoder::Encoder::new(stream.id, stream.kind)))
 	}

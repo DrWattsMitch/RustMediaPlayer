@@ -205,6 +205,13 @@ Containers:
 - **MP4 / M4A / MOV**: ISO BMFF with any number of tracks, B-frame timing,
   edit lists, keyframe seeking and iTunes metadata/cover art. Demux, and mux
   for H.264, HEVC, AV1, MPEG-4, AAC, MP3, ALAC, Opus and FLAC.
+- **Matroska / WebM** (`.mkv`, `.mka`, `.webm`): demux of every track type,
+  laced blocks, live streams with unknown sizes, cues or index-based seeking,
+  tags, attachments (cover art) and subtitle tracks.
+- **FLAC** (`.flac`): demux (with seek table and bisection seeking) and mux
+  (STREAMINFO with MD5, Vorbis comments, pictures).
+- **Ogg** (`.ogg`, `.opus`, `.oga`): demux of Opus, FLAC and Vorbis streams,
+  with Vorbis comments and `METADATA_BLOCK_PICTURE` cover art.
 
 Codecs:
 
@@ -217,10 +224,21 @@ Codecs:
 - **MP3 (MPEG audio Layer III)**: decoder to 16-bit PCM, within ±1 LSB of
   FFmpeg.
 - **AAC-LC** and **H.264** (Baseline/Main/High, 8-bit 4:2:0) decoders.
+- **FLAC**: decoder (bit-exact with FFmpeg) and encoder (compression levels
+  0–12, FFmpeg's defaults, files within ~3% of FFmpeg's size).
+- **Opus**: decoder for SILK, hybrid and CELT packets, mono, stereo and
+  multichannel (SILK bit-exact with libopus, CELT within float rounding).
 
-See [docs/WAV_Y4M.md](docs/WAV_Y4M.md), [docs/MP3_MP4.md](docs/MP3_MP4.md)
-and [docs/AAC_H264.md](docs/AAC_H264.md) for how each part works and how to
-extend it. Try it with the examples:
+Processing (`rmp::process`), so files can be transcoded and not only
+remuxed: sample-format conversion, resampling (polyphase windowed sinc),
+channel remixing with FFmpeg's default matrices, and picture scaling (point,
+bilinear, bicubic, Lanczos) with YUV ↔ RGB conversion (BT.601/709/2020,
+limited or full range).
+
+See [docs/WAV_Y4M.md](docs/WAV_Y4M.md), [docs/MP3_MP4.md](docs/MP3_MP4.md),
+[docs/AAC_H264.md](docs/AAC_H264.md) and
+[docs/MKV_FLAC_OPUS_PROCESSING.md](docs/MKV_FLAC_OPUS_PROCESSING.md) for how
+each part works and how to extend it. Try it with the examples:
 
 ```bash
 cargo run --release --example probe       -- input.mp4
@@ -228,6 +246,8 @@ cargo run --release --example remux       -- input.y4m output.y4m
 cargo run --release --example decode      -- input.wav audio.s16le -
 cargo run --release --example pcm_convert -- input.wav output.wav pcm_s24le
 cargo run --release --example mp3_to_wav  -- input.mp3 output.wav
+cargo run --release --example transcode   -- input.mkv output.flac -ar 48000
+cargo run --release --example transcode   -- input.opus output.wav -c:a pcm_f32le
 ```
 
 Video uses the same pipeline as audio. A Y4M stream is `rawvideo` with its
@@ -268,7 +288,7 @@ preserved, and this fork is distributed under the same terms.
 
 FFmpReg set out to support WAV and Y4M containers and the PCM, ADPCM, and raw
 video codecs. RMP completes those and extends them with additional file types
-and codecs, starting with MP3, MP4, AAC and H.264. If you find FFmpReg useful, please consider supporting the original
+and codecs, starting with MP3, MP4, AAC, H.264, Matroska, FLAC, Ogg and Opus. If you find FFmpReg useful, please consider supporting the original
 author on [Ko-fi](https://ko-fi.com/yazaldefilimone).
 
 ## Versioning

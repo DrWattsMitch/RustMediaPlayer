@@ -7,6 +7,8 @@
 //! `AVCodecParameters.extradata`.
 
 use super::boxes::{BoxIter, FourCC, Put, find, full_box, write_box, write_full_box};
+use crate::codecs::flac::StreamInfo;
+use crate::codecs::opus::OpusHead;
 use crate::core::StreamKind;
 use crate::io::ByteCursor;
 use crate::message::{Message, Result};
@@ -152,6 +154,25 @@ fn parse_audio_entry(format: &FourCC, entry: &[u8]) -> Result<CodecInfo> {
 		};
 		if let Some(config) = config {
 			info.extradata = find(children, config).unwrap_or(&[]).to_vec();
+		}
+		// FFmpeg's extradata layouts: the bare STREAMINFO for FLAC, the
+		// `OpusHead` packet for Opus (mov.c `mov_read_dfla` / `mov_read_dops`).
+		match format {
+			b"fLaC" => {
+				if let Some(si) = StreamInfo::from_extradata(&info.extradata) {
+					info.extradata = si.to_bytes().to_vec();
+					info.sample_rate = Some(si.sample_rate);
+					info.channels = Some(si.channels);
+				}
+			}
+			b"Opus" => {
+				if let Some(head) = OpusHead::from_dops(&info.extradata) {
+					info.channels = Some(head.channels);
+					info.sample_rate = Some(48_000);
+					info.extradata = head.to_bytes();
+				}
+			}
+			_ => {}
 		}
 	}
 	if let Some(btrt) = find(children, b"btrt") {
@@ -405,8 +426,22 @@ fn write_audio_entry(out: &mut Vec<u8>, p: &EntryParams) -> Result<()> {
 					_ => b"dfLa",
 				};
 				let extradata = require_extradata(p)?;
+				let body = match p.codec {
+					"flac" => {
+						let si = StreamInfo::from_extradata(extradata)
+							.ok_or(Message::Container("mp4 muxer: invalid flac extradata"))?;
+						let mut body = vec![0, 0, 0, 0]; // dfLa full box: version 0, flags 0
+						body.extend(si.to_block(true));
+						body
+					}
+					"opus" => OpusHead::parse(extradata)
+						.or_else(|| OpusHead::from_dops(extradata))
+						.ok_or(Message::Container("mp4 muxer: invalid opus extradata"))?
+						.to_dops(),
+					_ => extradata.to_vec(),
+				};
 				write_box(out, config, |out| {
-					out.put(extradata);
+					out.put(&body);
 					Ok(())
 				})
 			}

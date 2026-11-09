@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Regenerates the MP3/MP4 test fixtures with FFmpeg (built with libmp3lame
-# and libx264). Fixture byte counts are asserted in tests, so if you change a
+# Regenerates the test fixtures with FFmpeg (built with libmp3lame, libx264,
+# libvpx, libopus and libvorbis). Fixture byte counts are asserted in tests, so if you change a
 # command here, update the expected packet counts (see `ffprobe -count_packets`).
 set -euo pipefail
 cd "$(dirname "$0")/../tests/fixtures"
@@ -46,3 +46,82 @@ for f in wav/adpcm/*.wav; do ff -i "$f" -f s16le "${f%.wav}.ffmpeg.s16le"; done
 ff -f lavfi -i testsrc2=s=34x18:r=30000/1001 -frames:v 3 -pix_fmt yuv420p y4m/yuv420p_34x18.y4m
 ff -f lavfi -i testsrc2=s=16x8:r=25 -frames:v 2 -pix_fmt yuv422p10le -strict -1 y4m/yuv422p10_16x8.y4m
 for f in y4m/*.y4m; do ff -i "$f" -f rawvideo -c:v rawvideo "${f%.y4m}.ffmpeg.yuv"; done
+
+# --- Matroska / WebM, FLAC, Ogg, Opus and the processing layer ------------
+# Needs FFmpeg with libx264, libvpx, libopus and libvorbis. References
+# (`*.packets.csv`, `*.ffmpeg.*`) are derived from the fixtures themselves,
+# so after re-encoding a fixture, rerun its reference line too. A few tests
+# also assert sample counts, sizes or tags, which follow from these commands.
+mkdir -p mkv flac ogg opus process
+packets() { ffprobe -v error -show_packets -show_data_hash adler32 -of csv=p=0 \
+	-show_entries packet=stream_index,pts,duration,size,flags,data_hash "$1" > "${1%.*}.packets.csv"; }
+printf '1\n00:00:00,100 --> 00:00:00,500\nBonjour\n\n2\n00:00:00,600 --> 00:00:01,000\nAu revoir\n' > /tmp/rmp.srt
+printf 'WEBVTT\n\n00:00:00.100 --> 00:00:00.500\nHello\n\n00:00:00.600 --> 00:00:01.000\nBye\n' > /tmp/rmp.vtt
+
+ff -i mp4/h264_bframes_aac.mp4 -c copy mkv/h264_aac.mkv
+ff -f lavfi -i testsrc2=s=64x48:r=25:d=2 -f lavfi -i "sine=f=330:d=2:sample_rate=44100" -i /tmp/rmp.srt \
+	-map 0 -map 1 -map 2 -c:v libx264 -preset veryfast -c:a flac -c:s srt -metadata:s:a:0 language=fra \
+	-metadata title="MKV Song" -metadata artist="RMP Tests" -metadata album="Fixtures" mkv/h264_flac_srt.mkv
+ff -f lavfi -i testsrc2=s=64x48:r=25:d=1 -f lavfi -i "sine=f=440:d=1" -i /tmp/rmp.vtt -map 0 -map 1 -map 2 \
+	-c:v libvpx-vp9 -deadline realtime -c:a libopus -ac 1 -b:a 32k -c:s webvtt -metadata title="WebM clip" mkv/vp9_opus_vtt.webm
+# Live WebM: unknown element sizes, no cues or duration.
+ff -f lavfi -i testsrc2=s=64x48:r=25:d=1 -f lavfi -i "sine=f=440:d=1" -c:v libvpx-vp9 -deadline realtime \
+	-c:a libopus -ac 1 -b:a 32k -metadata title="WebM clip" -f webm -live 1 mkv/live_vp9_opus.webm
+for f in mkv/*.mkv mkv/*.webm; do packets "$f"; done
+
+ff -f lavfi -i "aevalsrc='0.5*sin(2*PI*440*t)|0.4*sin(2*PI*554*t)':s=44100:d=0.5" -c:a flac \
+	-metadata title="FLAC Song" -metadata artist="RMP Tests" -metadata album="Fixtures" -metadata track="4/12" \
+	-metadata genre="Ambient" -metadata date=2025 flac/s16_stereo_44k.flac
+# Nearly identical channels (mid/side), level 8.
+ff -f lavfi -i "aevalsrc='0.5*sin(2*PI*300*t)|0.5*sin(2*PI*300*t)+0.01*sin(2*PI*5000*t)':s=48000:d=0.3" \
+	-c:a flac -compression_level 8 flac/s16_ms_48k_lvl8.flac
+ff -f lavfi -i "anoisesrc=d=0.2:a=0.5:r=22050" -c:a flac flac/noise_22k.flac
+# Samples that are multiples of 128 (7 wasted bits), level 0.
+ff -f lavfi -i "aevalsrc='floor(0.5*sin(2*PI*200*t)*256)/256':s=8000:d=0.5" -c:a flac -compression_level 0 \
+	flac/wasted_mono_8k_lvl0.flac
+ff -f lavfi -i "aevalsrc='0.3*sin(2*PI*440*t)|0.3*sin(2*PI*550*t)|0.3*sin(2*PI*660*t)|0.1*sin(2*PI*60*t)|0.2*sin(2*PI*880*t)|0.2*sin(2*PI*990*t)':s=96000:d=0.06" \
+	-c:a flac -sample_fmt s32 -bits_per_raw_sample 24 -compression_level 12 flac/s24_51_96k_lvl12.flac
+ff -f lavfi -i "aevalsrc='0.6*sin(2*PI*700*t)|-0.6*sin(2*PI*700*t)+0.05*sin(2*PI*90*t)':s=32000:d=0.2" \
+	-c:a flac -sample_fmt s32 -bits_per_raw_sample 24 flac/s24_rs_32k.flac
+for f in flac/s16*.flac flac/noise_22k.flac flac/wasted*.flac; do ff -i "$f" -f s16le "${f%.flac}.ffmpeg.s16le"; done
+for f in flac/s24*.flac; do ff -i "$f" -f s32le "${f%.flac}.ffmpeg.s32le"; done
+
+# Ogg: Opus (tags, a METADATA_BLOCK_PICTURE cover, 5.1), FLAC and Vorbis.
+ff -f lavfi -i "sine=f=220:d=4" -f lavfi -i "anoisesrc=d=4:a=0.05" -filter_complex "[0][1]amix=2,volume=2" -ar 48000 /tmp/rmp_voice_mono.wav
+ff -f lavfi -i "sine=f=300:d=4" -f lavfi -i "sine=f=450:d=4" -f lavfi -i "anoisesrc=d=4:a=0.03" \
+	-filter_complex "[0][2]amix=2[l];[1][2]amix=2[r];[l][r]join=inputs=2:channel_layout=stereo" -ar 48000 /tmp/rmp_voice_st.wav
+cover=$(python3 -c "
+import struct, base64
+img = open('/tmp/rmp_cover.png', 'rb').read(); mime = b'image/png'; d = b'Cover'
+print(base64.b64encode(struct.pack('>II', 3, len(mime)) + mime + struct.pack('>I', len(d)) + d
+	+ struct.pack('>IIIII', 16, 16, 24, 0, len(img)) + img).decode())")
+ff -i /tmp/rmp_voice_mono.wav -t 2 -c:a libopus -b:a 12k -metadata title="Ogg Test" -metadata artist="RMP" ogg/mono.opus
+ff -i /tmp/rmp_voice_st.wav -t 3 -c:a libopus -b:a 48k -metadata album=Album -metadata METADATA_BLOCK_PICTURE="$cover" ogg/st_cover.opus
+ff -f lavfi -i "sine=f=440:d=1.5" -af "aformat=channel_layouts=5.1" -c:a libopus -b:a 96k ogg/51.opus
+ff -i /tmp/rmp_voice_st.wav -t 2 -ar 44100 -c:a flac -metadata title=FlacOgg ogg/flac.oga
+ff -i /tmp/rmp_voice_st.wav -t 2 -c:a libvorbis -q:a 2 ogg/vorbis.ogg
+for f in ogg/*.opus ogg/*.oga ogg/*.ogg; do packets "$f"; done
+
+# Opus decoder references: libopus through FFmpeg, pre-skip kept.
+ff -i /tmp/rmp_voice_mono.wav -t 1 -ar 8000 -c:a libopus -b:a 8k -application voip opus/silk_nb_mono.webm
+ff -i /tmp/rmp_voice_st.wav -t 1 -ar 16000 -c:a libopus -b:a 24k -application voip -frame_duration 40 opus/silk_wb_st_40ms.webm
+ff -i /tmp/rmp_voice_st.wav -t 1 -c:a libopus -b:a 20k -application voip opus/hybrid_st.webm
+ff -f lavfi -i "sine=f=440:d=0.5" -af "aformat=channel_layouts=5.1" -c:a libopus -b:a 128k opus/celt_51.webm
+ff -f lavfi -i "sine=f=220:d=0.6" -f lavfi -i "anoisesrc=d=0.6:a=0.3:c=pink" \
+	-filter_complex "[0][1]concat=n=2:v=0:a=1,aformat=channel_layouts=mono,asplit[a][b];[b]areverse[r];[a][r]concat=n=2:v=0:a=1" \
+	-c:a libopus -b:a 20k -frame_duration 10 opus/mode_switch.webm
+for f in opus/*.webm; do ff -flags2 +skip_manual -c:a libopus -i "$f" -f s16le "${f%.webm}.ffmpeg.s16le"; done
+
+# Processing layer: libswscale / libswresample references.
+ff -f lavfi -i testsrc2=s=96x64:r=25 -frames:v 1 -pix_fmt yuv420p process/testsrc_96x64.y4m
+ff -i process/testsrc_96x64.y4m -vf scale=100:75 -f rawvideo -pix_fmt yuv420p process/testsrc_100x75.yuv
+ff -i process/testsrc_96x64.y4m -vf scale=48:32 -f rawvideo -pix_fmt yuv420p process/testsrc_48x32.yuv
+ff -i process/testsrc_96x64.y4m -f rawvideo -pix_fmt rgb24 process/testsrc_96x64.rgb24
+ff -i process/testsrc_96x64.y4m -sws_flags bicubic+accurate_rnd+full_chroma_int -f rawvideo -pix_fmt rgb24 \
+	process/testsrc_96x64.accurate.rgb24
+ff -f rawvideo -pix_fmt rgb24 -s 96x64 -i process/testsrc_96x64.rgb24 -f rawvideo -pix_fmt yuv420p process/from_rgb_96x64.yuv
+ff -f rawvideo -pix_fmt rgb24 -s 96x64 -i process/testsrc_96x64.rgb24 -sws_flags bicubic+accurate_rnd+full_chroma_int \
+	-f rawvideo -pix_fmt yuv420p process/from_rgb_96x64.accurate.yuv
+ff -f lavfi -i "aevalsrc='0.5*sin(2*PI*1000*t)|0.4*sin(2*PI*3000*t)':s=44100:d=0.25" -c:a pcm_s16le process/tone_44k_stereo.wav
+ff -i process/tone_44k_stereo.wav -ar 48000 -f f32le process/tone_48k_stereo.ffmpeg.f32le
+ff -i process/tone_44k_stereo.wav -ar 8000 -ac 1 -f f32le process/tone_8k_mono.ffmpeg.f32le

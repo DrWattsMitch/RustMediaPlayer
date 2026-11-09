@@ -21,20 +21,15 @@ impl AudioFrame {
 		format: SampleFormat,
 		layout: SampleLayout,
 	) -> Self {
-		let nb_samples = match layout {
-			SampleLayout::Interleaved => data.len() / (channels.count() as usize * format.bytes()),
-			SampleLayout::Planar => data.len() / format.bytes(),
-		};
+		// Samples per channel. Planar data holds one plane per channel back
+		// to back, so both layouts divide by channels × bytes per sample.
+		let nb_samples = data.len() / (usize::from(channels.count()).max(1) * format.bytes());
 		Self { data, sample_rate, channels, format, layout, nb_samples, pts: None }
 	}
 
+	/// Bytes of sample data (all channels, either layout).
 	pub fn frame_size(&self) -> usize {
-		match self.layout {
-			SampleLayout::Interleaved => {
-				self.nb_samples * self.channels.count() as usize * self.format.bytes()
-			}
-			SampleLayout::Planar => self.nb_samples * self.format.bytes(),
-		}
+		self.nb_samples * self.channels.count() as usize * self.format.bytes()
 	}
 
 	pub fn is_planar(&self) -> bool {

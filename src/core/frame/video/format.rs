@@ -1,10 +1,11 @@
 //! Raw (uncompressed) picture layouts.
 //!
-//! A [`Pixel`] is a planar layout plus a bit depth. It maps one-to-one onto
-//! FFmpeg's planar `AV_PIX_FMT_*` names (`yuv420p`, `yuv422p10le`, `gray`,
-//! ...), which is how streams describe it in `Parameters::pixel_format`.
-//! Samples deeper than 8 bits take two bytes, little-endian, as in FFmpeg's
-//! `*le` formats.
+//! A [`Pixel`] is a layout plus a bit depth. It maps one-to-one onto
+//! FFmpeg's `AV_PIX_FMT_*` names (`yuv420p`, `yuv422p10le`, `gray`, `rgb24`,
+//! `nv12`, ...), which is how streams describe it in
+//! `Parameters::pixel_format`. Planar samples deeper than 8 bits take two
+//! bytes, little-endian, as in FFmpeg's `*le` formats. Packed RGB and NV12
+//! are 8-bit only.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
@@ -17,6 +18,16 @@ pub enum PixelFormat {
 	YUVA444,
 	/// Luma only.
 	Gray,
+	/// Packed 8-bit R, G, B.
+	RGB24,
+	/// Packed 8-bit B, G, R.
+	BGR24,
+	/// Packed 8-bit R, G, B, A.
+	RGBA,
+	/// Packed 8-bit B, G, R, A.
+	BGRA,
+	/// 4:2:0 with a luma plane and one interleaved U/V plane.
+	NV12,
 }
 
 impl PixelFormat {
@@ -24,18 +35,43 @@ impl PixelFormat {
 	/// (FFmpeg's `log2_chroma_w` / `log2_chroma_h`).
 	pub const fn chroma_shift(self) -> (u32, u32) {
 		match self {
-			PixelFormat::YUV420 => (1, 1),
+			PixelFormat::YUV420 | PixelFormat::NV12 => (1, 1),
 			PixelFormat::YUV422 => (1, 0),
 			PixelFormat::YUV411 => (2, 0),
-			PixelFormat::YUV444 | PixelFormat::YUVA444 | PixelFormat::Gray => (0, 0),
+			_ => (0, 0),
 		}
 	}
 
+	/// Number of stored planes (1 for packed RGB, 2 for NV12).
 	pub const fn planes(self) -> usize {
 		match self {
-			PixelFormat::Gray => 1,
+			PixelFormat::Gray
+			| PixelFormat::RGB24
+			| PixelFormat::BGR24
+			| PixelFormat::RGBA
+			| PixelFormat::BGRA => 1,
+			PixelFormat::NV12 => 2,
 			PixelFormat::YUVA444 => 4,
 			_ => 3,
+		}
+	}
+
+	/// `true` for the RGB family (packed formats).
+	pub const fn is_rgb(self) -> bool {
+		matches!(self, PixelFormat::RGB24 | PixelFormat::BGR24 | PixelFormat::RGBA | PixelFormat::BGRA)
+	}
+
+	/// `true` when the layout carries an alpha channel.
+	pub const fn has_alpha(self) -> bool {
+		matches!(self, PixelFormat::YUVA444 | PixelFormat::RGBA | PixelFormat::BGRA)
+	}
+
+	/// Bytes per pixel of a packed RGB format (0 otherwise).
+	pub const fn packed_bytes(self) -> usize {
+		match self {
+			PixelFormat::RGB24 | PixelFormat::BGR24 => 3,
+			PixelFormat::RGBA | PixelFormat::BGRA => 4,
+			_ => 0,
 		}
 	}
 
@@ -47,6 +83,11 @@ impl PixelFormat {
 			PixelFormat::YUV411 => "yuv411p",
 			PixelFormat::YUVA444 => "yuva444p",
 			PixelFormat::Gray => "gray",
+			PixelFormat::RGB24 => "rgb24",
+			PixelFormat::BGR24 => "bgr24",
+			PixelFormat::RGBA => "rgba",
+			PixelFormat::BGRA => "bgra",
+			PixelFormat::NV12 => "nv12",
 		}
 	}
 }
@@ -59,7 +100,7 @@ fn supported_depth(format: PixelFormat, depth: u8) -> bool {
 			matches!(depth, 8 | 9 | 10 | 12 | 14 | 16)
 		}
 		PixelFormat::Gray => matches!(depth, 8 | 9 | 10 | 12 | 14 | 16),
-		PixelFormat::YUV411 | PixelFormat::YUVA444 => depth == 8,
+		_ => depth == 8,
 	}
 }
 
@@ -82,13 +123,18 @@ impl Pixel {
 
 	/// Parses an FFmpeg pixel format name such as `yuv420p` or `yuv444p10le`.
 	pub fn from_name(name: &str) -> Option<Self> {
-		const FORMATS: [PixelFormat; 6] = [
+		const FORMATS: [PixelFormat; 11] = [
 			PixelFormat::YUVA444,
 			PixelFormat::YUV420,
 			PixelFormat::YUV422,
 			PixelFormat::YUV444,
 			PixelFormat::YUV411,
 			PixelFormat::Gray,
+			PixelFormat::RGB24,
+			PixelFormat::BGR24,
+			PixelFormat::RGBA,
+			PixelFormat::BGRA,
+			PixelFormat::NV12,
 		];
 		for format in FORMATS {
 			let Some(rest) = name.strip_prefix(format.base_name()) else {
@@ -126,14 +172,19 @@ impl Pixel {
 	pub fn plane_sizes(&self, width: u32, height: u32) -> Option<Vec<usize>> {
 		let bps = self.bytes_per_sample();
 		let (sx, sy) = self.format.chroma_shift();
-		let luma = (width as usize).checked_mul(height as usize)?.checked_mul(bps)?;
+		let pixels = (width as usize).checked_mul(height as usize)?;
+		if self.format.is_rgb() {
+			return Some(vec![pixels.checked_mul(self.format.packed_bytes())?]);
+		}
+		let luma = pixels.checked_mul(bps)?;
 		let cw = (width as usize).div_ceil(1 << sx);
 		let ch = (height as usize).div_ceil(1 << sy);
 		let chroma = cw.checked_mul(ch)?.checked_mul(bps)?;
-		Some(match self.format.planes() {
-			1 => vec![luma],
-			3 => vec![luma, chroma, chroma],
-			_ => vec![luma, chroma, chroma, luma],
+		Some(match self.format {
+			PixelFormat::Gray => vec![luma],
+			PixelFormat::NV12 => vec![luma, chroma.checked_mul(2)?],
+			PixelFormat::YUVA444 => vec![luma, chroma, chroma, luma],
+			_ => vec![luma, chroma, chroma],
 		})
 	}
 
@@ -149,12 +200,24 @@ mod tests {
 
 	#[test]
 	fn names_round_trip() {
-		for name in ["yuv420p", "yuv422p10le", "yuv444p16le", "yuv411p", "yuva444p", "gray", "gray12le"]
-		{
+		for name in [
+			"yuv420p",
+			"yuv422p10le",
+			"yuv444p16le",
+			"yuv411p",
+			"yuva444p",
+			"gray",
+			"gray12le",
+			"rgb24",
+			"bgra",
+			"nv12",
+		] {
 			let pixel = Pixel::from_name(name).unwrap_or_else(|| panic!("{name}"));
 			assert_eq!(pixel.name(), name);
 		}
-		for name in ["yuv420p8le", "yuv411p10le", "rgb24", "yuv420p10be", "yuv420p11le", ""] {
+		for name in
+			["yuv420p8le", "yuv411p10le", "rgb48", "rgb2410le", "yuv420p10be", "yuv420p11le", ""]
+		{
 			assert!(Pixel::from_name(name).is_none(), "{name}");
 		}
 	}
@@ -167,5 +230,7 @@ mod tests {
 		assert_eq!(p.frame_size(4, 2), Some(2 * (8 + 2 * 4)));
 		let p = Pixel::from_name("yuv411p").unwrap();
 		assert_eq!(p.frame_size(9, 1), Some(9 + 2 * 3));
+		assert_eq!(Pixel::from_name("rgba").unwrap().frame_size(3, 2), Some(24));
+		assert_eq!(Pixel::from_name("nv12").unwrap().plane_sizes(5, 3), Some(vec![15, 12]));
 	}
 }

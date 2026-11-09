@@ -33,6 +33,9 @@ pub enum CodecPrivate {
 	Mp3(Box<crate::codecs::mp3::Mp3DecoderState>),
 	Aac(Box<crate::codecs::aac::AacDecoderState>),
 	H264(Box<crate::codecs::h264::H264DecoderState>),
+	Flac(Box<crate::codecs::flac::FlacDecoderState>),
+	FlacEncoder(Box<crate::codecs::flac::encoder::FlacEncoderState>),
+	Opus(Box<crate::codecs::opus::OpusDecoderState>),
 }
 
 #[derive(Debug, Clone)]

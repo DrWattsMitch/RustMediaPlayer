@@ -55,6 +55,10 @@ pub struct Parameters {
 	/// `avcC` record for H.264 or the AudioSpecificConfig for AAC. Empty when
 	/// the codec needs none.
 	pub extradata: Vec<u8>,
+	/// Bits per sample actually used by the codec, when it is not implied by
+	/// the codec ID (FFmpeg's `bits_per_raw_sample`): e.g. 24 for 24-bit FLAC,
+	/// which decodes to S32. `None` = unknown / not applicable.
+	pub bits_per_sample: Option<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +115,7 @@ impl Stream {
 				height: Some(height),
 				pixel_format: Some(pixel_format.to_string()),
 				extradata: Vec::new(),
+				bits_per_sample: None,
 			},
 			metadata: Metadata::default(),
 		}
@@ -132,6 +137,7 @@ impl Stream {
 				height: None,
 				pixel_format: None,
 				extradata: Vec::new(),
+				bits_per_sample: None,
 			},
 			metadata: Metadata::default(),
 		}

@@ -14,3 +14,9 @@ mod pcm_codec_test;
 
 #[path = "codecs/adpcm_decoder_test.rs"]
 mod adpcm_decoder_test;
+
+#[path = "codecs/flac_codec_test.rs"]
+mod flac_codec_test;
+
+#[path = "codecs/opus_decoder_test.rs"]
+mod opus_decoder_test;

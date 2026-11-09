@@ -9,6 +9,12 @@
 //! same track form a chunk. Per-sample bookkeeping (size, dts, composition
 //! offset, keyframe flag) is kept in memory and serialised into the sample
 //! tables when [`Muxer::finish`] writes `moov`.
+//!
+//! Video packets that carry a `pts` but no `dts` (Matroska stores only
+//! presentation times) are accepted: once the track is complete, its decode
+//! times are derived from the sorted presentation times, shifted so no
+//! sample is presented before it is decoded, and the shift is compensated
+//! by the edit list — the usual "dts from pts" reconstruction.
 
 use super::boxes::{Put, write_box, write_full_box};
 use super::codec::{self, EntryParams};
@@ -65,9 +71,31 @@ struct MuxTrack {
 	next_dts: u64,
 	bytes: u64,
 	max_sample_size: u32,
+	/// Decode times are derived from presentation times in `finish`; until
+	/// then `dts` holds the pts and `cts` is 0.
+	derive_dts: bool,
 }
 
 impl MuxTrack {
+	/// Replaces placeholder decode times with the sorted presentation times,
+	/// keeping every composition offset non-negative.
+	fn derive_decode_times(&mut self) {
+		if !self.derive_dts || self.samples.is_empty() {
+			return;
+		}
+		let pts: Vec<u64> = self.samples.iter().map(|s| s.dts).collect();
+		let mut sorted = pts.clone();
+		sorted.sort_unstable();
+		// Largest amount by which a sorted time runs ahead of the
+		// presentation time at the same position.
+		let shift = sorted.iter().zip(&pts).map(|(d, p)| d.saturating_sub(*p)).max().unwrap_or(0);
+		for (sample, (&d, &p)) in self.samples.iter_mut().zip(sorted.iter().zip(&pts)) {
+			sample.dts = d;
+			sample.cts = (i128::from(p) + i128::from(shift) - i128::from(d)) as i64;
+		}
+		self.derive_dts = false;
+	}
+
 	fn duration_of(&self, index: usize) -> u64 {
 		match self.samples.get(index + 1) {
 			Some(next) => next.dts.saturating_sub(self.samples[index].dts),
@@ -95,9 +123,12 @@ impl MuxTrack {
 		match self.kind {
 			StreamKind::Audio => self.encoder_delay.filter(|&d| d > 0 && d < self.media_duration()),
 			_ => {
+				// Sample times in the file start at the first decode time, so
+				// the edit is relative to it.
+				let first_dts = self.samples.first().map_or(0, |s| i128::from(s.dts));
 				let first_pts =
 					self.samples.iter().map(|s| i128::from(s.dts) + i128::from(s.cts)).min().unwrap_or(0);
-				u64::try_from(first_pts).ok().filter(|&p| p > 0)
+				u64::try_from(first_pts - first_dts).ok().filter(|&p| p > 0)
 			}
 		}
 	}
@@ -106,9 +137,19 @@ impl MuxTrack {
 	fn presentation_duration(&self) -> u64 {
 		let media = self.media_duration();
 		match self.edit_media_time() {
-			Some(start) => {
-				let padding = if self.kind == StreamKind::Audio { self.encoder_padding } else { 0 };
-				media.saturating_sub(start).saturating_sub(padding)
+			Some(start) if self.kind == StreamKind::Audio => {
+				media.saturating_sub(start).saturating_sub(self.encoder_padding)
+			}
+			Some(_) => {
+				// Video: from the first to the end of the last presented
+				// picture (with B-frames that ends after the last decode time).
+				let pts = |i: usize| i128::from(self.samples[i].dts) + i128::from(self.samples[i].cts);
+				let first = (0..self.samples.len()).map(pts).min().unwrap_or(0);
+				let end = (0..self.samples.len())
+					.map(|i| pts(i) + i128::from(self.duration_of(i)))
+					.max()
+					.unwrap_or(0);
+				u64::try_from(end - first).unwrap_or(media)
 			}
 			None => media,
 		}
@@ -504,6 +545,7 @@ impl Muxer for Mp4Muxer {
 			next_dts: 0,
 			bytes: 0,
 			max_sample_size: 0,
+			derive_dts: false,
 		});
 		Ok(self.tracks.len() - 1)
 	}
@@ -526,6 +568,13 @@ impl Muxer for Mp4Muxer {
 			Some(d) => Some(Self::to_track_ticks(d, timescale)?),
 			None => None,
 		};
+		if track.kind == StreamKind::Video && packet.dts.is_none() && packet.pts.is_some() {
+			if track.samples.is_empty() {
+				track.derive_dts = true;
+			}
+		} else if track.derive_dts {
+			return Err(Message::Container("mp4 muxer: mixed packets with and without dts"));
+		}
 		let dts = match packet.dts.or(packet.pts) {
 			Some(t) => Self::to_track_ticks(t, timescale)?,
 			None if !track.samples.is_empty() || duration.is_some() => track.next_dts,
@@ -538,7 +587,7 @@ impl Muxer for Mp4Muxer {
 			Some(t) => Self::to_track_ticks(t, timescale)?,
 			None => dts,
 		};
-		if track.samples.last().is_some_and(|last| dts < last.dts) {
+		if !track.derive_dts && track.samples.last().is_some_and(|last| dts < last.dts) {
 			return Err(Message::Container("mp4 muxer: non-monotonic dts"));
 		}
 		let step = duration.or_else(|| track.implicit_duration(&packet.data));
@@ -569,6 +618,9 @@ impl Muxer for Mp4Muxer {
 	fn finish(&mut self) -> Result<()> {
 		if !self.started {
 			self.start()?;
+		}
+		for track in &mut self.tracks {
+			track.derive_decode_times();
 		}
 		let moov = self.build_moov()?;
 		let mdat_size = self.position - self.mdat_start;

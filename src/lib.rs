@@ -4,4 +4,5 @@ pub mod container;
 pub mod core;
 pub mod io;
 mod message;
+pub mod process;
 pub use message::*;

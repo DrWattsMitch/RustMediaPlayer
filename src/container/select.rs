@@ -1,5 +1,5 @@
 use crate::Message;
-use crate::container::{mp3, mp4, riff, y4m};
+use crate::container::{flac, mp3, mp4, riff, y4m};
 use crate::core::{Hint, Muxer, Probe};
 use crate::io::Io;
 use crate::message::Result;
@@ -15,6 +15,10 @@ pub fn select_muxer(hint: Hint, io: Box<dyn Io>) -> Result<Box<dyn Muxer>> {
 
 	if mp4::Mp4Probe::muxer_matches(&hint) {
 		return mp4::Mp4Probe::create_muxer(io);
+	}
+
+	if flac::FlacProbe::muxer_matches(&hint) {
+		return flac::FlacProbe::create_muxer(io);
 	}
 
 	if mp3::Mp3Probe::muxer_matches(&hint) {

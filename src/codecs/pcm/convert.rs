@@ -107,17 +107,23 @@ pub fn for_each_sample(frame: &AudioFrame, mut visit: impl FnMut(Sample)) -> Res
 	Ok(())
 }
 
-/// Converts `frame` to interleaved `format`, returning the new sample bytes.
-pub fn convert(frame: &AudioFrame, format: SampleFormat) -> Result<Vec<u8>> {
-	let mut out = Vec::with_capacity(frame.data.len() / frame.format.bytes() * format.bytes());
-	for_each_sample(frame, |s| match format {
+/// Appends one sample in `format` (native little-endian layout).
+#[inline]
+pub fn write_sample(format: SampleFormat, s: Sample, out: &mut Vec<u8>) {
+	match format {
 		SampleFormat::U8 => out.push((s.to_int(8) as i8 as u8) ^ 0x80),
 		SampleFormat::S16 => out.extend_from_slice(&s.to_i16().to_le_bytes()),
 		SampleFormat::S32 => out.extend_from_slice(&s.to_i32().to_le_bytes()),
 		SampleFormat::S64 => out.extend_from_slice(&s.to_int(64).to_le_bytes()),
 		SampleFormat::F32 => out.extend_from_slice(&(s.to_float() as f32).to_le_bytes()),
 		SampleFormat::F64 => out.extend_from_slice(&s.to_float().to_le_bytes()),
-	})?;
+	}
+}
+
+/// Converts `frame` to interleaved `format`, returning the new sample bytes.
+pub fn convert(frame: &AudioFrame, format: SampleFormat) -> Result<Vec<u8>> {
+	let mut out = Vec::with_capacity(frame.data.len() / frame.format.bytes() * format.bytes());
+	for_each_sample(frame, |s| write_sample(format, s, &mut out))?;
 	Ok(out)
 }
 

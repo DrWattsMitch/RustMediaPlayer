@@ -1,8 +1,12 @@
 mod detect;
+pub mod flac;
+pub mod mkv;
 pub mod mp3;
 pub mod mp4;
+pub mod ogg;
 pub mod riff;
 mod select;
+pub mod xiph;
 pub mod y4m;
 pub use detect::*;
 pub use select::*;
