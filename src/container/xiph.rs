@@ -75,6 +75,13 @@ pub fn parse_comments(data: &[u8], metadata: &mut Metadata) -> Option<String> {
 
 /// Serialises `metadata` as a Vorbis comment list.
 pub fn write_comments(metadata: &Metadata, vendor: &str) -> Vec<u8> {
+	write_comments_with(metadata, vendor, false)
+}
+
+/// Serialises `metadata` as a Vorbis comment list; with `pictures`, the
+/// attached images become base64 `METADATA_BLOCK_PICTURE` comments, the
+/// way Ogg Opus and Ogg Vorbis carry cover art (FLAC uses PICTURE blocks).
+pub fn write_comments_with(metadata: &Metadata, vendor: &str, pictures: bool) -> Vec<u8> {
 	let mut entries: Vec<String> = Vec::new();
 	let mut push = |key: &str, value: &Option<String>| {
 		if let Some(v) = value {
@@ -103,7 +110,7 @@ pub fn write_comments(metadata: &Metadata, vendor: &str) -> Vec<u8> {
 		.raw
 		.iter()
 		.filter_map(|(k, v)| match v {
-			RawValue::String(s) if !k.contains('=') && k != "encoder" => {
+			RawValue::String(s) if !k.contains('=') && !is_internal_key(k) => {
 				Some((k.to_ascii_uppercase(), s))
 			}
 			_ => None,
@@ -113,6 +120,11 @@ pub fn write_comments(metadata: &Metadata, vendor: &str) -> Vec<u8> {
 	for (key, value) in raw {
 		entries.push(format!("{key}={value}"));
 	}
+	if pictures {
+		for image in &metadata.images {
+			entries.push(format!("METADATA_BLOCK_PICTURE={}", base64_encode(&write_picture(image))));
+		}
+	}
 
 	let mut out = Vec::new();
 	out.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
@@ -121,6 +133,96 @@ pub fn write_comments(metadata: &Metadata, vendor: &str) -> Vec<u8> {
 	for entry in entries {
 		out.extend_from_slice(&(entry.len() as u32).to_le_bytes());
 		out.extend_from_slice(entry.as_bytes());
+	}
+	out
+}
+
+/// Splits Xiph-style codec extradata (Vorbis, Theora) into its three header
+/// packets. Accepts FFmpeg's two layouts: `2` followed by the first two
+/// sizes in Xiph lacing (Matroska's `CodecPrivate` layout), or three 16-bit
+/// big-endian length-prefixed headers (FFmpeg's `avpriv_split_xiph_headers`).
+pub fn vorbis_headers(extradata: &[u8]) -> Option<Vec<Vec<u8>>> {
+	let mut c = ByteCursor::new(extradata);
+	if extradata.len() >= 6 && extradata[0] == 0 && extradata[1] == 30 {
+		let mut headers = Vec::with_capacity(3);
+		for _ in 0..3 {
+			let len = usize::from(c.read_u16().ok()?);
+			headers.push(c.read_bytes(len).ok()?.to_vec());
+		}
+		return Some(headers);
+	}
+	if c.read_u8().ok()? != 2 {
+		return None;
+	}
+	let mut sizes = [0usize; 2];
+	for size in &mut sizes {
+		loop {
+			let byte = c.read_u8().ok()?;
+			*size = size.checked_add(usize::from(byte))?;
+			if byte != 255 {
+				break;
+			}
+		}
+	}
+	let first = c.read_bytes(sizes[0]).ok()?.to_vec();
+	let second = c.read_bytes(sizes[1]).ok()?.to_vec();
+	let third = c.rest().to_vec();
+	if first.is_empty() || third.is_empty() {
+		return None;
+	}
+	Some(vec![first, second, third])
+}
+
+/// Joins header packets in Matroska's `CodecPrivate` layout: the count less
+/// one, every size but the last in Xiph lacing, then the headers.
+pub fn lace_headers(headers: &[Vec<u8>]) -> Vec<u8> {
+	let mut out = vec![headers.len().saturating_sub(1) as u8];
+	for h in headers.iter().take(headers.len().saturating_sub(1)) {
+		let mut n = h.len();
+		while n >= 255 {
+			out.push(255);
+			n -= 255;
+		}
+		out.push(n as u8);
+	}
+	for h in headers {
+		out.extend_from_slice(h);
+	}
+	out
+}
+
+/// Metadata keys that describe how RMP demuxed a stream rather than the
+/// content, and so are never written back as tags.
+pub fn is_internal_key(key: &str) -> bool {
+	matches!(
+		key,
+		"encoder"
+			| "encoder_delay"
+			| "encoder_padding"
+			| "language"
+			| "title"
+			| "matroska_codec_id"
+			| "default"
+			| "lame_tag"
+			| "duration"
+			| "vendor"
+	)
+}
+
+/// Standard base64 with padding (RFC 4648 §4).
+pub fn base64_encode(data: &[u8]) -> String {
+	const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+	for chunk in data.chunks(3) {
+		let b = [chunk[0], chunk.get(1).copied().unwrap_or(0), chunk.get(2).copied().unwrap_or(0)];
+		let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+		for i in 0..4 {
+			if i <= chunk.len() {
+				out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
+			} else {
+				out.push('=');
+			}
+		}
 	}
 	out
 }
@@ -185,6 +287,28 @@ pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn base64_round_trips() {
+		for data in [&b""[..], b"f", b"fo", b"foo", b"foob", b"fooba", b"foobar", &[0xFF, 0x00, 0x7F]] {
+			let text = super::base64_encode(data);
+			assert_eq!(super::base64_decode(&text).as_deref(), Some(data), "{text}");
+		}
+		assert_eq!(super::base64_encode(b"foobar"), "Zm9vYmFy");
+		assert_eq!(super::base64_encode(b"fo"), "Zm8=");
+	}
+
+	#[test]
+	fn vorbis_header_layouts() {
+		let headers = vec![vec![1u8; 30], vec![3u8; 300], vec![5u8; 7]];
+		let laced = super::lace_headers(&headers);
+		assert_eq!(super::vorbis_headers(&laced), Some(headers.clone()));
+		let mut prefixed = Vec::new();
+		for h in &headers {
+			prefixed.extend_from_slice(&(h.len() as u16).to_be_bytes());
+			prefixed.extend_from_slice(h);
+		}
+		assert_eq!(super::vorbis_headers(&prefixed), Some(headers));
+	}
 	use super::*;
 
 	#[test]

@@ -425,16 +425,22 @@ impl MkvDemuxer {
 		let mut block = None;
 		let mut duration = None;
 		let mut referenced = false;
+		let mut discard_ns = 0i64;
 		for (eid, child) in Children::new(body) {
 			match eid {
 				id::BLOCK => block = Some(child),
 				id::BLOCK_DURATION => duration = ebml::uint(child).ok(),
 				id::REFERENCE_BLOCK => referenced = true,
+				id::DISCARD_PADDING => discard_ns = ebml::sint(child).unwrap_or(0),
 				_ => {}
 			}
 		}
 		if let Some(block) = block {
+			let before = self.queue.len();
 			self.parse_block(block, Some((duration, !referenced)));
+			if discard_ns > 0 && self.queue.len() == before + 1 {
+				self.apply_discard_padding(discard_ns as u64);
+			}
 		}
 	}
 
@@ -496,6 +502,24 @@ impl MkvDemuxer {
 				(Some(t), Some(d)) => t.checked_add(d),
 				_ => None,
 			};
+		}
+	}
+
+	/// `DiscardPadding` on an Opus block is end trimming (FFmpeg's
+	/// `AV_PKT_DATA_SKIP_SAMPLES`). RMP reports it the way the Ogg demuxer
+	/// does: the packet's duration shrinks to the samples that are kept,
+	/// expressed in 1/48000 s so no precision is lost to the 1 ms ticks.
+	fn apply_discard_padding(&mut self, padding_ns: u64) {
+		let Some(packet) = self.queue.back_mut() else { return };
+		let Some(stream) = self.streams.get(packet.stream_id) else { return };
+		if stream.parameters.codec.id != "opus" {
+			return;
+		}
+		let Some((samples, _)) = packet_samples(&stream.parameters, &packet.data) else { return };
+		let padding = (u128::from(padding_ns) * 48_000 / 1_000_000_000) as u64;
+		let kept = samples.saturating_sub(padding);
+		if kept < samples {
+			packet.duration = Some(Time::new(kept, TimeBase::new(1, 48_000)));
 		}
 	}
 

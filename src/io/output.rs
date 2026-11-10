@@ -12,6 +12,8 @@ pub struct Output {
 	called: bool,
 	metadata: Metadata,
 	muxer: Option<Box<dyn Muxer>>,
+	/// Container forced by name (`mkv`, `ogg`, ...) instead of the extension.
+	format: Option<String>,
 }
 
 impl Output {
@@ -50,12 +52,30 @@ impl Output {
 	}
 
 	fn extension(&self) -> Option<String> {
+		if let Some(format) = &self.format {
+			return Some(format.clone());
+		}
 		self.path.extension().and_then(|e| e.to_str()).map(|s| s.to_string())
 	}
 
 	pub fn create(path: impl AsRef<std::path::Path>) -> Result<Self> {
 		let path = path.as_ref().to_path_buf();
-		Ok(Self { path, io: None, called: false, metadata: Metadata::default(), muxer: None })
+		Ok(Self {
+			path,
+			io: None,
+			called: false,
+			metadata: Metadata::default(),
+			muxer: None,
+			format: None,
+		})
+	}
+
+	/// Like [`Output::create`], with the container named explicitly (an
+	/// extension such as `mkv`, `webm`, `ogg`, `flac`), as FFmpeg's `-f`.
+	pub fn create_as(path: impl AsRef<std::path::Path>, format: &str) -> Result<Self> {
+		let mut output = Self::create(path)?;
+		output.format = Some(format.to_ascii_lowercase());
+		Ok(output)
 	}
 }
 

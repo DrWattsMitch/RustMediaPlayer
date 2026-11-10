@@ -5,4 +5,5 @@
 pub mod demuxer;
 pub mod muxer;
 pub mod probe;
+pub mod stats;
 pub use probe::*;

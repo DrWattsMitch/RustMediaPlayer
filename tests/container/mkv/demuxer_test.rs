@@ -66,7 +66,15 @@ fn assert_matches_ffmpeg(name: &str) {
 		let pts = p.pts.expect("pts").ticks() as i64;
 		assert_eq!(pts, e.pts + delay_ticks(&demuxer, e.stream), "{at}: pts");
 		if let Some(d) = e.duration {
-			assert_eq!(p.duration.map(|t| t.ticks()), Some(d), "{at}: duration");
+			let duration = p.duration.expect("duration");
+			if duration.base() == demuxer.streams().streams[e.stream].time_base {
+				assert_eq!(duration.ticks(), d, "{at}: duration");
+			} else {
+				// End-trimmed Opus packet (DiscardPadding): the kept samples,
+				// in 1/48000 s, are fewer than the coded duration.
+				assert_eq!(duration.base(), rmp::core::TimeBase::new(1, 48_000), "{at}");
+				assert!(duration.ticks() < d * 48, "{at}: trimmed duration");
+			}
 		}
 		assert_eq!(p.data.len(), e.size, "{at}: size");
 		assert_eq!(p.keyframe, e.keyframe, "{at}: keyframe");

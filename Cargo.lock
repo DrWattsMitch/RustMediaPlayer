@@ -274,19 +274,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
-name = "rmp"
-version = "0.1.2"
-dependencies = [
- "clap",
- "nom",
- "reqwest",
- "rustc-hash",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1003,6 +990,19 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rmp"
+version = "0.2.0"
+dependencies = [
+ "clap",
+ "nom",
+ "reqwest",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

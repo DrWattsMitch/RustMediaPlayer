@@ -16,181 +16,213 @@ performance standards of FFmpeg, redesigned for Rust and written in safe Rust.
 
 ## Installation
 
-To install the command-line tool, run:
+Build and install the `rmp` command-line tool from this repository:
 
 ```bash
-cargo install rmp
+cargo install --git https://github.com/DrWattsMitch/RustMediaPlayer
+# or, from a checkout:
+cargo install --path .
 ```
 
-This downloads and compiles `rmp`, placing the binary in your Cargo bin
-directory.
+This compiles `rmp` and places it in your Cargo bin directory. (The `rmp`
+crate on crates.io is an unrelated MessagePack library, so
+`cargo install rmp` doesn't install this tool.)
 
-To use `rmp` as a library in your Rust project, add it to your `Cargo.toml`
-dependencies:
+To use RMP as a library, add it as a Git dependency:
 
 ```toml
 [dependencies]
-rmp = "0.2"
+rmp = { git = "https://github.com/DrWattsMitch/RustMediaPlayer" }
 ```
 
 ## Getting Started
 
-The simplest operation is transcoding a file from one format to another. For
-example, reading a WAV file and writing it back:
+`rmp` uses FFmpeg's command-line conventions: `-i` names the input, the
+last argument is the output, and the output's extension picks the
+container. Without an output, `rmp` describes the input:
 
 ```bash
-rmp -i input.wav -o output.wav
+rmp -i movie.mkv                   # duration, tags, streams
+rmp -i movie.mkv --show            # ... and one line per packet
 ```
 
-You can apply transforms to modify the media during processing. Transforms
-execute in the order they appear and can perform operations such as gain
-adjustment or normalization:
+```
+Input: movie.mkv
+  Duration: 00:00:02 (2.000 s)
+  Metadata:
+    Title: MKV Song
+  Stream #0: video h264, 64x48
+  Stream #1: audio flac, 44100 Hz, 1 ch, 16-bit
+    language: fra
+  Stream #2: subtitle subrip
+```
+
+### Changing containers (stream copy)
+
+When the output container can hold a stream's codec, `rmp` copies it
+without re-encoding, like `ffmpeg -c copy`:
 
 ```bash
-rmp -i input.wav -o output.wav --apply gain=2.0 --apply normalize
+rmp -i input.mp4 output.mkv        # H.264 + AAC into Matroska
+rmp -i input.mkv output.mp4        # and back (subtitles are dropped: MP4 can't hold them)
+rmp -i input.mkv audio.mka         # audio and subtitles only
+rmp -i clip.webm clip.opus         # WebM Opus → Ogg Opus, sample-exact
+rmp -i voice.opus voice.webm       # Ogg Opus → WebM
+rmp -i music.ogg music.mka         # Ogg Vorbis → Matroska audio
+rmp -i song.flac song.oga          # FLAC → Ogg FLAC
+rmp -i frames.y4m frames.mkv       # raw video into Matroska (V_UNCOMPRESSED)
+rmp -i input.mkv -c copy out.webm  # WebM takes only VP8/VP9/AV1, Opus/Vorbis, WebVTT
 ```
 
-To inspect a media file without transcoding, use the `--show` flag. This prints
-frame-level metadata, similar to `ffprobe`, including timing, sample count,
-channel configuration, and sample rate:
+### Decoding and re-encoding
+
+RMP decodes PCM, ADPCM, MP3, AAC, H.264, FLAC and Opus, and encodes FLAC,
+PCM and raw video. Without `-c:a`/`-c:v`, each container gets a sensible
+default (WAV → `pcm_s16le`, FLAC/Ogg/Matroska → FLAC when the source can't be
+copied, Y4M → `rawvideo`):
 
 ```bash
-rmp -i input.wav --show
+rmp -i song.mp3 song.flac                          # MP3 → FLAC
+rmp -i song.m4a song.wav                           # AAC → 16-bit PCM WAV
+rmp -i voice.opus voice.wav -c:a pcm_f32le         # Opus → 32-bit float WAV
+rmp -i song.mp3 song.ogg                           # MP3 → FLAC in Ogg
+rmp -i input.mp4 output.mkv -c:a flac              # copy H.264, AAC → FLAC
+rmp -i input.wav output.flac -compression_level 8  # FLAC level 0-12
 ```
 
-Output example:
-
-```
-Frame 0: pts=0, samples=1024, channels=2, rate=44100
-Frame 1: pts=1024, samples=1024, channels=2, rate=44100
-```
-
-Batch processing is supported using glob patterns. Each file is processed
-independently, enabling parallel execution:
+Resampling, remixing and sample-format changes re-encode (as in FFmpeg):
 
 ```bash
-rmp -i "folder/*.wav" -o out/
+rmp -i input.flac output.wav -ar 48000 -ac 1 -sample_fmt s32
+rmp -i input.mp3 output.mka -ar 48000              # MP3 → 48 kHz FLAC in Matroska
+```
+
+Video is decoded to raw pictures, and can be scaled and converted:
+
+```bash
+rmp -i input.mp4 frames.y4m                        # H.264 → YUV4MPEG2
+rmp -i input.mp4 small.y4m -s 320x180 -pix_fmt yuv444p -sws_flags lanczos
+rmp -i input.mp4 -c:v rawvideo -an raw.mkv         # decoded video in Matroska
+rmp -i frames.y4m big.mkv -s 1280x720              # scale raw video
+```
+
+### Choosing streams, tags and formats
+
+```bash
+rmp -i movie.mkv -vn soundtrack.flac               # drop video (-an: audio, -sn: subtitles)
+rmp -i song.flac -metadata title="New Title" -metadata artist=Me out.oga
+rmp -i song.flac -map_metadata -1 untagged.flac    # drop the input's tags
+rmp -i input.wav -f flac output.audio              # container by name, not extension
+rmp -y -i input.wav output.flac                    # overwrite (rmp refuses by default)
+```
+
+### Batch processing
+
+A glob (`*`, `?` in the file name) converts every matching file into an
+output directory, several at a time:
+
+```bash
+rmp -i "recordings/*.wav" -f flac flac/            # recordings/a.wav → flac/a.flac
+rmp -i "videos/*.mp4" -f mkv -j 4 mkv/             # 4 files at a time (default: CPU count)
+rmp -i "music/*.flac"                              # describe each file
 ```
 
 ## Library
 
-The library exposes the same primitives used internally by the CLI. A pipeline
-reads packets from a container, decodes them into frames, optionally applies
-transforms, encodes the frames, and writes them to an output container.
-
-Example WAV transcoding pipeline:
+The CLI is a thin layer over the library. The whole pipeline is one call:
 
 ```rust
-use rmp::container::{WavReader, WavWriter};
-use rmp::codecs::{PcmDecoder, PcmEncoder};
-use rmp::core::{Decoder, Encoder, Demuxer, Muxer, Timebase};
-use std::fs::File;
+use rmp::transcode::{Options, transcode};
 
-fn main() -> std::io::Result<()> {
-    let input = File::open("input.wav")?;
-    let mut reader = WavReader::new(input)?;
-    let format = reader.format();
+fn main() -> rmp::Result<()> {
+    let mut options = Options::default();
+    options.audio_codec = Some("flac".into());
+    options.sample_rate = Some(48_000);
+    let summary = transcode("input.mp4", "output.mka", &options)?;
+    for line in &summary.streams {
+        println!("{line}"); // e.g. "stream 1: audio aac -> flac (48000 Hz, 2 ch)"
+    }
+    Ok(())
+}
+```
 
-    let output = File::create("output.wav")?;
-    let mut writer = WavWriter::new(output, format)?;
+`Options::parse` accepts the same FFmpeg-style arguments as the CLI.
 
-    let mut decoder = PcmDecoder::new(format);
-    let mut encoder = PcmEncoder::new(Timebase::new(1, format.sample_rate));
+The building blocks are the same ones the pipeline uses. A demuxer reads
+packets from a container, a decoder turns packets into frames, `rmp::process`
+converts frames, an encoder turns frames back into packets, and a muxer
+writes them. Remuxing (stream copy) is a demuxer feeding a muxer:
 
-    while let Some(packet) = reader.read_packet()? {
-        if let Some(frame) = decoder.decode(packet)? {
-            if let Some(out_packet) = encoder.encode(frame)? {
-                writer.write_packet(out_packet)?;
+```rust
+use rmp::core::traits::*;
+use rmp::io::{Input, Output};
+
+fn main() -> rmp::Result<()> {
+    let mut input = Input::open("input.mp4")?;
+    let mut output = Output::create("output.mkv")?; // container from the extension
+    output.set_metadata(input.metadata().clone())?;
+    for stream in input.streams().iter() {
+        output.add(stream)?;
+    }
+    while let Some(packet) = input.read()? {
+        output.write(packet)?;
+    }
+    output.finish()
+}
+```
+
+Decoding goes through the `Resolver`, which picks a decoder for a stream's
+codec:
+
+```rust
+use rmp::core::traits::*;
+use rmp::core::{Frame, Resolver};
+use rmp::io::Input;
+
+fn main() -> rmp::Result<()> {
+    let mut input = Input::open("song.flac")?;
+    let stream = input.streams().streams[0].clone();
+    let decoder = Resolver::new().decoder_for(&stream).ok_or("no decoder")?;
+    let mut state = decoder.create_state(&stream.parameters);
+    let mut samples = 0;
+    while let Some(packet) = input.read()? {
+        for frame in decoder.decode(&mut state, packet)?.value {
+            if let Frame::Audio(audio) = frame {
+                samples += audio.nb_samples;
             }
         }
     }
-
-    writer.finalize()?;
+    println!("{samples} samples per channel");
     Ok(())
 }
 ```
 
 ## Core Concepts
 
-Media processing revolves around two main data types: `Packet` and `Frame`. A
-`Packet` represents encoded data in a container, while a `Frame` represents
-decoded data ready for processing or playback. Data flows predictably: readers
-demux containers into packets, decoders convert packets into frames, transforms
-modify frames, encoders convert frames back into packets, and writers mux
-packets into output files.
-
-Example `Frame` structure:
-
-```rust
-pub struct Frame {
-    pub data: Vec<u8>,
-    pub pts: i64,
-    pub timebase: Timebase,
-    pub sample_rate: u32,
-    pub channels: u8,
-    pub nb_samples: usize,
-}
-```
-
-Example `Packet` structure:
+Media processing revolves around two main data types: `Packet` and `Frame`.
+A `Packet` is encoded data from a container, and a `Frame` is decoded audio
+or video ready for processing or playback. Data flows predictably: demuxers
+split containers into packets, decoders turn packets into frames, converters
+in `rmp::process` change sample format, rate, layout, size or pixel format,
+encoders turn frames back into packets, and muxers write packets into output
+files.
 
 ```rust
 pub struct Packet {
+    pub stream_id: StreamId,
     pub data: Vec<u8>,
-    pub pts: i64,
-    pub dts: i64,
-    pub timebase: Timebase,
-    pub stream_index: usize,
+    pub pts: Option<Time>,      // each Time carries its own time base
+    pub dts: Option<Time>,
+    pub duration: Option<Time>,
+    pub keyframe: bool,
 }
 ```
 
-## Transforms
-
-Transforms modify frames in the pipeline. Built-in transforms include `Gain` for
-multiplying sample amplitudes and `Normalize` for scaling samples to a target
-peak.
-
-Example of applying transforms:
-
-```rust
-use rmp::transform::{Gain, Normalize};
-use rmp::core::Transform;
-
-let mut gain = Gain::new(2.0);
-let mut normalize = Normalize::new(0.95);
-
-let frame = decoder.decode(packet)?.unwrap();
-let frame = gain.apply(frame)?;
-let frame = normalize.apply(frame)?;
-```
-
-Custom transforms can be implemented by the `Transform` trait:
-
-```rust
-pub struct Invert;
-
-impl Transform for Invert {
-    fn apply(&mut self, mut frame: Frame) -> Result<Frame> {
-        for i in (0..frame.data.len()).step_by(2) {
-            let sample = i16::from_le_bytes([frame.data[i], frame.data[i + 1]]);
-            let inverted = (-sample).to_le_bytes();
-            frame.data[i] = inverted[0];
-            frame.data[i + 1] = inverted[1];
-        }
-        Ok(frame)
-    }
-
-    fn name(&self) -> &'static str {
-        "invert"
-    }
-}
-```
-
-CLI transforms are specified as `name=value` pairs:
-
-```bash
-rmp -i input.wav -o output.wav --apply gain=1.5 --apply normalize=0.9
-```
+A `Stream` describes one track: its kind (audio, video, subtitle), time
+base, codec `Parameters` (codec ID using FFmpeg's names, sample rate,
+channels, picture size, pixel format, `extradata`) and metadata. Gapless
+audio is described by `encoder_delay` / `encoder_padding` stream metadata,
+in samples, which every container that can store it reads and writes.
 
 ## Formats
 
@@ -207,11 +239,15 @@ Containers:
   for H.264, HEVC, AV1, MPEG-4, AAC, MP3, ALAC, Opus and FLAC.
 - **Matroska / WebM** (`.mkv`, `.mka`, `.webm`): demux of every track type,
   laced blocks, live streams with unknown sizes, cues or index-based seeking,
-  tags, attachments (cover art) and subtitle tracks.
+  tags, attachments (cover art) and subtitle tracks. Mux with SeekHead,
+  cues, tags, attachments, Opus `CodecDelay`/`DiscardPadding`, raw video
+  (`V_UNCOMPRESSED`), and WebM's codec rules; remuxes are packet-identical
+  to the source in `ffprobe`.
 - **FLAC** (`.flac`): demux (with seek table and bisection seeking) and mux
   (STREAMINFO with MD5, Vorbis comments, pictures).
-- **Ogg** (`.ogg`, `.opus`, `.oga`): demux of Opus, FLAC and Vorbis streams,
-  with Vorbis comments and `METADATA_BLOCK_PICTURE` cover art.
+- **Ogg** (`.ogg`, `.opus`, `.oga`): demux and mux of Opus, FLAC and Vorbis
+  streams, with Vorbis comments and `METADATA_BLOCK_PICTURE` cover art. The
+  muxer writes exact granule positions and FFmpeg's page layout.
 
 Codecs:
 
@@ -236,9 +272,11 @@ bilinear, bicubic, Lanczos) with YUV ↔ RGB conversion (BT.601/709/2020,
 limited or full range).
 
 See [docs/WAV_Y4M.md](docs/WAV_Y4M.md), [docs/MP3_MP4.md](docs/MP3_MP4.md),
-[docs/AAC_H264.md](docs/AAC_H264.md) and
-[docs/MKV_FLAC_OPUS_PROCESSING.md](docs/MKV_FLAC_OPUS_PROCESSING.md) for how
-each part works and how to extend it. Try it with the examples:
+[docs/AAC_H264.md](docs/AAC_H264.md),
+[docs/MKV_FLAC_OPUS_PROCESSING.md](docs/MKV_FLAC_OPUS_PROCESSING.md) and
+[docs/MKV_OGG_MUXING_CLI.md](docs/MKV_OGG_MUXING_CLI.md) for how each part
+works and how to extend it. The examples show single features in a few
+lines each:
 
 ```bash
 cargo run --release --example probe       -- input.mp4
@@ -248,10 +286,11 @@ cargo run --release --example pcm_convert -- input.wav output.wav pcm_s24le
 cargo run --release --example mp3_to_wav  -- input.mp3 output.wav
 cargo run --release --example transcode   -- input.mkv output.flac -ar 48000
 cargo run --release --example transcode   -- input.opus output.wav -c:a pcm_f32le
+cargo run --release --example framecrc    -- input.mkv   # like ffmpeg -f framecrc
 ```
 
-Video uses the same pipeline as audio. A Y4M stream is `rawvideo` with its
-layout in `pixel_format`, and each packet is one planar picture:
+Raw video is the `rawvideo` codec with its layout in `pixel_format`, and
+each packet is one planar picture:
 
 ```rust
 use rmp::core::traits::*;
@@ -273,11 +312,55 @@ output.finish()?;
 
 ## CLI Reference
 
-- `-i`: input file or glob pattern.
-- `-o`: output file or directory.
-- `--show`: inspection mode, prints frame metadata.
-- `--apply`: add transform to pipeline (multiple allowed).
-- `--codec`: select output codec (default matches input).
+```text
+rmp -i <input> [--show]                           describe the input
+rmp [-y|-n] -i <input> [options] <output>         convert
+rmp -i "<dir>/*.<ext>" [-f fmt] [-j N] [options] <out-dir>/   batch
+```
+
+| Option | Meaning |
+| --- | --- |
+| `-i <input>` | Input file, URL, or glob pattern (`*`, `?` in the file name) |
+| `-o <output>` | Output file or directory (or give it as the last argument) |
+| `-y` / `-n` | Overwrite / never overwrite an existing output (the default refuses) |
+| `-j <jobs>` | Files converted at once in batch mode (default: CPU count) |
+| `--show` | When describing an input, also list every packet |
+| `-an`, `-vn`, `-sn` | Drop audio, video or subtitle streams |
+| `-c:a <codec\|copy>` | Audio codec: `flac`, `pcm_s16le`, `pcm_s24le`, `pcm_s32le`, `pcm_f32le`, `pcm_u8`, `pcm_alaw`, `pcm_mulaw`, ..., or `copy` |
+| `-c:v <codec\|copy>` | Video codec: `rawvideo` or `copy` |
+| `-c:s copy` | Copy subtitles (Matroska; WebVTT into WebM) |
+| `-c copy` | Copy every stream |
+| `-ar <rate>` | Output sample rate (polyphase resampler) |
+| `-ac <channels>` | Output channel count (FFmpeg's default remix matrices) |
+| `-sample_fmt <fmt>` | `u8`, `s16`, `s32`, `s64`, `flt`, `dbl` (add `p` for planar) |
+| `-compression_level <n>` | FLAC level 0-12 (default 5) |
+| `-s <W>x<H>` | Output picture size |
+| `-pix_fmt <name>` | `yuv420p`, `yuv422p`, `yuv444p`, `yuv420p10le`, `gray`, `rgb24`, `nv12`, ... |
+| `-sws_flags <filter>` | Scaler: `point`, `bilinear`, `bicubic` (default), `lanczos` |
+| `-f <format>` | Output container by name: `wav`, `flac`, `mp3`, `mp4`, `m4a`, `mov`, `mkv`, `mka`, `webm`, `ogg`, `oga`, `opus`, `y4m` |
+| `-metadata key=value` | Set a tag (`title`, `artist`, `album`, `album_artist`, `genre`, `date`, `comment`, `track`, `disc`, or any other key) |
+| `-map_metadata -1` | Don't copy the input's tags |
+| `-h`, `--help`, `--version` | Help and version |
+
+Default codecs per output container (when `-c:a`/`-c:v` aren't given):
+
+| Output | Audio | Video | Subtitles |
+| --- | --- | --- | --- |
+| `.wav` | `pcm_s16le` | dropped | dropped |
+| `.flac` | `flac` | dropped | dropped |
+| `.mp3` | copy (MP3 only) | dropped | dropped |
+| `.y4m` | dropped | `rawvideo` | dropped |
+| `.mp4`, `.mov` | copy if MP4 holds it, else `flac` | copy | dropped |
+| `.m4a` | copy if MP4 holds it, else `flac` | dropped | dropped |
+| `.mkv` | copy if Matroska holds it, else `flac` | copy | copy |
+| `.mka` | copy if Matroska holds it, else `flac` | dropped | copy |
+| `.webm` | copy (Opus, Vorbis) | copy (VP8, VP9, AV1) | copy (WebVTT) |
+| `.ogg`, `.oga` | copy (Opus, FLAC, Vorbis), else `flac` | dropped | dropped |
+| `.opus` | copy (Opus only) | dropped | dropped |
+
+`-ar`, `-ac` and `-sample_fmt` switch a copy default to FLAC; `-s` and
+`-pix_fmt` switch it to `rawvideo`. RMP has no Opus, Vorbis, AAC, MP3 or
+H.264/VP9 encoder, so WebM, `.opus` and `.mp3` output are stream copies.
 
 ## Fork Notice
 

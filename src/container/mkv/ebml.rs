@@ -22,6 +22,9 @@ pub mod id {
 	pub const EBML: u32 = 0x1A45_DFA3;
 	pub const EBML_MAX_ID_LENGTH: u32 = 0x42F2;
 	pub const EBML_MAX_SIZE_LENGTH: u32 = 0x42F3;
+	pub const EBML_VERSION: u32 = 0x4286;
+	pub const EBML_READ_VERSION: u32 = 0x42F7;
+	pub const DOC_TYPE_VERSION: u32 = 0x4287;
 	pub const DOC_TYPE: u32 = 0x4282;
 	pub const DOC_TYPE_READ_VERSION: u32 = 0x4285;
 	pub const VOID: u32 = 0xEC;
@@ -68,6 +71,7 @@ pub mod id {
 	pub const FLAG_ENABLED: u32 = 0xB9;
 	pub const FLAG_DEFAULT: u32 = 0x88;
 	pub const FLAG_FORCED: u32 = 0x55AA;
+	pub const FLAG_LACING: u32 = 0x9C;
 	pub const DEFAULT_DURATION: u32 = 0x23E383;
 	pub const NAME: u32 = 0x536E;
 	pub const LANGUAGE: u32 = 0x22B59C;
@@ -79,6 +83,7 @@ pub mod id {
 	pub const VIDEO: u32 = 0xE0;
 	pub const PIXEL_WIDTH: u32 = 0xB0;
 	pub const PIXEL_HEIGHT: u32 = 0xBA;
+	pub const COLOUR_SPACE: u32 = 0x2EB524;
 	pub const DISPLAY_WIDTH: u32 = 0x54B0;
 	pub const DISPLAY_HEIGHT: u32 = 0x54BA;
 	pub const AUDIO: u32 = 0xE1;
@@ -117,6 +122,7 @@ pub mod id {
 	pub const FILE_NAME: u32 = 0x466E;
 	pub const FILE_MEDIA_TYPE: u32 = 0x4660;
 	pub const FILE_DATA: u32 = 0x465C;
+	pub const FILE_UID: u32 = 0x46AE;
 }
 
 /// IDs that may appear directly under `Segment`. Seeing one while inside an
@@ -278,6 +284,101 @@ pub fn child_string(data: &[u8], wanted: u32) -> Option<String> {
 	find(data, wanted).map(string)
 }
 
+// --- Writing -------------------------------------------------------------
+//
+// The muxer builds elements in memory (`Vec<u8>`), children first, so every
+// size is known when its header is written; only the `Segment` (and nothing
+// else) is written with a placeholder size that `finish` patches.
+// FFmpeg: `libavformat/matroskaenc.c` (`put_ebml_id`, `put_ebml_num`,
+// `put_ebml_uint`, `put_ebml_float`, `put_ebml_void`).
+
+/// An 8-byte "unknown size" vint (all value bits set).
+pub const UNKNOWN_SIZE: [u8; 8] = [0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+
+/// Bytes needed to store `size` as a vint (1-8). The all-ones value of each
+/// length is reserved for "unknown", so it needs the next length.
+pub fn size_len(size: u64) -> usize {
+	(1..8).find(|&n| size < (1u64 << (7 * n)) - 1).unwrap_or(8)
+}
+
+/// Writes an element ID (its bytes as the specification writes them).
+pub fn put_id(out: &mut Vec<u8>, id: u32) {
+	let bytes = id.to_be_bytes();
+	let skip = (id.leading_zeros() / 8).min(3) as usize;
+	out.extend_from_slice(&bytes[skip..]);
+}
+
+/// Writes `size` as a vint of exactly `len` bytes (`len` ≥ [`size_len`]).
+pub fn put_size_len(out: &mut Vec<u8>, size: u64, len: usize) {
+	let len = len.clamp(1, 8);
+	let value = size | (1u64 << (7 * len));
+	out.extend_from_slice(&value.to_be_bytes()[8 - len..]);
+}
+
+/// Writes `size` as the shortest vint.
+pub fn put_size(out: &mut Vec<u8>, size: u64) {
+	put_size_len(out, size, size_len(size));
+}
+
+/// Writes a complete element.
+pub fn put_element(out: &mut Vec<u8>, id: u32, body: &[u8]) {
+	put_id(out, id);
+	put_size(out, body.len() as u64);
+	out.extend_from_slice(body);
+}
+
+/// Writes a master element whose children are produced by `children`.
+pub fn put_master(out: &mut Vec<u8>, id: u32, children: impl FnOnce(&mut Vec<u8>)) {
+	let mut body = Vec::new();
+	children(&mut body);
+	put_element(out, id, &body);
+}
+
+/// Unsigned integer element in the fewest bytes (at least one).
+pub fn put_uint(out: &mut Vec<u8>, id: u32, value: u64) {
+	let len = (8 - value.leading_zeros() as usize / 8).max(1);
+	put_element(out, id, &value.to_be_bytes()[8 - len..]);
+}
+
+/// Signed integer element in the fewest two's-complement bytes.
+pub fn put_sint(out: &mut Vec<u8>, id: u32, value: i64) {
+	let bytes = value.to_be_bytes();
+	let mut len = 8;
+	while len > 1 {
+		let (first, next) = (bytes[8 - len], bytes[9 - len]);
+		// Drop a leading byte that only repeats the next byte's sign bit.
+		if (first == 0 && next & 0x80 == 0) || (first == 0xFF && next & 0x80 != 0) {
+			len -= 1;
+		} else {
+			break;
+		}
+	}
+	put_element(out, id, &bytes[8 - len..]);
+}
+
+/// 8-byte IEEE float element.
+pub fn put_float(out: &mut Vec<u8>, id: u32, value: f64) {
+	put_element(out, id, &value.to_bits().to_be_bytes());
+}
+
+/// String / UTF-8 element.
+pub fn put_string(out: &mut Vec<u8>, id: u32, value: &str) {
+	put_element(out, id, value.as_bytes());
+}
+
+/// A `Void` element occupying exactly `total` bytes (`total` ≥ 2).
+pub fn put_void(out: &mut Vec<u8>, total: usize) {
+	if total < 2 {
+		return;
+	}
+	out.push(0xEC);
+	// One size byte holds up to 126; longer voids use an 8-byte size.
+	let size_len = if total - 2 <= 126 { 1 } else { 8 };
+	let body = total - 1 - size_len;
+	put_size_len(out, body as u64, size_len);
+	out.resize(out.len() + body, 0);
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -312,5 +413,43 @@ mod tests {
 		assert_eq!(float(&2.25f64.to_bits().to_be_bytes()).unwrap(), 2.25);
 		assert!(float(&[1, 2, 3]).is_err());
 		assert_eq!(string(b"und\0\0"), "und");
+	}
+
+	#[test]
+	fn writers_round_trip() {
+		for size in [0u64, 1, 126, 127, 128, 16_382, 16_383, 1 << 40] {
+			let mut out = Vec::new();
+			put_size(&mut out, size);
+			let (value, unknown) = read_vint(&mut ByteCursor::new(&out)).unwrap();
+			assert_eq!((value, unknown), (size, false), "size {size}");
+		}
+		let mut out = Vec::new();
+		put_uint(&mut out, id::TIMESTAMP_SCALE, 1_000_000);
+		assert_eq!(out, [0x2A, 0xD7, 0xB1, 0x83, 0x0F, 0x42, 0x40]);
+		for v in [0i64, 1, -1, 127, 128, -128, -129, 13_500_000, i64::MIN, i64::MAX] {
+			let mut out = Vec::new();
+			put_sint(&mut out, id::DISCARD_PADDING, v);
+			let h = parse_header(&out).unwrap();
+			assert_eq!(sint(&out[h.len..]).unwrap(), v, "{v}");
+		}
+		let mut out = Vec::new();
+		put_uint(&mut out, id::TRACK_NUMBER, 0);
+		assert_eq!(out, [0xD7, 0x81, 0x00]);
+		for total in [2usize, 9, 128, 129, 130, 1000] {
+			let mut out = Vec::new();
+			put_void(&mut out, total);
+			assert_eq!(out.len(), total);
+			let h = parse_header(&out).unwrap();
+			assert_eq!((h.id, h.len as u64 + h.size.unwrap()), (id::VOID, total as u64));
+		}
+		assert!(
+			parse_header(&UNKNOWN_SIZE.iter().fold(vec![0xA3], |mut v, b| {
+				v.push(*b);
+				v
+			}))
+			.unwrap()
+			.size
+			.is_none()
+		);
 	}
 }

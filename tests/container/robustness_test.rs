@@ -289,3 +289,96 @@ fn random_bytes_are_rejected_cleanly() {
 		}
 	}
 }
+
+/// Remuxes whatever a (possibly corrupted) demuxer yields into Matroska,
+/// WebM and Ogg, then reads each result back. Muxers may refuse streams or
+/// packets with an error, but must never panic, and what they write must
+/// stay readable.
+fn remux_everywhere(
+	data: &[u8],
+	open: &dyn Fn(Vec<u8>) -> Option<Box<dyn Demuxer>>,
+	rng: &mut Rng,
+) {
+	use rmp::container::mkv::muxer::MkvMuxer;
+	use rmp::container::ogg::muxer::OggMuxer;
+	use rmp::core::Muxer;
+	use rmp::io::MemoryIo;
+	let Some(mut demuxer) = open(data.to_vec()) else { return };
+	let mut packets = Vec::new();
+	for _ in 0..4000 {
+		match demuxer.read() {
+			Ok(Some(mut p)) => {
+				// Damage timestamps too: missing, reordered or huge.
+				match rng.below(40) {
+					0 => p.pts = None,
+					1 => p.duration = None,
+					2 => {
+						p.pts = Some(rmp::core::Time::new(rng.next() >> 20, rmp::core::TimeBase::new(1, 1000)))
+					}
+					_ => {}
+				}
+				packets.push(p);
+			}
+			_ => break,
+		}
+	}
+	for kind in 0..3 {
+		let out = MemoryIo::new();
+		let mut muxer: Box<dyn Muxer> = match kind {
+			0 => Box::new(MkvMuxer::new(Box::new(out.clone()), false)),
+			1 => Box::new(MkvMuxer::new(Box::new(out.clone()), true)),
+			_ => Box::new(OggMuxer::new(Box::new(out.clone()), false)),
+		};
+		let _ = muxer.set_metadata(demuxer.metadata().clone());
+		let mut added = Vec::new();
+		for s in demuxer.streams().iter() {
+			if muxer.add(s).is_ok() {
+				added.push(s.id);
+			}
+		}
+		if added.is_empty() {
+			continue;
+		}
+		for p in packets.iter().filter(|p| added.contains(&p.stream_id)) {
+			let _ = muxer.write(p.clone());
+		}
+		if muxer.finish().is_err() {
+			continue;
+		}
+		let bytes = out.contents();
+		let back: Option<Box<dyn Demuxer>> = match kind {
+			0 | 1 => MkvDemuxer::new(memory(bytes)).ok().map(|d| Box::new(d) as Box<dyn Demuxer>),
+			_ => OggDemuxer::new(memory(bytes)).ok().map(|d| Box::new(d) as Box<dyn Demuxer>),
+		};
+		let mut back = back.expect("a finished muxer output reopens");
+		drain(back.as_mut());
+	}
+}
+
+#[test]
+fn mkv_and_ogg_muxers_survive_corrupted_input() {
+	let mkv_sources = [
+		fixture("mkv/h264_aac.mkv"),
+		fixture("mkv/h264_flac_srt.mkv"),
+		fixture("mkv/vp9_opus_vtt.webm"),
+		fixture("opus/celt_51.webm"),
+	];
+	let ogg_sources =
+		[fixture("ogg/st_cover.opus"), fixture("ogg/flac.oga"), fixture("ogg/vorbis.ogg")];
+	let open_mkv =
+		|d: Vec<u8>| MkvDemuxer::new(memory(d)).ok().map(|d| Box::new(d) as Box<dyn Demuxer>);
+	let open_ogg =
+		|d: Vec<u8>| OggDemuxer::new(memory(d)).ok().map(|d| Box::new(d) as Box<dyn Demuxer>);
+	let open_mp4 =
+		|d: Vec<u8>| Mp4Demuxer::new(memory(d)).ok().map(|d| Box::new(d) as Box<dyn Demuxer>);
+	let mut rng = Rng::new(seed() ^ 21);
+	for round in 0..rounds() {
+		let i = round as usize;
+		let data = mutate(&mkv_sources[i % mkv_sources.len()], &mut rng);
+		remux_everywhere(&data, &open_mkv, &mut rng);
+		let data = mutate(&ogg_sources[i % ogg_sources.len()], &mut rng);
+		remux_everywhere(&data, &open_ogg, &mut rng);
+		let data = mutate(&fixture("mp4/aac_tagged_cover.m4a"), &mut rng);
+		remux_everywhere(&data, &open_mp4, &mut rng);
+	}
+}

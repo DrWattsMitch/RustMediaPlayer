@@ -5,4 +5,5 @@ pub mod core;
 pub mod io;
 mod message;
 pub mod process;
+pub mod transcode;
 pub use message::*;

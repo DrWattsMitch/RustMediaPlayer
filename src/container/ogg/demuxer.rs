@@ -221,24 +221,6 @@ fn new_logical(first: &[u8], serial: u32, index: usize) -> Option<Logical> {
 	})
 }
 
-/// FFmpeg's Vorbis extradata: `2`, the first two header sizes in Xiph
-/// lacing, then the three headers.
-fn xiph_extradata(headers: &[Vec<u8>]) -> Vec<u8> {
-	let mut out = vec![2u8];
-	for h in &headers[..2] {
-		let mut n = h.len();
-		while n >= 255 {
-			out.push(255);
-			n -= 255;
-		}
-		out.push(n as u8);
-	}
-	for h in headers {
-		out.extend_from_slice(h);
-	}
-	out
-}
-
 impl OggDemuxer {
 	pub fn new(io: Box<dyn Io>) -> Result<Self> {
 		let mut reader = BufferedReader::new(io);
@@ -278,7 +260,7 @@ impl OggDemuxer {
 				if l.vorbis_headers.len() < 3 {
 					return Err(Message::Container("ogg: vorbis headers missing"));
 				}
-				l.parameters.extradata = xiph_extradata(&l.vorbis_headers);
+				l.parameters.extradata = xiph::lace_headers(&l.vorbis_headers);
 			}
 		}
 		let data_start = data_start.unwrap_or_else(|| reader.position());
@@ -688,7 +670,7 @@ mod tests {
 	#[test]
 	fn xiph_lacing() {
 		let headers = vec![vec![1u8; 300], vec![3u8; 10], vec![5u8; 2]];
-		let out = xiph_extradata(&headers);
+		let out = xiph::lace_headers(&headers);
 		assert_eq!(&out[..4], &[2, 255, 45, 10]);
 		assert_eq!(out.len(), 4 + 312);
 	}

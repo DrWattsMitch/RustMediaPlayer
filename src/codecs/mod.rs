@@ -9,3 +9,4 @@ pub mod mp3;
 pub mod opus;
 pub mod pcm;
 pub mod raw;
+pub mod vorbis;

@@ -38,3 +38,9 @@ mod mkv_demuxer_test;
 
 #[path = "container/ogg/demuxer_test.rs"]
 mod ogg_demuxer_test;
+
+#[path = "container/mkv/muxer_test.rs"]
+mod mkv_muxer_test;
+
+#[path = "container/ogg/muxer_test.rs"]
+mod ogg_muxer_test;

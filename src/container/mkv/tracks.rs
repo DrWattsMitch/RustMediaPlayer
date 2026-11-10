@@ -6,6 +6,7 @@
 
 use super::ebml::{self, Children, id};
 use crate::codecs::flac;
+use crate::container::xiph;
 use crate::core::{
 	CodecId, Metadata, Parameters, RawValue, Stream, StreamId, StreamKind, TimeBase,
 };
@@ -57,6 +58,7 @@ pub fn codec_name(codec_id: &str, bit_depth: u64) -> String {
 		"V_THEORA" => "theora",
 		"V_PRORES" => "prores",
 		"V_FFV1" => "ffv1",
+		"V_UNCOMPRESSED" => "rawvideo",
 		"A_OPUS" => "opus",
 		"A_VORBIS" => "vorbis",
 		"A_FLAC" => "flac",
@@ -210,6 +212,10 @@ pub fn parse_entry(entry: &[u8], index: usize, time_base: TimeBase) -> Result<Tr
 		let height = ebml::child_uint(video, id::PIXEL_HEIGHT, 0);
 		parameters.width = u32::try_from(width).ok().filter(|&w| w > 0);
 		parameters.height = u32::try_from(height).ok().filter(|&h| h > 0);
+		if codec_id == "V_UNCOMPRESSED" {
+			let fourcc = ebml::find(video, id::COLOUR_SPACE).and_then(|b| <[u8; 4]>::try_from(b).ok());
+			parameters.pixel_format = fourcc.and_then(pixel_format_for).map(str::to_string);
+		}
 	}
 	if let Some(audio) = ebml::find(entry, id::AUDIO) {
 		let rate = ebml::child_float(audio, id::SAMPLING_FREQUENCY).unwrap_or(8000.0);
@@ -302,6 +308,147 @@ pub fn parse_entry(entry: &[u8], index: usize, time_base: TimeBase) -> Result<Tr
 	})
 }
 
+/// FourCC ↔ pixel format for `V_UNCOMPRESSED` tracks (`ColourSpace`), the
+/// subset of FFmpeg's `ff_raw_pix_fmt_tags` RMP's raw codec handles.
+const RAW_FOURCCS: [([u8; 4], &str); 9] = [
+	(*b"I420", "yuv420p"),
+	(*b"Y42B", "yuv422p"),
+	(*b"444P", "yuv444p"),
+	(*b"Y41B", "yuv411p"),
+	(*b"Y800", "gray"),
+	(*b"NV12", "nv12"),
+	([b'R', b'G', b'B', 24], "rgb24"),
+	([b'B', b'G', b'R', 24], "bgr24"),
+	(*b"RGBA", "rgba"),
+];
+
+fn pixel_format_for(fourcc: [u8; 4]) -> Option<&'static str> {
+	RAW_FOURCCS.iter().find(|(f, _)| *f == fourcc).map(|(_, name)| *name)
+}
+
+/// How one RMP stream is stored in Matroska.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuxCodec {
+	pub codec_id: &'static str,
+	pub private: Vec<u8>,
+	/// `BitDepth` for PCM tracks.
+	pub bit_depth: Option<u8>,
+	/// `ColourSpace` FourCC for `V_UNCOMPRESSED`.
+	pub colour_space: Option<[u8; 4]>,
+}
+
+/// Matroska codec ID for an FFmpeg codec name (the inverse of
+/// [`codec_name`]), with the PCM bit depth where the ID needs one.
+fn mux_codec_id(codec: &str) -> Option<(&'static str, Option<u8>)> {
+	Some(match codec {
+		"h264" => ("V_MPEG4/ISO/AVC", None),
+		"hevc" => ("V_MPEGH/ISO/HEVC", None),
+		"av1" => ("V_AV1", None),
+		"vp8" => ("V_VP8", None),
+		"vp9" => ("V_VP9", None),
+		"mpeg4" => ("V_MPEG4/ISO/ASP", None),
+		"mpeg1video" => ("V_MPEG1", None),
+		"mpeg2video" => ("V_MPEG2", None),
+		"mjpeg" => ("V_MJPEG", None),
+		"theora" => ("V_THEORA", None),
+		"prores" => ("V_PRORES", None),
+		"ffv1" => ("V_FFV1", None),
+		"rawvideo" => ("V_UNCOMPRESSED", None),
+		"opus" => ("A_OPUS", None),
+		"vorbis" => ("A_VORBIS", None),
+		"flac" => ("A_FLAC", None),
+		"alac" => ("A_ALAC", None),
+		"mp3" => ("A_MPEG/L3", None),
+		"mp2" => ("A_MPEG/L2", None),
+		"mp1" => ("A_MPEG/L1", None),
+		"aac" => ("A_AAC", None),
+		"ac3" => ("A_AC3", None),
+		"eac3" => ("A_EAC3", None),
+		"dts" => ("A_DTS", None),
+		"truehd" => ("A_TRUEHD", None),
+		"pcm_u8" => ("A_PCM/INT/LIT", Some(8)),
+		"pcm_s16le" => ("A_PCM/INT/LIT", Some(16)),
+		"pcm_s24le" => ("A_PCM/INT/LIT", Some(24)),
+		"pcm_s32le" => ("A_PCM/INT/LIT", Some(32)),
+		"pcm_s8" => ("A_PCM/INT/BIG", Some(8)),
+		"pcm_s16be" => ("A_PCM/INT/BIG", Some(16)),
+		"pcm_s24be" => ("A_PCM/INT/BIG", Some(24)),
+		"pcm_s32be" => ("A_PCM/INT/BIG", Some(32)),
+		"pcm_f32le" => ("A_PCM/FLOAT/IEEE", Some(32)),
+		"pcm_f64le" => ("A_PCM/FLOAT/IEEE", Some(64)),
+		"subrip" => ("S_TEXT/UTF8", None),
+		"ass" => ("S_TEXT/ASS", None),
+		// FFmpeg 6.1 writes WebVTT with the WebM codec ID in both flavours.
+		"webvtt" => ("D_WEBVTT/SUBTITLES", None),
+		"dvd_subtitle" => ("S_VOBSUB", None),
+		"hdmv_pgs_subtitle" => ("S_HDMV/PGS", None),
+		_ => return None,
+	})
+}
+
+/// Codecs WebM allows (FFmpeg's `webm` muxer: VP8/VP9/AV1, Opus/Vorbis,
+/// WebVTT).
+fn webm_allows(codec: &str) -> bool {
+	matches!(codec, "vp8" | "vp9" | "av1" | "opus" | "vorbis" | "webvtt")
+}
+
+/// Codec ID and `CodecPrivate` for a stream (FFmpeg's
+/// `mkv_write_codecprivate`), or why Matroska / WebM can't carry it.
+pub fn mux_codec(parameters: &Parameters, webm: bool) -> Result<MuxCodec, &'static str> {
+	let codec = parameters.codec.id.as_str();
+	let (codec_id, bit_depth) = mux_codec_id(codec).ok_or("codec not supported by matroska")?;
+	if webm && !webm_allows(codec) {
+		return Err("webm only holds vp8, vp9, av1, opus, vorbis and webvtt (use .mkv)");
+	}
+	let extradata = &parameters.extradata;
+	let mut colour_space = None;
+	let private = match codec {
+		"h264" | "hevc" => {
+			// Matroska stores the avcC / hvcC record; Annex B extradata (start
+			// codes) would need converting, which no RMP source produces.
+			let annex_b = extradata.starts_with(&[0, 0, 1]) || extradata.starts_with(&[0, 0, 0, 1]);
+			if extradata.is_empty() || annex_b {
+				return Err("h264/hevc in matroska needs avcC/hvcC extradata");
+			}
+			extradata.clone()
+		}
+		"flac" => {
+			let info = flac::StreamInfo::from_extradata(extradata)
+				.ok_or("flac stream has no STREAMINFO extradata")?;
+			let mut out = b"fLaC".to_vec();
+			out.extend(info.to_block(true));
+			out
+		}
+		"opus" => {
+			if crate::codecs::opus::header::OpusHead::parse(extradata).is_some() {
+				extradata.clone()
+			} else {
+				let channels = parameters.channels.ok_or("opus stream has no channel count")?;
+				if channels > 2 {
+					return Err("multichannel opus needs its OpusHead extradata");
+				}
+				crate::codecs::opus::header::OpusHead::new(channels, 0, 48_000).to_bytes()
+			}
+		}
+		"vorbis" => {
+			let headers = xiph::vorbis_headers(extradata).ok_or("vorbis stream has no headers")?;
+			xiph::lace_headers(&headers)
+		}
+		// FFmpeg's ALAC extradata is the 36-byte `alac` atom; Matroska keeps
+		// only the ALACSpecificConfig after its 12-byte atom header.
+		"alac" if extradata.len() >= 36 && &extradata[4..8] == b"alac" => extradata[12..].to_vec(),
+		"rawvideo" => {
+			let name = parameters.pixel_format.as_deref().unwrap_or("yuv420p");
+			let fourcc = RAW_FOURCCS.iter().find(|(_, n)| *n == name).map(|(f, _)| *f);
+			colour_space = Some(fourcc.ok_or("raw pixel format not supported by matroska")?);
+			Vec::new()
+		}
+		_ if codec.starts_with("pcm_") => Vec::new(),
+		_ => extradata.clone(),
+	};
+	Ok(MuxCodec { codec_id, private, bit_depth, colour_space })
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -321,5 +468,27 @@ mod tests {
 		assert_eq!(codec_name("A_PCM/FLOAT/IEEE", 64), "pcm_f64le");
 		assert_eq!(codec_name("V_MPEG4/ISO/AVC", 0), "h264");
 		assert_eq!(codec_name("A_AAC/MPEG4/LC/SBR", 0), "aac");
+	}
+
+	#[test]
+	fn mux_ids_invert_demux_names() {
+		for (codec, bits) in [
+			("h264", 0),
+			("vp9", 0),
+			("opus", 0),
+			("flac", 0),
+			("pcm_s24le", 24),
+			("pcm_s16be", 16),
+			("pcm_f64le", 64),
+			("subrip", 0),
+			("webvtt", 0),
+			("rawvideo", 0),
+		] {
+			let (id, depth) = mux_codec_id(codec).unwrap();
+			assert_eq!(codec_name(id, depth.map_or(bits, u64::from)), codec, "{codec}");
+		}
+		for (fourcc, name) in RAW_FOURCCS {
+			assert_eq!(pixel_format_for(fourcc), Some(name));
+		}
 	}
 }
