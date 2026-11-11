@@ -130,6 +130,31 @@ rmp -i input.wav -f flac output.audio              # container by name, not exte
 rmp -y -i input.wav output.flac                    # overwrite (rmp refuses by default)
 ```
 
+### Streaming and web playback (MP4)
+
+```bash
+rmp -i movie.mkv -c copy -movflags +faststart web.mp4      # moov first: plays while downloading
+rmp -i movie.mkv -c copy -movflags frag_keyframe+empty_moov+default_base_moof live.mp4
+                                                           # fragmented MP4 for MSE / HLS / DASH
+rmp -i movie.mp4 -c copy -frag_duration 2000000 frag.mp4   # a fragment every 2 s
+```
+
+Fragmented output never seeks, so it also works when writing to a pipe.
+Fragmented MP4 files (RMP's, FFmpeg's, DASH/CMAF segments joined into one
+file) are read like any other MP4.
+
+### Bit depth and dithering
+
+Audio rounded to fewer bits (float or 24-bit sources to 16-bit WAV/FLAC,
+any resample or remix to integers) is dithered with triangular (TPDF) noise
+by default, so quiet passages and fades don't turn into distortion:
+
+```bash
+rmp -i song.opus song.wav                                  # TPDF dither (default)
+rmp -i song.opus -dither_method lipshitz song.wav          # noise-shaped (44.1/48 kHz)
+rmp -i song.opus -dither_method none song.wav              # plain rounding, like FFmpeg
+```
+
 ### Batch processing
 
 A glob (`*`, `?` in the file name) converts every matching file into an
@@ -249,8 +274,9 @@ Containers:
 - **MP3**: MPEG-1/2/2.5 audio streams with ID3v1/ID3v2 tags, Xing/Info/VBRI
   headers (exact duration, VBR seeking) and LAME gapless info. Demux and mux.
 - **MP4 / M4A / MOV**: ISO BMFF with any number of tracks, B-frame timing,
-  edit lists, keyframe seeking and iTunes metadata/cover art. Demux, and mux
-  for H.264, HEVC, AV1, MPEG-4, AAC, MP3, ALAC, Opus and FLAC.
+  edit lists, keyframe seeking and iTunes metadata/cover art. Demux
+  (including fragmented MP4), and mux for H.264, HEVC, AV1, MPEG-4, AAC,
+  MP3, ALAC, Opus and FLAC, with `+faststart` or as fragmented MP4.
 - **Matroska / WebM** (`.mkv`, `.mka`, `.webm`): demux of every track type,
   laced blocks, live streams with unknown sizes, cues or index-based seeking,
   tags, attachments (cover art) and subtitle tracks. Mux with SeekHead,
@@ -366,11 +392,16 @@ rmp -i "<dir>/*.<ext>" [-f fmt] [-j N] [options] <out-dir>/   batch
 | `-ar <rate>` | Output sample rate (polyphase resampler) |
 | `-ac <channels>` | Output channel count (FFmpeg's default remix matrices) |
 | `-sample_fmt <fmt>` | `u8`, `s16`, `s32`, `s64`, `flt`, `dbl` (add `p` for planar) |
+| `-dither_method <m>` | Rounding to integer samples: `triangular` (default when precision is lost), `triangular_hp`, `rectangular`, `lipshitz` (noise shaped, 44.1/48 kHz), `none` |
+| `-dither_scale <x>` | Dither noise level, 0-8 (default 1) |
 | `-compression_level <n>` | FLAC level 0-12 (default 5) |
 | `-s <W>x<H>` | Output picture size |
 | `-pix_fmt <name>` | `yuv420p`, `yuv422p`, `yuv444p`, `yuv420p10le`, `gray`, `rgb24`, `nv12`, ... |
 | `-sws_flags <filter>` | Scaler: `point`, `bilinear`, `bicubic` (default), `lanczos` |
 | `-f <format>` | Output container by name: `wav`, `flac`, `mp3`, `mp4`, `m4a`, `mov`, `mkv`, `mka`, `webm`, `ogg`, `oga`, `opus`, `y4m` |
+| `-movflags <flags>` | MP4 layout: `+faststart`; `frag_keyframe`, `frag_every_frame`, `empty_moov`, `default_base_moof`, `separate_moof`, `skip_trailer` (fragmented MP4) |
+| `-frag_duration <µs>` | Fragmented MP4: cut a fragment every N microseconds |
+| `-min_frag_duration <µs>` | Fragmented MP4: never cut a fragment shorter than this |
 | `-metadata key=value` | Set a tag (`title`, `artist`, `album`, `album_artist`, `genre`, `date`, `comment`, `track`, `disc`, or any other key) |
 | `-map_metadata -1` | Don't copy the input's tags |
 | `-h`, `--help`, `--version` | Help and version |

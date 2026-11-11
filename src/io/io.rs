@@ -39,9 +39,17 @@ impl File {
 		Ok(Self { file })
 	}
 
+	/// Creates (or truncates) a file for writing. It is also opened for
+	/// reading when the system allows, so muxers can move data they already
+	/// wrote (MP4 `+faststart`); otherwise it is write-only, as before.
 	pub fn create(path: impl AsRef<Path>) -> Result<Self> {
-		let file = std::fs::File::create(path.as_ref())?;
-
+		let path = path.as_ref();
+		let read_write =
+			std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path);
+		let file = match read_write {
+			Ok(file) => file,
+			Err(_) => std::fs::File::create(path)?,
+		};
 		Ok(Self { file })
 	}
 }

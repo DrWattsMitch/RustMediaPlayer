@@ -247,8 +247,9 @@ For each `trak`:
   same idea as FFmpeg's `mov_build_index`.
 - **`edts/elst`**: see §5.2.
 
-A malformed track is skipped and the rest of the file stays playable. A file
-with only `mvex`/`moof` fragments is rejected with a clear message.
+A malformed track is skipped and the rest of the file stays playable.
+Fragmented files (`mvex` + `moof`) are read too: see
+[FRAGMENTED_MP4_DITHER.md](FRAGMENTED_MP4_DITHER.md) §3.5.
 
 ### 5.2 Timestamps and edit lists
 
@@ -383,8 +384,7 @@ packet counts.
 | --- | --- |
 | No AAC/H.264/HEVC **decoders**, so MP4 is remux-only. | Add `codecs/aac` and register it in `Resolver::decoder_for`. Extradata is already present. |
 | No MP3 **encoder**. MP3 output requires already-encoded frames. | A Layer III encoder (psychoacoustic model + bit allocation) is a large, separate project. |
-| Fragmented MP4 (`moof`/`mvex`, DASH/CMAF) is rejected. | Extend `load_moov` to collect `moof`/`traf`/`trun` and append to each `Track::samples`. |
-| No `+faststart` (`moov` before `mdat`) when muxing. | In `finish`, build `moov` first, add its size to every chunk offset, then move `mdat`. This needs a second pass or a temporary file. |
+| Fragmented MP4 and `+faststart` were added in a later batch. | [FRAGMENTED_MP4_DITHER.md](FRAGMENTED_MP4_DITHER.md) |
 | The MP4 muxer writes only the first sample description, so mid-stream codec changes aren't supported. | `codec::write_stsd` |
 | Raw PCM tracks in MOV (`sowt`/`twos`), one sample per audio frame, can hit the 2²² sample cap on long files. | Group PCM samples per chunk in `sample_table::build_index`, as FFmpeg does. |
 | MP3 free-format bitrate is unsupported. | `FrameHeader::parse` plus minimp3's `mp3d_find_frame` logic. |

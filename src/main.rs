@@ -47,6 +47,10 @@ Stream options:
   -ar <rate>            output sample rate (resampled)
   -ac <channels>        output channels (FFmpeg's default remix)
   -sample_fmt <fmt>     u8, s16, s32, s64, flt, dbl (add p for planar)
+  -dither_method <m>    rounding to integer samples: triangular (default when
+                        precision is lost), triangular_hp, rectangular,
+                        lipshitz (noise shaped, 44.1/48 kHz), none (FFmpeg's)
+  -dither_scale <x>     dither noise level, 0-8 (default 1)
   -compression_level n  FLAC level 0-12 (default 5)
   -b:a <rate>           AAC bit rate, e.g. 128k (default 64k per channel)
   -b:v <rate>           H.264 average bit rate, e.g. 2M
@@ -56,6 +60,12 @@ Stream options:
   -pix_fmt <name>       yuv420p, yuv422p, yuv444p, yuv420p10le, gray, rgb24, nv12, ...
   -sws_flags <filter>   point, bilinear, bicubic (default), lanczos
   -f <format>           output container: wav flac mp3 mp4 m4a mov mkv mka webm ogg oga opus y4m
+  -movflags <flags>     MP4 layout: +faststart (moov first, for progressive web
+                        playback) or frag_keyframe+empty_moov+default_base_moof
+                        (fragmented MP4 for MSE / HLS / DASH); also
+                        frag_every_frame, separate_moof, skip_trailer
+  -frag_duration <us>   fragmented MP4: cut a fragment every <us> microseconds
+  -min_frag_duration <us>  fragmented MP4: never cut fragments shorter than this
   -metadata key=value   set a tag (title, artist, album, date, track, ...)
   -map_metadata -1      don't copy the input's tags
 

@@ -333,7 +333,7 @@ RMP_FUZZ_ROUNDS=6000 RMP_FUZZ_SEED=7 cargo test --test container robustness
 | Other WAV codecs (GSM 6.10, G.726, `0x0055` MP3-in-WAV, WAVE_FORMAT_EXTENSIBLE channel masks) | `resolve_codec`. MP3-in-WAV can reuse the MP3 decoder. |
 | The WAV muxer doesn't write WAVE_FORMAT_EXTENSIBLE for more than 2 channels or more than 16 bits. FFmpeg and most readers accept the plain form. | `RiffMuxer::write_header`. |
 | No RF64/BW64 for files over 4 GiB. Muxing fails cleanly. | New chunk handling in both RIFF files. |
-| Sample-format conversion has no dithering, and there is no channel remix or resampling in the pipeline. | Move `pcm::convert` into a core audio-conversion stage; `core/resampler` already exists. |
+| Sample-format conversion has no dithering, and there is no channel remix or resampling in the pipeline. | Done in later batches: `process::audio` ([MKV_FLAC_OPUS_PROCESSING.md](MKV_FLAC_OPUS_PROCESSING.md)) and `process::dither` ([FRAGMENTED_MP4_DITHER.md](FRAGMENTED_MP4_DITHER.md)). |
 | Y4M per-frame parameters (`FRAME Ixyz`) are skipped, not applied, and seeking assumes plain `FRAME\n` headers. | `Y4mDemuxer::read` / `seek`. |
 
 ---

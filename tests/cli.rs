@@ -221,3 +221,84 @@ fn encodes_aac_and_h264() {
 	]);
 	assert!(!ok && err.contains("bit rate"), "{err}");
 }
+
+#[test]
+fn movflags_select_the_mp4_layout() {
+	let dir = tempfile::tempdir().unwrap();
+	let source = fixture("mp4/h264_bframes_aac.mp4");
+	let top = |path: &Path| {
+		let data = std::fs::read(path).unwrap();
+		let mut kinds = Vec::new();
+		let mut at = 0;
+		while at + 8 <= data.len() {
+			let mut size = u32::from_be_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+			if size == 1 {
+				size = u64::from_be_bytes(data[at + 8..at + 16].try_into().unwrap()) as usize;
+			}
+			kinds.push(String::from_utf8_lossy(&data[at + 4..at + 8]).into_owned());
+			at += size.max(8);
+		}
+		kinds
+	};
+
+	let fast = tmp(&dir, "fast.mp4");
+	let (ok, _, err) =
+		rmp(&["-i", &source, "-c", "copy", "-movflags", "+faststart", fast.to_str().unwrap()]);
+	assert!(ok, "{err}");
+	assert_eq!(top(&fast), vec!["ftyp", "moov", "mdat"]);
+
+	let frag = tmp(&dir, "frag.mp4");
+	let args =
+		["-i", &source, "-c", "copy", "-movflags", "frag_keyframe+empty_moov+default_base_moof"];
+	let (ok, _, err) =
+		rmp(&[&args[..], &["-frag_duration", "500000", frag.to_str().unwrap()]].concat());
+	assert!(ok, "{err}");
+	let kinds = top(&frag);
+	assert_eq!((&kinds[0][..], &kinds[1][..], &kinds[2][..]), ("ftyp", "moov", "moof"));
+	assert_eq!(kinds.last().map(String::as_str), Some("mfra"));
+
+	// Typos and containers without these options are refused up front.
+	let bad = tmp(&dir, "bad.mp4");
+	let (ok, _, err) = rmp(&["-i", &source, "-movflags", "+fast_start", bad.to_str().unwrap()]);
+	assert!(!ok && err.contains("faststart"), "{err}");
+	let mkv = tmp(&dir, "out.mkv");
+	let (ok, _, err) =
+		rmp(&["-i", &source, "-c", "copy", "-movflags", "+faststart", mkv.to_str().unwrap()]);
+	assert!(!ok && err.contains("MP4"), "{err}");
+	assert!(!mkv.exists());
+}
+
+#[test]
+fn dithers_when_rounding_to_integer_samples() {
+	let dir = tempfile::tempdir().unwrap();
+	// Opus decodes to float, so writing 16-bit PCM loses precision.
+	let source = fixture("opus/hybrid_st.webm");
+	let pcm = |name: &str, extra: &[&str]| {
+		let out = tmp(&dir, name);
+		let (ok, _, err) = rmp(&[&["-i", &source][..], extra, &[out.to_str().unwrap()]].concat());
+		assert!(ok, "{err}");
+		let wav = std::fs::read(&out).unwrap();
+		let data = &wav[wav.windows(4).position(|w| w == b"data").unwrap() + 8..];
+		data.chunks(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect::<Vec<_>>()
+	};
+	let plain = pcm("plain.wav", &["-dither_method", "none"]);
+	let default = pcm("default.wav", &[]);
+	let tpdf = pcm("tpdf.wav", &["-dither_method", "triangular"]);
+	let shaped = pcm("shaped.wav", &["-dither_method", "lipshitz", "-dither_scale", "0.5"]);
+	assert!(default == tpdf, "triangular is the default");
+	assert!(default == pcm("again.wav", &[]), "deterministic");
+	assert_eq!(plain.len(), default.len());
+	assert!(plain != default && default != shaped);
+	let diff: Vec<i32> =
+		plain.iter().zip(&default).map(|(a, b)| i32::from(*b) - i32::from(*a)).collect();
+	assert!(diff.iter().all(|d| d.abs() <= 2));
+	let mean = diff.iter().map(|&d| f64::from(d)).sum::<f64>() / diff.len() as f64;
+	assert!(mean.abs() < 0.05, "unbiased: {mean}");
+
+	let bad = tmp(&dir, "bad.wav");
+	let (ok, _, err) = rmp(&["-i", &source, "-dither_method", "shibata", bad.to_str().unwrap()]);
+	assert!(!ok && err.contains("triangular"), "{err}");
+	let (ok, _, err) =
+		rmp(&["-i", &source, "-ar", "96000", "-dither_method", "lipshitz", bad.to_str().unwrap()]);
+	assert!(!ok && err.contains("44100"), "{err}");
+}

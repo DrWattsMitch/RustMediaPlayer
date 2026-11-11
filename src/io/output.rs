@@ -14,6 +14,9 @@ pub struct Output {
 	muxer: Option<Box<dyn Muxer>>,
 	/// Container forced by name (`mkv`, `ogg`, ...) instead of the extension.
 	format: Option<String>,
+	/// Container options set before the muxer exists, applied when it is
+	/// created.
+	options: Vec<(String, String)>,
 }
 
 impl Output {
@@ -36,8 +39,11 @@ impl Output {
 		let hint = Hint { extension, ..Default::default() };
 		// todo: take io?
 		let muxer = container::select_muxer(hint, self.io.take().unwrap())?;
-		self.muxer = Some(muxer);
-		self.muxer.as_deref_mut().unwrap().set_metadata(self.metadata.clone())?;
+		let muxer = self.muxer.insert(muxer);
+		muxer.set_metadata(self.metadata.clone())?;
+		for (key, value) in &self.options {
+			muxer.set_option(key, value)?;
+		}
 		Ok(())
 	}
 
@@ -67,6 +73,7 @@ impl Output {
 			metadata: Metadata::default(),
 			muxer: None,
 			format: None,
+			options: Vec::new(),
 		})
 	}
 
@@ -90,6 +97,17 @@ impl Muxer for Output {
 
 	fn metadata(&self) -> &Metadata {
 		&self.metadata
+	}
+
+	/// Kept until the muxer is created (on the first `add`), then passed on.
+	fn set_option(&mut self, key: &str, value: &str) -> Result<()> {
+		match self.muxer.as_deref_mut() {
+			Some(muxer) => muxer.set_option(key, value),
+			None => {
+				self.options.push((key.to_string(), value.to_string()));
+				Ok(())
+			}
+		}
 	}
 
 	fn add(&mut self, stream: &Stream) -> Result<usize> {

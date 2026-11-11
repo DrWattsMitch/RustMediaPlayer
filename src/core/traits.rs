@@ -51,6 +51,14 @@ pub trait Muxer {
 		Ok(0)
 	}
 
+	/// Sets a container option by its FFmpeg name (`movflags`,
+	/// `frag_duration`, ...). Must be called before the first packet.
+	/// Containers without options reject every key.
+	#[allow(unused_variables)]
+	fn set_option(&mut self, key: &str, value: &str) -> Result<()> {
+		Err(crate::Message::Container("this output container has no such option"))
+	}
+
 	fn write(&mut self, packet: Packet) -> Result<()>;
 	fn finish(&mut self) -> Result<()>;
 }

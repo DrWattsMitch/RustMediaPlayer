@@ -45,7 +45,8 @@ use crate::core::{
 use crate::io::{Input, Output};
 use crate::message::Result;
 use crate::process::{
-	AudioConverter, AudioSpec, ScaleFilter, VideoConverter, VideoOptions, VideoSpec, audio::Gapless,
+	AudioConverter, AudioSpec, Dither, DitherMethod, ScaleFilter, VideoConverter, VideoOptions,
+	VideoSpec, audio::Gapless, dither::DITHER_METHODS,
 };
 
 /// What to do with the input, in FFmpeg's option vocabulary.
@@ -82,6 +83,14 @@ pub struct Options {
 	pub metadata: Vec<(String, String)>,
 	/// `-map_metadata -1`: don't copy the input's tags.
 	pub drop_metadata: bool,
+	/// `-dither_method`, `-dither_scale`: how audio is rounded to integer
+	/// samples. `None` means RMP's default, triangular (TPDF) dither
+	/// whenever precision is lost; `-dither_method none` gives FFmpeg's
+	/// default (plain rounding), bit for bit.
+	pub dither: Option<Dither>,
+	/// `-movflags`, `-frag_duration`, `-min_frag_duration`: MP4 layout
+	/// (`+faststart`, fragmented MP4), as `(name, value)` without the dash.
+	pub container_options: Vec<(String, String)>,
 }
 
 /// What a finished transcode did.
@@ -149,6 +158,11 @@ impl Options {
 					| "-f"
 					| "-metadata"
 					| "-map_metadata"
+					| "-dither_method"
+					| "-dither_scale"
+					| "-movflags"
+					| "-frag_duration"
+					| "-min_frag_duration"
 			)
 	}
 
@@ -249,6 +263,38 @@ impl Options {
 				}
 				self.drop_metadata = true;
 			}
+			"-dither_method" => {
+				let v = need()?;
+				let method = DitherMethod::from_name(v)
+					.ok_or_else(|| format!("unknown dither method {v} (one of: {DITHER_METHODS})"))?;
+				self.dither = Some(Dither { method, ..self.dither.unwrap_or(Dither::TRIANGULAR) });
+			}
+			"-dither_scale" => {
+				let v = need()?;
+				let scale = v
+					.parse::<f64>()
+					.ok()
+					.filter(|s| s.is_finite() && (0.0..=8.0).contains(s))
+					.ok_or_else(|| format!("-dither_scale must be 0 to 8: {v}"))?;
+				self.dither = Some(Dither { scale, ..self.dither.unwrap_or(Dither::TRIANGULAR) });
+			}
+			"-movflags" | "-frag_duration" | "-min_frag_duration" => {
+				let v = need()?;
+				let key = &option[1..];
+				// Check the value now, so a typo fails before any work.
+				let mut check = crate::container::mp4::options::Mp4Options::default();
+				for (k, v) in &self.container_options {
+					let _ = check.set(k, v);
+				}
+				check.set(key, v).map_err(|e| {
+					let reason = match e {
+						Message::Container(s) | Message::Other(s) | Message::Codec(s) => s.to_string(),
+						Message::Io(e) => e.to_string(),
+					};
+					format!("{reason}: {v} (-movflags: {})", crate::container::mp4::options::MOVFLAGS)
+				})?;
+				self.container_options.push((key.to_string(), v.to_string()));
+			}
 			other => return Err(format!("unknown option {other}")),
 		}
 		Ok(())
@@ -346,6 +392,10 @@ struct AudioRoute {
 	encoder: Box<dyn Encoder>,
 	enc_state: State,
 	target: AudioSpec,
+	/// Significant bits of an integer target (24 for `pcm_s24le` or 24-bit
+	/// FLAC held in `S32`), and how to round to them.
+	precision: u32,
+	dither: Dither,
 	converter: Option<AudioConverter>,
 	/// Source priming / padding to drop from the decoded audio.
 	gapless: Gapless,
@@ -383,6 +433,17 @@ fn source_bits(stream: &Stream) -> u8 {
 		},
 		None => 16,
 	}
+}
+
+/// Significant bits the encoder keeps from its integer input.
+fn target_precision(codec: &str, out: &Stream, format: SampleFormat) -> u32 {
+	let container = (format.bytes() * 8) as u32;
+	let coded = match codec {
+		"flac" => out.parameters.bits_per_sample.map_or(container, u32::from),
+		"pcm_s24le" | "pcm_s24be" => 24,
+		_ => container,
+	};
+	coded.min(container)
 }
 
 fn audio_target(stream: &Stream, codec: &str, o: &Options) -> Result<(Stream, AudioSpec)> {
@@ -500,6 +561,16 @@ pub fn transcode(input: &str, output: &str, options: &Options) -> Result<Summary
 	};
 	apply_metadata(&mut metadata, &options.metadata);
 	muxer.set_metadata(metadata)?;
+	if !options.container_options.is_empty()
+		&& !matches!(ext.as_str(), "mp4" | "m4a" | "m4v" | "m4b" | "mov")
+	{
+		return Err(Message::Container(
+			"-movflags / -frag_duration apply only to MP4, M4A and MOV outputs",
+		));
+	}
+	for (key, value) in &options.container_options {
+		muxer.set_option(key, value)?;
+	}
 
 	let streams: Vec<Stream> = demuxer.streams().iter().cloned().collect();
 	let mut routes: HashMap<StreamId, Route> = HashMap::new();
@@ -538,6 +609,11 @@ pub fn transcode(input: &str, output: &str, options: &Options) -> Result<Summary
 						));
 					}
 					let (mut out, target) = audio_target(stream, &codec, options)?;
+					let precision = target_precision(&codec, &out, target.format);
+					let dither = options.dither.unwrap_or(Dither::TRIANGULAR);
+					if !target.format.is_float() {
+						dither.check(target.sample_rate)?;
+					}
 					out.id = out_id;
 					muxer.add(&out)?;
 					let decoder = resolver.decoder_for(stream).ok_or("no decoder")?;
@@ -563,6 +639,8 @@ pub fn transcode(input: &str, output: &str, options: &Options) -> Result<Summary
 							encoder,
 							enc_state,
 							target,
+							precision,
+							dither,
 							converter: None,
 							gapless: gapless_of(stream),
 						})),
@@ -785,7 +863,9 @@ fn encode_audio(
 ) -> Result<u64> {
 	let converter = match &mut r.converter {
 		Some(c) => c,
-		None => r.converter.insert(AudioConverter::new(AudioSpec::of(&a), r.target)?),
+		None => r
+			.converter
+			.insert(AudioConverter::new(AudioSpec::of(&a), r.target)?.dithered(r.dither, r.precision)?),
 	};
 	let Some(converted) = converter.convert(&a)? else { return Ok(0) };
 	*count += 1;

@@ -11,11 +11,17 @@
 //! - Channels or rate differ: samples go through `f64`, the channel matrix
 //!   ([`remix_matrix`], FFmpeg's default downmix/upmix coefficients) and one
 //!   [`Resampler`] per output channel, then are rounded to the output format.
+//! - With [`AudioConverter::dithered`], every conversion that loses
+//!   precision (float → integer, wider → narrower integer, or any remix /
+//!   resample into an integer format) is dithered instead of rounded or
+//!   truncated ([`super::dither`]). Lossless conversions (integer → wider
+//!   integer) stay exact.
 //!
 //! Output timestamps continue from the first input frame's `pts` in a
 //! `1 / output rate` time base, counting the samples actually produced, so
 //! they stay exact across resampling.
 
+use super::dither::{Dither, Quantizer};
 use crate::codecs::pcm::convert::{Sample, for_each_sample, write_sample};
 use crate::core::resampler::Resampler;
 use crate::core::{
@@ -179,28 +185,57 @@ pub struct AudioConverter {
 	/// pts of the first output sample, in output-rate ticks.
 	start: Option<u64>,
 	produced: u64,
+	/// Dithered quantisation to `bits` bits; `None`: round / truncate.
+	quantizer: Option<(Quantizer, u32)>,
+}
+
+/// Bits of an integer sample format.
+fn format_bits(format: SampleFormat) -> u32 {
+	(format.bytes() * 8) as u32
+}
+
+/// Appends a `bits`-bit signed integer, left-aligned, in integer `format`.
+fn write_quantized(format: SampleFormat, bits: u32, value: i64, out: &mut Vec<u8>) {
+	let aligned = value << (format_bits(format) - bits);
+	match format {
+		SampleFormat::U8 => out.push((aligned as i8 as u8) ^ 0x80),
+		SampleFormat::S16 => out.extend_from_slice(&(aligned as i16).to_le_bytes()),
+		SampleFormat::S32 => out.extend_from_slice(&(aligned as i32).to_le_bytes()),
+		// Floats and S64 are never dithered (see `dithered`).
+		_ => write_sample(format, Sample::Int(aligned << (64 - format_bits(format))), out),
+	}
 }
 
 fn float_output(format: SampleFormat) -> bool {
 	format.is_float()
 }
 
-/// Writes per-channel `f64` samples in `format` / `layout`.
-fn store(planes: &[Vec<f64>], format: SampleFormat, layout: SampleLayout) -> Vec<u8> {
+/// Writes per-channel `f64` samples in `format` / `layout`, through the
+/// dithering quantiser when there is one.
+fn store(
+	planes: &[Vec<f64>],
+	format: SampleFormat,
+	layout: SampleLayout,
+	mut quantizer: Option<&mut (Quantizer, u32)>,
+) -> Vec<u8> {
 	let n = planes.first().map_or(0, Vec::len);
 	let mut out = Vec::with_capacity(n * planes.len() * format.bytes());
+	let mut put = |ch: usize, v: f64, out: &mut Vec<u8>| match quantizer.as_deref_mut() {
+		Some((q, bits)) => write_quantized(format, *bits, q.quantize(ch, v), out),
+		None => write_sample(format, Sample::Float(v), out),
+	};
 	match layout {
 		SampleLayout::Interleaved => {
 			for i in 0..n {
-				for plane in planes {
-					write_sample(format, Sample::Float(plane[i]), &mut out);
+				for (ch, plane) in planes.iter().enumerate() {
+					put(ch, plane[i], &mut out);
 				}
 			}
 		}
 		SampleLayout::Planar => {
-			for plane in planes {
+			for (ch, plane) in planes.iter().enumerate() {
 				for &v in plane {
-					write_sample(format, Sample::Float(v), &mut out);
+					put(ch, v, &mut out);
 				}
 			}
 		}
@@ -229,7 +264,33 @@ impl AudioConverter {
 			all.extend((1..output.channels).map(|_| first.new_like()));
 			all
 		};
-		Ok(Self { input, output, matrix, resamplers, start: None, produced: 0 })
+		Ok(Self { input, output, matrix, resamplers, start: None, produced: 0, quantizer: None })
+	}
+
+	/// Dithers every conversion that loses precision, quantising to `bits`
+	/// significant bits (at most the output format's; a 24-bit target held
+	/// in `S32` is `bits = 24`, the low byte then stays zero). Conversions
+	/// that lose nothing, float outputs and `S64` are left as they are.
+	pub fn dithered(mut self, dither: Dither, bits: u32) -> Result<Self> {
+		self.quantizer = None;
+		let format = self.output.format;
+		if dither.is_none() || format.is_float() || format == SampleFormat::S64 {
+			return Ok(self);
+		}
+		let bits = bits.clamp(2, format_bits(format));
+		let lossy =
+			!self.exact_path() || self.input.format.is_float() || format_bits(self.input.format) > bits;
+		if lossy {
+			let quantizer =
+				Quantizer::new(dither, bits, usize::from(self.output.channels), self.output.sample_rate)?;
+			self.quantizer = Some((quantizer, bits));
+		}
+		Ok(self)
+	}
+
+	/// The conversion is dithered.
+	pub fn is_dithered(&self) -> bool {
+		self.quantizer.is_some()
 	}
 
 	pub fn input(&self) -> AudioSpec {
@@ -242,7 +303,7 @@ impl AudioConverter {
 
 	/// `true` when frames pass through unchanged.
 	pub fn is_identity(&self) -> bool {
-		self.input == self.output
+		self.input == self.output && self.quantizer.is_none()
 	}
 
 	fn exact_path(&self) -> bool {
@@ -282,6 +343,19 @@ impl AudioConverter {
 			self.produced += out.nb_samples as u64;
 			return Ok(Some(out));
 		}
+		if self.exact_path()
+			&& let Some(quantizer) = self.quantizer.as_mut()
+		{
+			let channels = usize::from(self.output.channels);
+			let mut planes: Vec<Vec<f64>> = vec![Vec::with_capacity(frame.nb_samples); channels];
+			let mut ch = 0;
+			for_each_sample(frame, |s| {
+				planes[ch].push(s.to_float());
+				ch = (ch + 1) % channels;
+			})?;
+			let data = store(&planes, self.output.format, self.output.layout, Some(quantizer));
+			return Ok(Some(self.frame(data)));
+		}
 		if self.exact_path() {
 			let format = self.output.format;
 			let data = match self.output.layout {
@@ -317,7 +391,7 @@ impl AudioConverter {
 		if planes.first().is_none_or(Vec::is_empty) {
 			return Ok(None);
 		}
-		let data = store(&planes, self.output.format, self.output.layout);
+		let data = store(&planes, self.output.format, self.output.layout, self.quantizer.as_mut());
 		Ok(Some(self.frame(data)))
 	}
 
@@ -342,7 +416,7 @@ impl AudioConverter {
 		if planes.first().is_none_or(Vec::is_empty) {
 			return Ok(None);
 		}
-		let data = store(&planes, self.output.format, self.output.layout);
+		let data = store(&planes, self.output.format, self.output.layout, self.quantizer.as_mut());
 		Ok(Some(self.frame(data)))
 	}
 }
@@ -393,6 +467,102 @@ mod tests {
 			out.data.chunks(4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
 		assert_eq!(v, vec![1000 << 16, 32767 << 16, -2000 << 16, -32768 << 16]);
 		assert_eq!(out.nb_samples, 2);
+	}
+
+	fn f32_frame(samples: &[f32], rate: u32, channels: Channels) -> AudioFrame {
+		let data = samples.iter().flat_map(|v| v.to_le_bytes()).collect();
+		AudioFrame::new(data, rate, channels, SampleFormat::F32, SampleLayout::Interleaved)
+	}
+
+	fn s16(data: &[u8]) -> Vec<i16> {
+		data.chunks(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect()
+	}
+
+	/// |DFT|² of `x` at `freq` Hz.
+	fn tone_power(x: &[f64], rate: f64, freq: f64) -> f64 {
+		let w = 2.0 * std::f64::consts::PI * freq / rate;
+		let (re, im) = x.iter().enumerate().fold((0.0, 0.0), |(re, im), (i, &v)| {
+			(re + v * (w * i as f64).cos(), im + v * (w * i as f64).sin())
+		});
+		re * re + im * im
+	}
+
+	#[test]
+	fn dither_removes_quantisation_distortion() {
+		// A 1 kHz tone 1.5 LSB high: plain rounding turns it into a
+		// staircase with strong odd harmonics; TPDF dither leaves noise only.
+		let rate = 48_000;
+		let n = 48_000;
+		let tone: Vec<f32> = (0..n)
+			.map(|i| {
+				((i as f64 * 2.0 * std::f64::consts::PI * 1000.0 / rate as f64).sin() * 1.5 / 32768.0)
+					as f32
+			})
+			.collect();
+		let frame = f32_frame(&tone, rate, Channels::Mono);
+		let spec = AudioSpec::new(rate, 1, SampleFormat::S16, SampleLayout::Interleaved);
+		let third = |dither: Dither| {
+			let mut c =
+				AudioConverter::new(AudioSpec::of(&frame), spec).unwrap().dithered(dither, 16).unwrap();
+			let out: Vec<f64> =
+				s16(&c.convert(&frame).unwrap().unwrap().data).iter().map(|&v| f64::from(v)).collect();
+			(tone_power(&out, f64::from(rate), 1000.0), tone_power(&out, f64::from(rate), 3000.0))
+		};
+		let (_, harmonic_plain) = third(Dither::NONE);
+		let (fundamental, harmonic) = third(Dither::TRIANGULAR);
+		// The tone keeps its true level (within 1 dB) and the third
+		// harmonic drops by more than 20 dB.
+		let exact = (1.5 * n as f64 / 2.0).powi(2);
+		assert!((fundamental / exact - 1.0).abs() < 0.26, "{fundamental} vs {exact}");
+		assert!(harmonic < harmonic_plain / 100.0, "{harmonic} vs {harmonic_plain}");
+	}
+
+	#[test]
+	fn dither_applies_only_where_precision_is_lost() {
+		let s16_spec = AudioSpec::new(8000, 2, SampleFormat::S16, SampleLayout::Interleaved);
+		let s32_spec = AudioSpec::new(8000, 2, SampleFormat::S32, SampleLayout::Interleaved);
+		let f32_spec = AudioSpec::new(8000, 2, SampleFormat::F32, SampleLayout::Planar);
+		let dithered = |a, b, bits| {
+			AudioConverter::new(a, b).unwrap().dithered(Dither::TRIANGULAR, bits).unwrap().is_dithered()
+		};
+		assert!(!dithered(s16_spec, s32_spec, 32), "widening is exact");
+		assert!(!dithered(s16_spec, s16_spec, 16));
+		assert!(!dithered(s16_spec, f32_spec, 32), "float output");
+		assert!(dithered(s32_spec, s16_spec, 16));
+		assert!(dithered(f32_spec, s16_spec, 16));
+		assert!(dithered(s32_spec, s32_spec, 24), "24-bit target held in S32");
+		let resample = AudioSpec::new(16_000, 2, SampleFormat::S16, SampleLayout::Interleaved);
+		assert!(dithered(s16_spec, resample, 16), "resampling recomputes every sample");
+		assert!(
+			!AudioConverter::new(f32_spec, s16_spec)
+				.unwrap()
+				.dithered(Dither::NONE, 16)
+				.unwrap()
+				.is_dithered()
+		);
+	}
+
+	#[test]
+	fn dithered_24_bit_output_keeps_the_low_byte_clear() {
+		let samples: Vec<f32> = (0..2000).map(|i| ((i as f32) * 0.01).sin() * 0.3).collect();
+		let frame = f32_frame(&samples, 44_100, Channels::Stereo);
+		let mut c = AudioConverter::new(
+			AudioSpec::of(&frame),
+			AudioSpec::new(44_100, 2, SampleFormat::S32, SampleLayout::Planar),
+		)
+		.unwrap()
+		.dithered(Dither::new(crate::process::DitherMethod::Lipshitz), 24)
+		.unwrap();
+		let out = c.convert(&frame).unwrap().unwrap();
+		let values: Vec<i32> =
+			out.data.chunks(4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+		assert!(values.iter().all(|v| v & 0xFF == 0));
+		// Planar: channel 0 first. Each value is within a few 24-bit LSB of
+		// the exact one.
+		for (i, v) in values[..1000].iter().enumerate() {
+			let exact = f64::from(samples[2 * i]) * f64::from(1 << 23);
+			assert!((f64::from(v >> 8) - exact).abs() < 8.0);
+		}
 	}
 
 	#[test]

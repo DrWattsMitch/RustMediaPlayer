@@ -76,10 +76,14 @@ fn mp3_demuxer_and_decoder_survive_corruption() {
 
 #[test]
 fn mp4_demuxer_survives_corruption() {
-	let sources = [fixture("mp4/h264_bframes_aac.mp4"), fixture("mp4/aac_tagged_cover.m4a")];
+	let sources = [
+		fixture("mp4/h264_bframes_aac.mp4"),
+		fixture("mp4/aac_tagged_cover.m4a"),
+		fixture("mp4/h264_aac.ffmpeg_frag.mp4"),
+	];
 	let mut rng = Rng::new(seed() ^ 4);
-	for round in 0..rounds() * 2 {
-		let data = mutate(&sources[(round % 2) as usize], &mut rng);
+	for round in 0..rounds() * 3 {
+		let data = mutate(&sources[(round % 3) as usize], &mut rng);
 		if let Ok(mut demuxer) = Mp4Demuxer::new(memory(data)) {
 			drain(&mut demuxer);
 		}

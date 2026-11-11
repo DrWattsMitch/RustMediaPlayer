@@ -1,13 +1,18 @@
-//! MP4 / M4A / MOV demuxer (non-fragmented ISO BMFF).
+//! MP4 / M4A / MOV demuxer, plain and fragmented ISO BMFF.
 //!
 //! Opening a file walks the top-level boxes until `moov`, loads it into
 //! memory, and builds a flat sample index per track
-//! ([`super::sample_table`]). Reading then returns samples from all tracks
+//! ([`super::sample_table`]). When `moov` has an `mvex` (fragmented MP4),
+//! the rest of the file is scanned for `moof` boxes, skipping `mdat`
+//! payloads, and their samples are appended to the same index
+//! ([`super::fragment::parse_moof`]); a file cut short mid-fragment keeps
+//! every complete sample. Reading then returns samples from all tracks
 //! interleaved by decode time, seeking to each sample's offset in `mdat`.
 //! This follows FFmpeg's `mov.c` (`mov_read_header` + `mov_read_packet`).
 
 use super::boxes::{BoxIter, find, find_path, full_box};
 use super::codec::{self, CodecInfo};
+use super::fragment::{self, FragmentedTrack, TrackDefaults};
 use super::metadata;
 use super::sample_table::{self, Sample};
 use crate::core::{
@@ -20,6 +25,8 @@ use crate::message::{Message, Result};
 /// Largest `moov` box we are willing to load (sample tables of very long
 /// files are a few tens of MB; anything far larger is corrupt).
 const MAX_MOOV_SIZE: u64 = 256 * 1024 * 1024;
+/// Largest `moof` we load (FFmpeg-written ones are a few KB).
+const MAX_MOOF_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Stream metadata keys for audio priming / trailing padding (in samples),
 /// derived from the edit list. Same keys as the MP3 demuxer uses, so audio
@@ -108,6 +115,60 @@ fn parse_mvhd(body: &[u8]) -> Result<(u32, u64)> {
 	} else {
 		c.skip(8)?;
 		Ok((c.read_u32()?, u64::from(c.read_u32()?)))
+	}
+}
+
+/// A top-level box header: file position, type, header size, total size.
+type BoxHeader = (u64, [u8; 4], u64, u64);
+
+/// Reads the header of the top-level box at the reader's position. `None`
+/// at the end of input.
+fn next_box(reader: &mut BufferedReader, file_size: Option<u64>) -> Result<Option<BoxHeader>> {
+	let position = reader.position();
+	let head = reader.fill(16)?;
+	if head.len() < 8 {
+		return Ok(None);
+	}
+	let mut c = ByteCursor::new(head);
+	let size32 = c.read_u32()?;
+	let kind = c.read_fourcc()?;
+	let (size, header) = match size32 {
+		0 => match file_size {
+			Some(total) => (total.saturating_sub(position), 8),
+			None => return Ok(None),
+		},
+		1 => (c.read_u64()?, 16),
+		n => (u64::from(n), 8),
+	};
+	if size < header {
+		return Err(Message::Container("invalid mp4 box size"));
+	}
+	Ok(Some((position, kind, header, size)))
+}
+
+/// `tkhd` → track id.
+fn parse_tkhd_id(body: &[u8]) -> Result<u32> {
+	let (version, _, payload) = full_box(body)?;
+	let mut c = ByteCursor::new(payload);
+	c.skip(if version == 1 { 16 } else { 8 })?;
+	c.read_u32()
+}
+
+/// `mvex/mehd` → fragmented movie duration (movie timescale), if set.
+fn parse_mehd(mvex: &[u8]) -> Option<u64> {
+	let (version, _, payload) = full_box(find(mvex, b"mehd")?).ok()?;
+	let mut c = ByteCursor::new(payload);
+	let duration = if version == 1 { c.read_u64().ok()? } else { u64::from(c.read_u32().ok()?) };
+	Some(duration).filter(|&d| d > 0)
+}
+
+/// Decode-time span of a sample index, in track ticks.
+fn track_span(samples: &[Sample]) -> u64 {
+	match (samples.first(), samples.last()) {
+		(Some(first), Some(last)) => {
+			last.dts.saturating_add(u64::from(last.duration)).saturating_sub(first.dts)
+		}
+		_ => 0,
 	}
 }
 
@@ -217,34 +278,47 @@ impl Mp4Demuxer {
 		let mvhd = find(&moov, b"mvhd").ok_or(Message::Container("mp4 mvhd box not found"))?;
 		let (movie_timescale, movie_duration) = parse_mvhd(mvhd)?;
 
-		let mut streams = StreamSet::default();
-		let mut tracks = Vec::new();
+		let mvex = find(&moov, b"mvex");
+		let mut parsed = Vec::new();
 		for (kind, trak) in BoxIter::new(&moov).map_while(|r| r.ok()) {
 			if &kind != b"trak" {
 				continue;
 			}
 			// A malformed track is skipped rather than failing the file,
 			// so the remaining tracks stay playable.
-			let Ok(Some((stream, track))) =
-				Self::parse_track(trak, tracks.len(), movie_timescale, file_size)
-			else {
-				continue;
-			};
+			if let Ok(Some(track)) = Self::parse_track(trak, movie_timescale, file_size, mvex.is_some()) {
+				parsed.push(track);
+			}
+		}
+		if let Some(mvex) = mvex {
+			Self::read_fragments(&mut reader, mvex, file_size, &mut parsed);
+		}
+
+		let mut streams = StreamSet::default();
+		let mut tracks = Vec::new();
+		for (_, mut stream, track) in parsed.into_iter().filter(|(_, _, t)| !t.samples.is_empty()) {
+			stream.id = StreamId(tracks.len());
+			if stream.duration.is_none_or(|d| d.ticks() == 0) {
+				let span = track_span(&track.samples);
+				stream.duration = Some(Time::new(span, stream.time_base));
+			}
 			streams.add(stream);
 			tracks.push(track);
 		}
 		if tracks.is_empty() {
-			return Err(if find(&moov, b"mvex").is_some() {
-				Message::Container("fragmented mp4 is not supported")
-			} else {
-				Message::Container("mp4 file has no playable tracks")
-			});
+			return Err(Message::Container("mp4 file has no playable tracks"));
 		}
+		// Fragmented files leave mvhd's duration at 0; mehd or the
+		// fragments themselves give it.
+		let movie_duration = match mvex.and_then(parse_mehd) {
+			Some(d) if movie_duration == 0 => d,
+			_ => movie_duration,
+		};
 
 		let mut metadata = Metadata::default();
 		metadata::parse_moov_metadata(&moov, &mut metadata);
 
-		let duration = if movie_timescale > 0 {
+		let duration = if movie_timescale > 0 && movie_duration > 0 {
 			Time::new(movie_duration, TimeBase::new(1, movie_timescale))
 		} else {
 			streams
@@ -257,12 +331,15 @@ impl Mp4Demuxer {
 		Ok(Self { reader, metadata, streams, tracks, duration })
 	}
 
+	/// Parses one `trak` → (track id, stream, track). A fragmented file's
+	/// tracks may have no samples yet.
 	fn parse_track(
 		trak: &[u8],
-		index: usize,
 		movie_timescale: u32,
 		file_size: Option<u64>,
-	) -> Result<Option<(Stream, Track)>> {
+		fragmented: bool,
+	) -> Result<Option<(u32, Stream, Track)>> {
+		let track_id = find(trak, b"tkhd").map_or(Ok(0), parse_tkhd_id)?;
 		let Some(mdia) = find(trak, b"mdia") else { return Ok(None) };
 		let mdhd = find(mdia, b"mdhd").ok_or(Message::Container("mp4 mdhd box not found"))?;
 		let (timescale, media_duration, language) = parse_mdhd(mdhd)?;
@@ -276,13 +353,17 @@ impl Mp4Demuxer {
 			Some(stsd) => codec::parse_stsd(stsd, kind)?,
 			None => return Ok(None),
 		};
-		let samples = sample_table::build_index(stbl, file_size)?;
-		if samples.is_empty() {
+		let samples = match sample_table::build_index(stbl, file_size) {
+			// Fragmented files often omit or empty the sample tables.
+			Err(_) if fragmented => Vec::new(),
+			other => other?,
+		};
+		if samples.is_empty() && !fragmented {
 			return Ok(None);
 		}
 
 		let edit = parse_edit_list(trak, movie_timescale, timescale);
-		let mut stream = build_stream(index, kind, timescale, info);
+		let mut stream = build_stream(0, kind, timescale, info);
 		stream.duration = Some(Time::new(media_duration, stream.time_base));
 		if let Some(language) = language {
 			stream.metadata.raw.insert("language".into(), RawValue::String(language));
@@ -305,7 +386,50 @@ impl Mp4Demuxer {
 		};
 
 		let has_sync_table = find(stbl, b"stss").is_some();
-		Ok(Some((stream, Track { timescale, samples, next: 0, pts_shift, has_sync_table })))
+		Ok(Some((track_id, stream, Track { timescale, samples, next: 0, pts_shift, has_sync_table })))
+	}
+
+	/// Scans the top-level boxes after `moov` for `moof`s and appends their
+	/// samples. Stops quietly at the first box that can't be read, so a
+	/// partly written file plays up to its last complete fragment.
+	fn read_fragments(
+		reader: &mut BufferedReader,
+		mvex: &[u8],
+		file_size: Option<u64>,
+		parsed: &mut [(u32, Stream, Track)],
+	) {
+		let trex = fragment::parse_trex(mvex);
+		let mut tracks: Vec<FragmentedTrack> = parsed
+			.iter()
+			.map(|(id, _, track)| FragmentedTrack {
+				track_id: *id,
+				defaults: trex.iter().find(|(t, _)| t == id).map_or(TrackDefaults::default(), |(_, d)| *d),
+				next_dts: track.samples.last().map_or(0, |s| s.dts.saturating_add(u64::from(s.duration))),
+				samples: Vec::new(),
+			})
+			.collect();
+		let max_samples =
+			|i: usize| sample_table::MAX_SAMPLES.saturating_sub(parsed[i].2.samples.len());
+		let cap = (0..parsed.len()).map(max_samples).min().unwrap_or(0);
+		while let Ok(Some((position, kind, header, size))) = next_box(reader, file_size) {
+			if &kind == b"moof" {
+				if size - header > MAX_MOOF_SIZE || reader.skip(header).is_err() {
+					break;
+				}
+				let Ok(body) = reader.read_vec((size - header) as usize) else { break };
+				if fragment::parse_moof(&body, position, file_size, cap, &mut tracks).is_err() {
+					break;
+				}
+			}
+			let Some(next) = position.checked_add(size) else { break };
+			if file_size.is_some_and(|total| next >= total) || reader.seek(next).is_err() {
+				break;
+			}
+		}
+		for ((_, _, track), fragmented) in parsed.iter_mut().zip(tracks) {
+			track.samples.extend(fragmented.samples);
+			track.has_sync_table |= track.samples.iter().any(|s| !s.keyframe);
+		}
 	}
 
 	/// Track whose next sample has the smallest decode time (ties broken by
