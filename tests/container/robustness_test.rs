@@ -167,7 +167,16 @@ fn ogg_demuxer_and_opus_decoder_survive_corruption() {
 		}
 	}
 	// Corrupted SILK / hybrid / CELT / multistream packets.
-	let webm = ["silk_nb_mono", "silk_wb_st_40ms", "hybrid_st", "mode_switch", "celt_51"];
+	let webm = [
+		"silk_nb_mono",
+		"silk_wb_st_40ms",
+		"hybrid_st",
+		"mode_switch",
+		"celt_51",
+		"plc_silk_fec",
+		"plc_hybrid_fec_st",
+		"plc_celt",
+	];
 	for round in 0..rounds() * 2 {
 		let data =
 			mutate(&fixture(&format!("opus/{}.webm", webm[round as usize % webm.len()])), &mut rng);
@@ -183,6 +192,44 @@ fn ogg_demuxer_and_opus_decoder_survive_corruption() {
 			let len = rng.below(400);
 			let packet: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
 			let _ = state.decode_packet(&packet);
+		}
+	}
+	// Real packets with random losses, FEC recoveries, damaged packets and
+	// timestamp jumps, exercising every concealment path from every mode.
+	for name in ["plc_silk_fec", "plc_hybrid_fec_st", "plc_celt", "mode_switch", "celt_51"] {
+		let Ok(demuxer) = MkvDemuxer::new(memory(fixture(&format!("opus/{name}.webm")))) else {
+			continue;
+		};
+		let extradata = demuxer.streams().streams[0].parameters.extradata.clone();
+		let mut demuxer = demuxer;
+		let mut packets = Vec::new();
+		while let Ok(Some(packet)) = demuxer.read() {
+			packets.push(packet.data);
+		}
+		for _ in 0..rounds().div_ceil(20) {
+			let mut state = OpusDecoderState::from_extradata(&extradata, 2);
+			let mut pts = 0u64;
+			for packet in &packets {
+				let mut packet = packet.clone();
+				match rng.below(10) {
+					0 => {
+						let _ = state.conceal(120 * (1 + rng.below(100)));
+					}
+					1 => {
+						let _ = state.decode_fec(&packet, 120 * (1 + rng.below(60)));
+					}
+					2 => {
+						let at = rng.below(packet.len());
+						packet[at] ^= 1 << rng.below(8);
+						packet.truncate(at + 1);
+					}
+					3 => pts += rng.below(96_000) as u64,
+					_ => {}
+				}
+				let (out, _) = state.decode_with_recovery(&packet, Some(pts), None);
+				assert!(out.iter().all(|s| s.is_finite()), "{name}: non-finite output");
+				pts += (out.len() / state.channels()) as u64;
+			}
 		}
 	}
 }

@@ -16,6 +16,14 @@
 //!    ([`quant_all_bands`]), anti-collapse, final fine energy;
 //! 5. denormalisation, inverse MDCT, pitch post-filter, de-emphasis.
 //!
+//! A lost frame is concealed as in `celt_decode_lost`: after at least two
+//! good frames in a row, by repeating the last pitch period of the
+//! decoded signal through an LPC model of it, decaying as the signal did
+//! ([`CeltDecoder::decode_lost`], pitch branch); after 40 lost units
+//! (100 ms), in hybrid mode, or right after a loss or reset, by noise
+//! shaped by the last band energies that fade towards the background
+//! level (comfort noise).
+//!
 //! All arithmetic matches the float build's, so output equals libopus up to
 //! floating-point rounding (FMA and summation order).
 
@@ -24,6 +32,7 @@
 use std::sync::OnceLock;
 
 use super::mdct::Mdct;
+use super::pitch::{self, LPC_ORDER};
 use super::range::{BITRES, RangeDecoder, ilog};
 use super::tables::{
 	BAND_ALLOCATION, CACHE_BITS50, CACHE_CAPS50, CACHE_INDEX50, E_MEANS, E_PROB_MODEL, EBANDS,
@@ -35,6 +44,9 @@ pub const SHORT_MDCT: usize = 120;
 pub const OVERLAP: usize = 120;
 pub const MAX_LM: usize = 3;
 const DECODE_BUFFER_SIZE: usize = 2048;
+const MAX_PERIOD: usize = 1024;
+const PLC_PITCH_LAG_MAX: usize = 720;
+const PLC_PITCH_LAG_MIN: usize = 100;
 const NB_ALLOC_VECTORS: usize = 11;
 const PREEMPH: f32 = 0.850_006_1;
 const VERY_SMALL: f32 = 1e-30;
@@ -1580,6 +1592,28 @@ fn comb_filter(
 	}
 }
 
+/// `comb_filter` with distinct input and output and a constant filter
+/// (`comb_filter_const`): returns `n` samples of
+/// `buf[at + i] + g * (taps around buf[at + i - t])`.
+fn comb_filter_fir(buf: &[f32], at: usize, t: i32, n: usize, g: f32, tapset: usize) -> Vec<f32> {
+	if g == 0.0 {
+		return buf[at..at + n].to_vec();
+	}
+	let t = t.max(COMBFILTER_MINPERIOD) as usize;
+	let g10 = g * COMB_GAINS[tapset][0];
+	let g11 = g * COMB_GAINS[tapset][1];
+	let g12 = g * COMB_GAINS[tapset][2];
+	(0..n)
+		.map(|i| {
+			let p = at + i;
+			buf[p]
+				+ g10 * buf[p - t]
+				+ g11 * (buf[p + 1 - t] + buf[p - t - 1])
+				+ g12 * (buf[p + 2 - t] + buf[p - t - 2])
+		})
+		.collect()
+}
+
 fn tf_decode(
 	start: usize,
 	end: usize,
@@ -1628,7 +1662,15 @@ pub struct CeltDecoder {
 	pub end: usize,
 	disable_inv: bool,
 	pub rng: u32,
+	/// Pitch period found at the start of the current loss.
+	last_pitch_index: usize,
+	/// Concealed duration since the last good frame, in 2.5 ms units.
 	loss_duration: i32,
+	/// Set until two good frames follow a loss or reset: the pitch-based
+	/// PLC needs a clean history.
+	skip_plc: bool,
+	/// Per-channel LPC model of the signal before the loss.
+	lpc: [[f32; LPC_ORDER]; 2],
 	postfilter_period: i32,
 	postfilter_period_old: i32,
 	postfilter_gain: f32,
@@ -1652,7 +1694,10 @@ impl CeltDecoder {
 			end: NB_EBANDS,
 			disable_inv: channels == 1,
 			rng: 0,
+			last_pitch_index: 0,
 			loss_duration: 0,
+			skip_plc: true,
+			lpc: [[0.0; LPC_ORDER]; 2],
 			postfilter_period: 0,
 			postfilter_period_old: 0,
 			postfilter_gain: 0.0,
@@ -1673,7 +1718,10 @@ impl CeltDecoder {
 	/// `OPUS_RESET_STATE`.
 	pub fn reset(&mut self) {
 		self.rng = 0;
+		self.last_pitch_index = 0;
 		self.loss_duration = 0;
+		self.skip_plc = true;
+		self.lpc = [[0.0; LPC_ORDER]; 2];
 		self.postfilter_period = 0;
 		self.postfilter_period_old = 0;
 		self.postfilter_gain = 0.0;
@@ -1784,9 +1832,24 @@ impl CeltDecoder {
 		}
 	}
 
-	/// Noise-based concealment for a missing frame (`celt_decode_lost`,
-	/// noise branch). Writes `n` samples per channel to `pcm`.
+	/// Conceals a missing frame of `120 << lm` samples (`celt_decode_lost`)
+	/// and writes it to `pcm` (interleaved, unit scale).
 	pub fn decode_lost(&mut self, lm: usize, pcm: &mut [f32]) {
+		let n = SHORT_MDCT << lm;
+		let noise_based = self.loss_duration >= 40 || self.start != 0 || self.skip_plc;
+		if noise_based {
+			self.conceal_with_noise(lm);
+		} else {
+			self.conceal_with_pitch(n);
+		}
+		self.deemphasis(n, pcm);
+		// Saturate to avoid wrap-around.
+		self.loss_duration = (self.loss_duration + (1 << lm)).min(10_000);
+	}
+
+	/// Noise-based PLC / comfort noise: random spectra at the last band
+	/// energies, decaying towards the background noise estimate.
+	fn conceal_with_noise(&mut self, lm: usize) {
 		let n = SHORT_MDCT << lm;
 		let c = self.channels;
 		let start = self.start;
@@ -1818,8 +1881,147 @@ impl CeltDecoder {
 		self.stream_channels = c;
 		self.synthesis(&x, start, eff_end, c, false, lm, false);
 		self.stream_channels = saved;
-		self.deemphasis(n, pcm);
-		self.loss_duration = (self.loss_duration + (1 << lm)).min(10_000);
+	}
+
+	/// `celt_plc_pitch_search`: the pitch period of the decoded history,
+	/// between `PLC_PITCH_LAG_MIN` and `PLC_PITCH_LAG_MAX`.
+	fn plc_pitch_search(&self) -> usize {
+		let channels: Vec<&[f32]> = (0..self.channels)
+			.map(|ch| {
+				let base = self.channel_base(ch);
+				&self.decode_mem[base..base + DECODE_BUFFER_SIZE]
+			})
+			.collect();
+		let lp = pitch::downsample(&channels, DECODE_BUFFER_SIZE);
+		let lag = pitch::search(
+			&lp[PLC_PITCH_LAG_MAX >> 1..],
+			&lp,
+			DECODE_BUFFER_SIZE - PLC_PITCH_LAG_MAX,
+			PLC_PITCH_LAG_MAX - PLC_PITCH_LAG_MIN,
+		);
+		PLC_PITCH_LAG_MAX.saturating_sub(lag).clamp(PLC_PITCH_LAG_MIN, PLC_PITCH_LAG_MAX)
+	}
+
+	/// Pitch-based PLC: repeats the last pitch period of the LPC
+	/// excitation, decaying as the signal did, and re-synthesises it.
+	#[allow(clippy::too_many_lines)]
+	fn conceal_with_pitch(&mut self, n: usize) {
+		let first_loss = self.loss_duration == 0;
+		let (pitch_index, fade) = if first_loss {
+			self.last_pitch_index = self.plc_pitch_search();
+			(self.last_pitch_index, 1.0f32)
+		} else {
+			(self.last_pitch_index, 0.8)
+		};
+		// Always in range once set; the clamp guards a never-searched state.
+		let pitch_index = pitch_index.clamp(PLC_PITCH_LAG_MIN, PLC_PITCH_LAG_MAX);
+		// Two pitch periods of excitation, to see whether it decays, but no
+		// more than MAX_PERIOD.
+		let exc_length = (2 * pitch_index).min(MAX_PERIOD);
+		let extrapolation_offset = MAX_PERIOD - pitch_index;
+		// Enough to cover a complete MDCT window, overlap included.
+		let extrapolation_len = n + OVERLAP;
+		let window = &WINDOW120[..OVERLAP];
+		// exc[i] is `exc_buf[LPC_ORDER + i]`, with LPC_ORDER samples of history.
+		let mut exc_buf = vec![0f32; MAX_PERIOD + LPC_ORDER];
+		let mut fir_tmp = vec![0f32; exc_length];
+		for ch in 0..self.channels {
+			let base = self.channel_base(ch);
+			let buf_end = base + DECODE_BUFFER_SIZE;
+			exc_buf.copy_from_slice(&self.decode_mem[buf_end - MAX_PERIOD - LPC_ORDER..buf_end]);
+			if first_loss {
+				// LPC model of the last MAX_PERIOD samples before the loss.
+				let mut ac = pitch::autocorr(&exc_buf[LPC_ORDER..], window, LPC_ORDER);
+				// Noise floor at -40 dB, then lag windowing.
+				ac[0] *= 1.0001;
+				for i in 1..=LPC_ORDER {
+					ac[i] -= ac[i] * (0.008 * 0.008) * i as f32 * i as f32;
+				}
+				let lpc = pitch::lpc(&ac, LPC_ORDER);
+				self.lpc[ch].copy_from_slice(&lpc);
+			}
+			let lpc = self.lpc[ch];
+			// The excitation for the exc_length samples before the loss.
+			let at = LPC_ORDER + MAX_PERIOD - exc_length;
+			pitch::fir(&exc_buf, at, &lpc, &mut fir_tmp);
+			exc_buf[at..at + exc_length].copy_from_slice(&fir_tmp);
+			let exc = &exc_buf[LPC_ORDER..];
+
+			// How fast the waveform decays, so concealment adds no energy.
+			let decay = {
+				let mut e1 = 1f32;
+				let mut e2 = 1f32;
+				let decay_length = exc_length >> 1;
+				for i in 0..decay_length {
+					let e = exc[MAX_PERIOD - decay_length + i];
+					e1 += e * e;
+					let e = exc[MAX_PERIOD - 2 * decay_length + i];
+					e2 += e * e;
+				}
+				(e1.min(e2) / e2).sqrt()
+			};
+
+			// Make room for the new frame (the overlap past the buffer end is
+			// not needed).
+			self.decode_mem.copy_within(base + n..buf_end, base);
+			let buf = &mut self.decode_mem[base..buf_end + OVERLAP];
+			let out_at = DECODE_BUFFER_SIZE - n;
+
+			// Repeat the last pitch period, one more decay per period.
+			let mut attenuation = fade * decay;
+			let mut s1 = 0f32;
+			let mut j = 0usize;
+			for i in 0..extrapolation_len {
+				if j >= pitch_index {
+					j -= pitch_index;
+					attenuation *= decay;
+				}
+				buf[out_at + i] = attenuation * exc[extrapolation_offset + j];
+				// Energy of the decoded signal whose excitation is copied.
+				let tmp = buf[DECODE_BUFFER_SIZE - MAX_PERIOD - n + extrapolation_offset + j];
+				s1 += tmp * tmp;
+				j += 1;
+			}
+
+			// Back to the signal domain, continuing from the last samples.
+			let mut lpc_mem = [0f32; LPC_ORDER];
+			for (i, m) in lpc_mem.iter_mut().enumerate() {
+				*m = buf[out_at - 1 - i];
+			}
+			pitch::iir(&mut buf[out_at..out_at + extrapolation_len], &lpc, &mut lpc_mem);
+
+			// Attenuate if the synthesis came out louder than expected, which
+			// the signal changing within the window can cause.
+			let s2: f32 = buf[out_at..out_at + extrapolation_len].iter().map(|v| v * v).sum();
+			// Written so that a NaN from the filter also mutes.
+			if s1.partial_cmp(&(0.2 * s2)) != Some(std::cmp::Ordering::Greater) {
+				buf[out_at..out_at + extrapolation_len].fill(0.0);
+			} else if s1 < s2 {
+				let ratio = ((s1 + 1.0) / (s2 + 1.0)).sqrt();
+				for i in 0..OVERLAP {
+					buf[out_at + i] *= 1.0 - window[i] * (1.0 - ratio);
+				}
+				for v in &mut buf[out_at + OVERLAP..out_at + extrapolation_len] {
+					*v *= ratio;
+				}
+			}
+
+			// Pre-filter the overlap for the next frame, whose post-filter
+			// runs over it again, then simulate TDAC so the concealment blends
+			// with the next frame's MDCT.
+			let etmp = comb_filter_fir(
+				buf,
+				DECODE_BUFFER_SIZE,
+				self.postfilter_period,
+				OVERLAP,
+				-self.postfilter_gain,
+				self.postfilter_tapset,
+			);
+			for i in 0..OVERLAP / 2 {
+				buf[DECODE_BUFFER_SIZE + i] =
+					window[i] * etmp[OVERLAP - 1 - i] + window[OVERLAP - i - 1] * etmp[i];
+			}
+		}
 	}
 
 	/// Decodes one CELT frame of `frame_size` samples (120 << LM) per
@@ -1861,6 +2063,8 @@ impl CeltDecoder {
 			self.decode_lost(lm, pcm);
 			return Ok(frame_size);
 		}
+		// The pitch-based PLC needs two good frames in a row.
+		self.skip_plc = self.loss_duration != 0;
 		let cc = self.channels;
 		let c = self.stream_channels;
 		let start = self.start;

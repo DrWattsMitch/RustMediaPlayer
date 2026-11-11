@@ -6,6 +6,7 @@ pub mod celt;
 pub mod decoder;
 pub mod header;
 pub mod mdct;
+mod pitch;
 pub mod range;
 pub mod silk;
 mod tables;

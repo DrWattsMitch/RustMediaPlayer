@@ -112,6 +112,32 @@ ff -f lavfi -i "sine=f=220:d=0.6" -f lavfi -i "anoisesrc=d=0.6:a=0.3:c=pink" \
 	-c:a libopus -b:a 20k -frame_duration 10 opus/mode_switch.webm
 for f in opus/*.webm; do ff -flags2 +skip_manual -c:a libopus -i "$f" -f s16le "${f%.webm}.ffmpeg.s16le"; done
 
+# Opus packet-loss references (tests/codecs/opus_plc_test.rs): libopus 1.4
+# itself, through tools/opus_plc_ref.c, since FFmpeg cannot drop packets.
+# Needs a built libopus 1.4 checkout in $LIBOPUS (./configure && make).
+ff -f lavfi -i "aevalsrc='0.25*(sin(2*PI*(140+20*sin(2*PI*0.7*t))*t)+0.5*sin(2*PI*2*(140+20*sin(2*PI*0.7*t))*t)+0.3*sin(2*PI*3*(140+20*sin(2*PI*0.7*t))*t))*gt(sin(2*PI*0.9*t),-0.2)+0.004*(random(0)-0.5)':s=48000:d=2" /tmp/rmp_speechlike.wav
+ff -i /tmp/rmp_speechlike.wav -filter_complex "[0]asplit[a][b];[b]volume=0.8,adelay=3[c];[a][c]join=inputs=2:channel_layout=stereo" /tmp/rmp_speechlike_st.wav
+ff -i /tmp/rmp_speechlike.wav -ar 16000 -c:a libopus -b:a 28k -application voip -fec 1 -packet_loss 30 opus/plc_silk_fec.webm
+ff -i /tmp/rmp_speechlike_st.wav -c:a libopus -b:a 32k -application voip -fec 1 -packet_loss 20 opus/plc_hybrid_fec_st.webm
+ff -i /tmp/rmp_speechlike.wav -c:a libopus -b:a 64k -application audio opus/plc_celt.webm
+cc -O2 -I "$LIBOPUS/include" ../../tools/opus_plc_ref.c "$LIBOPUS/.libs/libopus.a" -lm -o /tmp/opus_plc_ref
+# The dropped packets: the same rule as `lost` in opus_plc_test.rs.
+loss_pattern() {
+	python3 -c "
+import struct, sys
+d = open(sys.argv[1], 'rb').read(); at = 8 + d[4]; n = 0
+while at < len(d):
+    at += 4 + struct.unpack('<I', d[at:at + 4])[0]; n += 1
+lost = lambda i: i < n - 1 and (i in (5, 9, 10) or 15 <= i < 23 or 30 <= i < 33 or i == n * 3 // 4)
+print(''.join('x' if lost(i) else '.' for i in range(n)))" "$1"
+}
+for spec in silk_wb_st_40ms:plc hybrid_st:plc celt_51:plc mode_switch:plc plc_celt:plc \
+	plc_silk_fec:plc plc_silk_fec:fec plc_hybrid_fec_st:plc plc_hybrid_fec_st:fec; do
+	f=${spec%%:*} mode=${spec##*:}
+	python3 ../../tools/opus_packets.py "opus/$f.webm" "/tmp/$f.opkt"
+	/tmp/opus_plc_ref "/tmp/$f.opkt" "$(loss_pattern "/tmp/$f.opkt")" "$mode" "opus/$f.loss_$mode.s16le"
+done
+
 # Processing layer: libswscale / libswresample references.
 ff -f lavfi -i testsrc2=s=96x64:r=25 -frames:v 1 -pix_fmt yuv420p process/testsrc_96x64.y4m
 ff -i process/testsrc_96x64.y4m -vf scale=100:75 -f rawvideo -pix_fmt yuv420p process/testsrc_100x75.yuv

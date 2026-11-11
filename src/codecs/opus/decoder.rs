@@ -15,7 +15,7 @@
 use super::celt::CeltDecoder;
 use super::header::{OpusHead, frame_samples};
 use super::range::RangeDecoder;
-use super::silk::SilkDecoder;
+use super::silk::{SilkDecoder, SilkMode};
 use super::tables::WINDOW120;
 use crate::core::{
 	self, AudioFrame, AudioState, Channels, CodecPrivate, CodecState, DecodeOut, Frame, Packet,
@@ -220,12 +220,19 @@ pub struct StreamDecoder {
 	pub channels: usize,
 	celt: CeltDecoder,
 	silk: SilkDecoder,
+	/// Mode, bandwidth, frame size and coded channels of the current packet.
 	mode: Option<Mode>,
+	bandwidth: Bandwidth,
+	frame_size: usize,
+	stream_channels: usize,
 	prev_mode: Option<Mode>,
 	prev_redundancy: bool,
-	frame_size: usize,
-	bandwidth: Bandwidth,
-	stream_channels: usize,
+	/// SILK's channel count and internal rate from the last packet, reused
+	/// when concealing (libopus' `DecControl`).
+	silk_channels: usize,
+	silk_rate: u32,
+	/// Samples produced by the last decode or concealment call.
+	pub last_packet_duration: usize,
 	/// Final range of the last frame (conformance testing).
 	pub range_final: u32,
 }
@@ -237,82 +244,117 @@ impl StreamDecoder {
 			celt: CeltDecoder::new(channels),
 			silk: SilkDecoder::new(channels),
 			mode: None,
+			bandwidth: Bandwidth::Full,
+			frame_size: 960,
+			stream_channels: channels,
 			prev_mode: None,
 			prev_redundancy: false,
-			frame_size: 960,
-			bandwidth: Bandwidth::Full,
-			stream_channels: channels,
+			silk_channels: channels,
+			silk_rate: 16_000,
+			last_packet_duration: 0,
 			range_final: 0,
 		}
 	}
 
+	/// `OPUS_RESET_STATE`.
 	pub fn reset(&mut self) {
 		*self = Self::new(self.channels);
 	}
 
-	/// Concealment for a missing frame of `samples` (`opus_decode_frame`
-	/// with no data): SILK or CELT PLC depending on the last mode.
-	fn decode_lost(&mut self, pcm: &mut [f32], samples: usize) {
-		let channels = self.channels;
-		let mode = if self.prev_redundancy { Some(Mode::CeltOnly) } else { self.prev_mode };
-		pcm[..samples * channels].fill(0.0);
-		match mode {
-			Some(Mode::CeltOnly) => {
-				let mut done = 0;
-				while done < samples {
-					let n =
-						[960usize, 480, 240, 120].into_iter().find(|&n| n <= samples - done).unwrap_or(120);
-					let mut tmp = vec![0f32; n * channels];
-					self.celt.decode_lost(n.trailing_zeros().saturating_sub(3) as usize, &mut tmp);
-					let take = n.min(samples - done);
-					pcm[done * channels..(done + take) * channels].copy_from_slice(&tmp[..take * channels]);
-					done += take;
-				}
-			}
-			Some(_) => {
-				// SILK concealment is not implemented: silence.
-			}
-			None => {}
-		}
-	}
-
-	/// `opus_decode_frame` for one frame with data.
+	/// `opus_decode_frame`: decodes one frame of `data` into `pcm`, or with
+	/// `None` (or a 0/1-byte DTX payload) conceals up to `frame_size`
+	/// samples in the last mode. With `decode_fec`, `data` is the packet
+	/// after a lost one and its SILK LBRR copy of that packet is decoded.
+	/// Returns the samples per channel written.
 	#[allow(clippy::too_many_lines)]
 	fn decode_frame(
 		&mut self,
-		data: &[u8],
+		data: Option<&[u8]>,
 		pcm: &mut [f32],
+		frame_size: usize,
+		decode_fec: bool,
 	) -> std::result::Result<usize, &'static str> {
 		let channels = self.channels;
 		let f20 = 960usize;
 		let f10 = 480usize;
 		let f5 = 240usize;
 		let f2_5 = 120usize;
-		let audiosize = self.frame_size;
-		let mode = self.mode.ok_or("opus decoder has no mode")?;
-		let bandwidth = self.bandwidth;
-		let mut len = data.len();
-		if len <= 1 {
-			self.decode_lost(pcm, audiosize);
-			return Ok(audiosize);
+		if frame_size < f2_5 {
+			return Err("opus output buffer too small");
 		}
-		let mut dec = RangeDecoder::new(data);
+		let mut frame_size = frame_size.min(MAX_FRAME_SAMPLES);
+		// Payloads of 0 or 1 byte (DTX) trigger the PLC, for no more than
+		// the TOC's duration.
+		let data = data.filter(|d| d.len() > 1);
+		if data.is_none() {
+			frame_size = frame_size.min(self.frame_size);
+		}
+		let mut audiosize;
+		let mode;
+		let bandwidth;
+		if data.is_some() {
+			audiosize = self.frame_size;
+			mode = self.mode.ok_or("opus decoder has no mode")?;
+			bandwidth = Some(self.bandwidth);
+		} else {
+			audiosize = frame_size;
+			// Conceal in the last mode (CELT if it ended with CELT redundancy).
+			let last = if self.prev_redundancy { Some(Mode::CeltOnly) } else { self.prev_mode };
+			let Some(last) = last else {
+				// Nothing decoded yet: all we can do is silence.
+				pcm[..audiosize * channels].fill(0.0);
+				return Ok(audiosize);
+			};
+			mode = last;
+			bandwidth = None;
+			// The PLC only runs on 2.5, 5, 10 and 20 ms.
+			if audiosize > f20 {
+				let mut done = 0;
+				while done < audiosize {
+					let n = self.decode_frame(
+						None,
+						&mut pcm[done * channels..],
+						(audiosize - done).min(f20),
+						false,
+					)?;
+					if n == 0 {
+						break;
+					}
+					done += n;
+				}
+				return Ok(frame_size);
+			} else if audiosize < f20 {
+				if audiosize > f10 {
+					audiosize = f10;
+				} else if mode != Mode::SilkOnly && audiosize > f5 && audiosize < f10 {
+					audiosize = f5;
+				}
+			}
+		}
+		let empty: &[u8] = &[];
+		let payload = data.unwrap_or(empty);
+		let mut len = payload.len();
+		let mut dec = RangeDecoder::new(payload);
 
+		// Mode transitions cross-fade from a 5 ms concealment of the old mode.
 		let mut transition = false;
 		let mut pcm_transition: Vec<f32> = Vec::new();
-		if let Some(prev) = self.prev_mode {
+		if let (Some(_), Some(prev)) = (data, self.prev_mode) {
 			if (mode == Mode::CeltOnly && prev != Mode::CeltOnly && !self.prev_redundancy)
 				|| (mode != Mode::CeltOnly && prev == Mode::CeltOnly)
 			{
 				transition = true;
 				if mode == Mode::CeltOnly {
 					pcm_transition = vec![0f32; f5 * channels];
-					let n = f5.min(audiosize);
-					self.decode_lost(&mut pcm_transition, n);
+					// A failed concealment only weakens the cross-fade.
+					let _ = self.decode_frame(None, &mut pcm_transition, f5.min(audiosize), false);
 				}
 			}
 		}
-		let frame_size = audiosize;
+		if audiosize > frame_size {
+			return Err("opus output buffer too small");
+		}
+		frame_size = audiosize;
 
 		// SILK.
 		let mut pcm_silk: Vec<f32> = Vec::new();
@@ -321,36 +363,55 @@ impl StreamDecoder {
 			if self.prev_mode == Some(Mode::CeltOnly) {
 				self.silk.reset();
 			}
-			let internal_rate = match (mode, bandwidth) {
-				(Mode::SilkOnly, Bandwidth::Narrow) => 8000,
-				(Mode::SilkOnly, Bandwidth::Medium) => 12000,
-				_ => 16000,
-			};
+			// SILK cannot conceal less than 10 ms.
 			let payload_ms = (1000 * audiosize / 48_000).max(10);
+			if data.is_some() {
+				self.silk_channels = self.stream_channels;
+				self.silk_rate = match (mode, bandwidth) {
+					(Mode::SilkOnly, Some(Bandwidth::Narrow)) => 8000,
+					(Mode::SilkOnly, Some(Bandwidth::Medium)) => 12000,
+					_ => 16000,
+				};
+			}
+			let silk_mode = match (data, decode_fec) {
+				(None, _) => SilkMode::Lost,
+				(Some(_), true) => SilkMode::Lbrr,
+				(Some(_), false) => SilkMode::Normal,
+			};
 			let mut decoded = 0usize;
 			while decoded < frame_size {
 				let first = decoded == 0;
 				let out = &mut pcm_silk[decoded * channels..];
-				let n = self.silk.decode(
+				match self.silk.decode(
 					&mut dec,
-					self.stream_channels,
-					internal_rate,
+					silk_mode,
+					self.silk_channels,
+					self.silk_rate,
 					payload_ms,
 					first,
 					out,
-				)?;
-				if n == 0 {
-					return Err("silk decoder produced no samples");
+				) {
+					Ok(0) => return Err("silk decoder produced no samples"),
+					Ok(n) => decoded += n,
+					// A concealment failure is not fatal: silence instead.
+					Err(_) if silk_mode != SilkMode::Normal => {
+						let end = ((decoded + frame_size) * channels).min(pcm_silk.len());
+						pcm_silk[decoded * channels..end].fill(0.0);
+						decoded += frame_size;
+					}
+					Err(e) => return Err(e),
 				}
-				decoded += n;
 			}
 		}
 
+		// Redundant CELT frame for SILK/hybrid ↔ CELT switches.
 		let mut start_band = 0;
 		let mut redundancy = false;
 		let mut redundancy_bytes = 0usize;
 		let mut celt_to_silk = false;
-		if mode != Mode::CeltOnly
+		if !decode_fec
+			&& mode != Mode::CeltOnly
+			&& data.is_some()
 			&& dec.tell() + 17 + 20 * i32::from(mode == Mode::Hybrid) <= 8 * len as i32
 		{
 			redundancy = if mode == Mode::Hybrid { dec.bit_logp(12) } else { true };
@@ -379,38 +440,44 @@ impl StreamDecoder {
 		}
 		if transition && mode != Mode::CeltOnly {
 			pcm_transition = vec![0f32; f5 * channels];
-			let n = f5.min(audiosize);
-			self.decode_lost(&mut pcm_transition, n);
+			let _ = self.decode_frame(None, &mut pcm_transition, f5.min(audiosize), false);
 		}
 
-		let end_band = match bandwidth {
-			Bandwidth::Narrow => 13,
-			Bandwidth::Medium | Bandwidth::Wide => 17,
-			Bandwidth::SuperWide => 19,
-			Bandwidth::Full => 21,
-		};
-		self.celt.end = end_band;
+		if let Some(bandwidth) = bandwidth {
+			self.celt.end = match bandwidth {
+				Bandwidth::Narrow => 13,
+				Bandwidth::Medium | Bandwidth::Wide => 17,
+				Bandwidth::SuperWide => 19,
+				Bandwidth::Full => 21,
+			};
+		}
 		self.celt.stream_channels = self.stream_channels;
 
-		let redundant_start = len;
-		let redundant = &data[redundant_start..(redundant_start + redundancy_bytes).min(data.len())];
+		let redundant = payload.get(len..len + redundancy_bytes).unwrap_or(empty);
 		let mut redundant_audio = vec![0f32; f5 * channels];
 		let mut redundant_rng = 0u32;
 		if redundancy && celt_to_silk {
+			// Decoded even when stale (its first frame may have been lost):
+			// the final range is still needed.
 			self.celt.start = 0;
 			let _ = self.celt.decode(redundant, &mut redundant_audio, f5);
 			redundant_rng = self.celt.rng;
 		}
+		// Must come after the transition PLC.
 		self.celt.start = start_band;
 
 		if mode != Mode::SilkOnly {
 			let celt_frame = f20.min(frame_size);
+			// Discard any previous CELT state.
 			if Some(mode) != self.prev_mode && self.prev_mode.is_some() && !self.prev_redundancy {
 				self.celt.reset();
 			}
-			self.celt.decode_with(&mut dec, len, pcm, celt_frame)?;
+			// A zero length makes CELT conceal (lost packets and FEC).
+			let celt_len = if decode_fec { 0 } else { len };
+			self.celt.decode_with(&mut dec, celt_len, pcm, celt_frame)?;
 		} else {
 			pcm[..frame_size * channels].fill(0.0);
+			// Hybrid → SILK: let the CELT MDCT fade out over a silence frame.
 			if self.prev_mode == Some(Mode::Hybrid)
 				&& !(redundancy && celt_to_silk && self.prev_redundancy)
 			{
@@ -435,6 +502,8 @@ impl StreamDecoder {
 			let head = pcm[at..at + f2_5 * channels].to_vec();
 			smooth_fade(&head, &redundant_audio[channels * f2_5..], &mut pcm[at..], f2_5, channels);
 		}
+		// Ignored when the previous frame did not use CELT (the first
+		// redundancy frame of a switch from SILK may have been lost).
 		if redundancy
 			&& celt_to_silk
 			&& (self.prev_mode != Some(Mode::SilkOnly) || self.prev_redundancy)
@@ -461,6 +530,7 @@ impl StreamDecoder {
 					channels,
 				);
 			} else {
+				// Too short for a clean transition; fade anyway.
 				let cur = pcm[..channels * f2_5].to_vec();
 				smooth_fade(&pcm_transition, &cur, pcm, f2_5, channels);
 			}
@@ -471,32 +541,110 @@ impl StreamDecoder {
 		Ok(audiosize)
 	}
 
-	/// Decodes one (non-self-delimited unless `self_delimited`) packet.
-	/// Returns the samples per channel written to `pcm`.
-	pub fn decode_packet(
+	/// `opus_decode_native`. With `None`, conceals `frame_size` samples
+	/// (a multiple of 2.5 ms). With `decode_fec`, recovers `frame_size`
+	/// samples lost before `data`: concealment for all but the last frame's
+	/// worth, then that frame from `data`'s in-band FEC (concealment when
+	/// it has none). Otherwise decodes `data` (self-delimited when
+	/// `self_delimited`). Returns the samples per channel written to `pcm`
+	/// and the bytes of `data` used.
+	pub fn decode_native(
 		&mut self,
-		data: &[u8],
-		self_delimited: bool,
+		data: Option<&[u8]>,
 		pcm: &mut [f32],
+		frame_size: usize,
+		decode_fec: bool,
+		self_delimited: bool,
 	) -> std::result::Result<(usize, usize), &'static str> {
+		let channels = self.channels;
+		let plc = data.is_none_or(<[u8]>::is_empty);
+		if (decode_fec || plc) && !frame_size.is_multiple_of(PLC_STEP) {
+			return Err("opus concealment must be a multiple of 2.5 ms");
+		}
+		if pcm.len() < frame_size * channels {
+			return Err("opus output buffer too small");
+		}
+		let data = match data {
+			Some(d) if !d.is_empty() => d,
+			_ => {
+				let mut count = 0;
+				while count < frame_size {
+					let n =
+						self.decode_frame(None, &mut pcm[count * channels..], frame_size - count, false)?;
+					if n == 0 {
+						return Err("opus concealment produced no samples");
+					}
+					count += n;
+				}
+				self.last_packet_duration = count;
+				return Ok((count, 0));
+			}
+		};
 		let parsed = parse_packet(data, self_delimited).ok_or("invalid opus packet")?;
 		let toc = parsed.toc;
-		let frame = frame_samples(toc) as usize;
-		self.mode = Some(toc_mode(toc));
-		self.bandwidth = toc_bandwidth(toc);
-		self.frame_size = frame;
-		self.stream_channels = if toc & 0x4 != 0 { 2 } else { 1 };
+		let packet_mode = toc_mode(toc);
+		let packet_frame = frame_samples(toc) as usize;
+		let set_packet_state = |st: &mut Self| {
+			st.mode = Some(packet_mode);
+			st.bandwidth = toc_bandwidth(toc);
+			st.frame_size = packet_frame;
+			st.stream_channels = if toc & 0x4 != 0 { 2 } else { 1 };
+		};
+
+		if decode_fec {
+			// No FEC can be present: plain concealment.
+			if frame_size < packet_frame
+				|| packet_mode == Mode::CeltOnly
+				|| self.mode == Some(Mode::CeltOnly)
+			{
+				let (n, _) = self.decode_native(None, pcm, frame_size, false, false)?;
+				return Ok((n, parsed.len));
+			}
+			// Conceal everything except the frame the FEC may cover.
+			let duration = self.last_packet_duration;
+			if frame_size > packet_frame {
+				if let Err(e) = self.decode_native(None, pcm, frame_size - packet_frame, false, false) {
+					self.last_packet_duration = duration;
+					return Err(e);
+				}
+			}
+			set_packet_state(self);
+			let (a, b) = parsed.frames[0];
+			let out = &mut pcm[(frame_size - packet_frame) * channels..];
+			self.decode_frame(Some(&data[a..b]), out, packet_frame, true)?;
+			self.last_packet_duration = frame_size;
+			return Ok((frame_size, parsed.len));
+		}
+
+		if parsed.frames.len() * packet_frame > frame_size {
+			return Err("opus output buffer too small");
+		}
+		// Only now that the packet is known to be valid.
+		set_packet_state(self);
 		let mut written = 0;
 		for &(a, b) in &parsed.frames {
-			let out = &mut pcm[written * self.channels..];
-			let n = self.decode_frame(&data[a..b], out)?;
-			written += n;
+			let out = &mut pcm[written * channels..];
+			written += self.decode_frame(Some(&data[a..b]), out, frame_size - written, false)?;
 		}
+		self.last_packet_duration = written;
 		Ok((written, parsed.len))
 	}
 }
 
 /// Full Opus decoder for one `OpusHead` configuration.
+///
+/// # Packet loss
+///
+/// Losses are recovered as libopus does: [`conceal`](Self::conceal) runs the
+/// packet-loss concealment (`opus_decode` with no data) and
+/// [`decode_fec`](Self::decode_fec) additionally recovers the last lost
+/// frame from the next packet's in-band FEC. Through [`core::Decoder`] this
+/// happens automatically: a packet that cannot be decoded (or is empty) is
+/// concealed for its duration, and a gap in the packet timestamps (a
+/// dropped packet or Ogg page) is concealed, with FEC, before the next
+/// packet is decoded. The concealment continues the signal for the first
+/// lost frames and then fades into comfort noise at the level of the
+/// background, so damaged streams never drop to digital silence.
 #[derive(Debug, Clone)]
 pub struct OpusDecoderState {
 	pub head: OpusHead,
@@ -504,8 +652,19 @@ pub struct OpusDecoderState {
 	/// FFmpeg output channel → decoded channel (255 = silence).
 	map: Vec<u8>,
 	gain: f32,
-	/// Packets that failed to decode and were replaced by silence.
+	/// Conceal gaps in packet timestamps (default on).
+	pub conceal_gaps: bool,
+	/// Use in-band FEC when concealing a gap (default on).
+	pub use_fec: bool,
+	/// Longest gap, in 48 kHz samples, that is concealed; longer jumps are
+	/// treated as discontinuities (a seek or a splice). Default 2 s.
+	pub max_gap: usize,
+	/// Expected pts (1/48000) of the next packet.
+	next_pts: Option<u64>,
+	/// Packets that could not be decoded and were concealed instead.
 	pub concealed_frames: u64,
+	/// Samples produced by concealment (lost packets, gaps and DTX aside).
+	pub concealed_samples: u64,
 }
 
 /// Vorbis → FFmpeg channel order for mapping family 1
@@ -520,6 +679,19 @@ const VORBIS_ORDER: [&[usize]; 8] = [
 	&[0, 2, 1, 6, 5, 3, 4],
 	&[0, 2, 1, 7, 5, 6, 3, 4],
 ];
+
+/// Default for [`OpusDecoderState::max_gap`]: 2 s.
+pub const DEFAULT_MAX_GAP: usize = 2 * SAMPLE_RATE as usize;
+/// Concealment granularity: 2.5 ms.
+const PLC_STEP: usize = 120;
+
+/// How [`OpusDecoderState::run`] drives each stream.
+#[derive(Clone, Copy)]
+enum Request<'a> {
+	Packet(&'a [u8]),
+	Conceal(usize),
+	Fec(&'a [u8], usize),
+}
 
 impl OpusDecoderState {
 	pub fn new(head: OpusHead) -> Self {
@@ -538,7 +710,18 @@ impl OpusDecoderState {
 		} else {
 			1.0
 		};
-		Self { head, streams, map, gain, concealed_frames: 0 }
+		Self {
+			head,
+			streams,
+			map,
+			gain,
+			conceal_gaps: true,
+			use_fec: true,
+			max_gap: DEFAULT_MAX_GAP,
+			next_pts: None,
+			concealed_frames: 0,
+			concealed_samples: 0,
+		}
 	}
 
 	pub fn from_extradata(extradata: &[u8], channels: u8) -> Self {
@@ -556,20 +739,80 @@ impl OpusDecoderState {
 		for s in &mut self.streams {
 			s.reset();
 		}
+		self.next_pts = None;
+	}
+
+	/// Samples per channel of the last decode or concealment
+	/// (`OPUS_GET_LAST_PACKET_DURATION`).
+	pub fn last_packet_duration(&self) -> usize {
+		self.streams.first().map_or(0, |s| s.last_packet_duration)
 	}
 
 	/// Decodes a packet into interleaved samples (`opus_multistream_decode_float`).
 	pub fn decode_packet(&mut self, data: &[u8]) -> Result<Vec<f32>> {
+		self.run(Request::Packet(data))
+	}
+
+	/// Conceals `samples` lost samples per channel (a multiple of 120, i.e.
+	/// 2.5 ms): `opus_multistream_decode_float` with no data, in calls of at
+	/// most 120 ms.
+	pub fn conceal(&mut self, samples: usize) -> Result<Vec<f32>> {
+		self.recover(None, samples)
+	}
+
+	/// Recovers `samples` lost samples per channel (a multiple of 120) that
+	/// precede `next`, the first packet received after the loss: the last
+	/// lost frame comes from `next`'s in-band FEC when it carries any, the
+	/// rest is concealed (`opus_multistream_decode_float` with
+	/// `decode_fec = 1` for the final 120 ms at most). `next` must still be
+	/// decoded afterwards.
+	pub fn decode_fec(&mut self, next: &[u8], samples: usize) -> Result<Vec<f32>> {
+		self.recover(Some(next), samples)
+	}
+
+	/// Splits a recovery into libopus-sized calls: 120 ms at most each, the
+	/// last one covering the gap's final 120 ms or less (and using FEC).
+	fn recover(&mut self, next: Option<&[u8]>, samples: usize) -> Result<Vec<f32>> {
+		if !samples.is_multiple_of(PLC_STEP) {
+			return Err(Message::Codec("opus concealment must be a multiple of 2.5 ms"));
+		}
+		let mut out = Vec::with_capacity(samples * self.channels());
+		let mut left = samples;
+		while left > 0 {
+			let last = left <= MAX_FRAME_SAMPLES;
+			let chunk = if last { left } else { (left - MAX_FRAME_SAMPLES).min(MAX_FRAME_SAMPLES) };
+			let request = match next {
+				Some(packet) if last => Request::Fec(packet, chunk),
+				_ => Request::Conceal(chunk),
+			};
+			out.extend(self.run(request)?);
+			left -= chunk;
+		}
+		Ok(out)
+	}
+
+	/// `opus_multistream_decode_native`: runs every stream and mixes them
+	/// into the output channels.
+	fn run(&mut self, request: Request<'_>) -> Result<Vec<f32>> {
 		let channels = self.channels();
 		let mut at = 0usize;
 		let count = self.streams.len();
 		let mut decoded: Vec<Vec<f32>> = Vec::with_capacity(count);
 		let mut samples = None;
 		for (s, stream) in self.streams.iter_mut().enumerate() {
-			let last = s + 1 == count;
-			let mut pcm = vec![0f32; MAX_FRAME_SAMPLES * stream.channels];
+			let self_delimited = s + 1 != count;
+			let (data, frame_size, fec) = match request {
+				// An empty payload would mean "conceal" to libopus.
+				Request::Packet(d) if d.len() <= at => {
+					return Err(Message::Codec("empty opus packet"));
+				}
+				Request::Packet(d) => (Some(d.get(at..).unwrap_or(&[])), MAX_FRAME_SAMPLES, false),
+				Request::Conceal(n) => (None, n, false),
+				Request::Fec(d, n) => (Some(d.get(at..).unwrap_or(&[])), n, true),
+			};
+			let mut pcm = vec![0f32; frame_size * stream.channels];
 			let (n, used) = stream
-				.decode_packet(data.get(at..).unwrap_or(&[]), !last, &mut pcm)
+				.decode_native(data, &mut pcm, frame_size, fec, self_delimited)
 				.map_err(Message::Codec)?;
 			if samples.is_some_and(|m| m != n) {
 				return Err(Message::Codec("opus streams disagree on frame duration"));
@@ -596,6 +839,63 @@ impl OpusDecoderState {
 			}
 		}
 		Ok(out)
+	}
+
+	/// Decodes one demuxed packet with loss recovery: conceals the gap
+	/// before it (if its `pts`, in 1/48000, is later than expected), then
+	/// decodes it, concealing it instead when it is damaged. `duration` is
+	/// the container's duration for the packet, used when the payload
+	/// cannot tell. Returns the samples and the pts of the first one.
+	pub fn decode_with_recovery(
+		&mut self,
+		data: &[u8],
+		pts: Option<u64>,
+		duration: Option<usize>,
+	) -> (Vec<f32>, Option<u64>) {
+		let channels = self.channels().max(1);
+		let mut out = Vec::new();
+		let mut start = pts;
+		if let (true, Some(pts), Some(expected)) = (self.conceal_gaps, pts, self.next_pts) {
+			// A lost packet leaves a gap of about a packet's duration; less
+			// than half of one is timestamp jitter (Matroska stores
+			// milliseconds, and muxers round). The gap is concealed to the
+			// nearest 2.5 ms.
+			let gap = pts.saturating_sub(expected) as usize;
+			let threshold = (self.last_packet_duration() / 2).max(PLC_STEP);
+			let lost = (gap + PLC_STEP / 2) / PLC_STEP * PLC_STEP;
+			if gap >= threshold && lost <= self.max_gap {
+				let recovered = if self.use_fec { self.decode_fec(data, lost) } else { self.conceal(lost) };
+				if let Ok(samples) = recovered.or_else(|_| self.conceal(lost)) {
+					out = samples;
+					start = Some(expected);
+					self.concealed_samples += lost as u64;
+				}
+			}
+		}
+		match self.decode_packet(data) {
+			Ok(samples) => out.extend(samples),
+			Err(_) => {
+				// Damaged or empty: conceal what the packet should have held.
+				self.concealed_frames += 1;
+				let nominal = super::header::packet_samples(data)
+					.map(|n| n as usize)
+					.or(duration)
+					.unwrap_or_else(|| self.last_packet_duration());
+				let n = nominal.clamp(PLC_STEP, MAX_FRAME_SAMPLES).div_ceil(PLC_STEP) * PLC_STEP;
+				match self.conceal(n) {
+					Ok(samples) => {
+						self.concealed_samples += n as u64;
+						out.extend(samples);
+					}
+					Err(_) => {
+						self.reset();
+						out.resize(out.len() + n * channels, 0.0);
+					}
+				}
+			}
+		}
+		self.next_pts = start.map(|p| p + (out.len() / channels) as u64);
+		(out, start)
 	}
 }
 
@@ -644,16 +944,10 @@ impl core::Decoder for OpusDecoder {
 			return Err(Message::Codec("opus decoder state missing"));
 		};
 		let channels = dec.channels();
-		let samples = match dec.decode_packet(&packet.data) {
-			Ok(s) => s,
-			Err(_) => {
-				// Conceal with silence of the packet's nominal duration.
-				dec.concealed_frames += 1;
-				let n = super::header::packet_samples(&packet.data).unwrap_or(960) as usize;
-				dec.reset();
-				vec![0f32; n * channels]
-			}
-		};
+		let rate = TimeBase::new(1, SAMPLE_RATE);
+		let pts = packet.pts.and_then(|t| t.rescale(rate)).map(|t| t.ticks());
+		let duration = packet.duration.and_then(|t| t.rescale(rate)).map(|t| t.ticks() as usize);
+		let (samples, start) = dec.decode_with_recovery(&packet.data, pts, duration);
 		let data: Vec<u8> = samples.iter().flat_map(|v| v.to_le_bytes()).collect();
 		let mut frame = AudioFrame::new(
 			data,
@@ -662,9 +956,7 @@ impl core::Decoder for OpusDecoder {
 			SampleFormat::F32,
 			SampleLayout::Interleaved,
 		);
-		frame.pts = packet
-			.pts
-			.and_then(|t| Time::new(t.ticks(), t.base()).rescale(TimeBase::new(1, SAMPLE_RATE)));
+		frame.pts = start.map(|t| Time::new(t, rate));
 		audio.samples_produced += frame.nb_samples as u64;
 		audio.samples_consumed += packet.data.len() as u64;
 		Ok(DecodeOut { value: vec![Frame::Audio(frame)], state: state.clone() })

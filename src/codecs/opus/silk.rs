@@ -3,15 +3,24 @@
 //! `decode_pulses.c`, `shell_coder.c`, `code_signs.c`,
 //! `decode_parameters.c`, `gain_quant.c`, `NLSF_decode.c`, `NLSF2A.c`,
 //! `NLSF_stabilize.c`, `LPC_inv_pred_gain.c`, `LPC_fit.c`, `bwexpander_32.c`,
-//! `decode_pitch.c`, `decode_core.c`, `stereo_*.c`, `resampler*.c`.
+//! `decode_pitch.c`, `decode_core.c`, `stereo_*.c`, `resampler*.c`, and the
+//! loss handling: `PLC.c` (packet-loss concealment), `CNG.c` (comfort
+//! noise) and the LBRR (in-band FEC) path of `dec_API.c`.
 //!
 //! SILK is specified in fixed point, so this port is bit-exact with libopus:
 //! the fixed-point helpers below reproduce `SigProc_FIX.h` / `Inlines.h`
 //! exactly (with wrapping where the reference relies on two's complement).
 //!
-//! Packet-loss concealment and comfort noise only change the output after a
-//! lost packet; RMP never reports losses to the decoder (a damaged packet
-//! is concealed with silence by the Opus layer), so they are not ported.
+//! Loss handling follows libopus. Every decoded frame updates the PLC state
+//! (last pitch lag, LTP and LPC filters, gains) and, during silence, the CNG
+//! estimate (smoothed NLSFs, gain and an excitation buffer). A lost frame is
+//! extrapolated from the last excitation with a decaying pitch pulse train
+//! and attenuated noise ([`plc_conceal`]); comfort noise shaped by the
+//! smoothed spectrum is added on top ([`cng`]); and the first good frame
+//! after a loss is faded in if it is louder than the concealment
+//! ([`plc_glue_frames`]). With [`SilkMode::Lbrr`] the low-bitrate
+//! redundant copy of the previous packet, carried at the start of the
+//! current one, is decoded instead of the packet itself.
 
 #![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 
@@ -48,6 +57,42 @@ const RESAMPLER_ORDER_FIR_12: usize = 8;
 const RESAMPLER_MAX_BATCH_SIZE_MS: i32 = 10;
 const UP2_HQ_0: [i32; 3] = [1746, 14986, 39083 - 65536];
 const UP2_HQ_1: [i32; 3] = [6854, 25769, 55542 - 65536];
+
+// PLC.h / PLC.c.
+const BWE_COEF_Q16: i32 = 64881; // SILK_FIX_CONST(0.99, 16)
+const BWE_AFTER_LOSS_Q16: i32 = 63570; // define.h
+const V_PITCH_GAIN_START_MIN_Q14: i32 = 11469; // 0.7
+const V_PITCH_GAIN_START_MAX_Q14: i32 = 15565; // 0.95
+const MAX_PITCH_LAG_MS: i32 = 18;
+const RAND_BUF_SIZE: usize = 128;
+const RAND_BUF_MASK: i32 = RAND_BUF_SIZE as i32 - 1;
+const LOG2_INV_LPC_GAIN_HIGH_THRES: u32 = 3; // 8 dB LPC gain
+const LOG2_INV_LPC_GAIN_LOW_THRES: u32 = 8; // 24 dB LPC gain
+const PITCH_DRIFT_FAC_Q16: i32 = 655; // 0.01
+const NB_ATT: usize = 2;
+const HARM_ATT_Q15: [i32; NB_ATT] = [32440, 31130]; // 0.99, 0.95
+const PLC_RAND_ATTENUATE_V_Q15: [i32; NB_ATT] = [31130, 26214]; // 0.95, 0.8
+const PLC_RAND_ATTENUATE_UV_Q15: [i32; NB_ATT] = [32440, 29491]; // 0.99, 0.9
+
+// define.h (comfort noise).
+const CNG_BUF_MASK_MAX: i32 = 255;
+const CNG_GAIN_SMTH_Q16: i32 = 4634; // 0.25^(1/4)
+const CNG_GAIN_SMTH_THRESHOLD_Q16: i32 = 46396; // -3 dB
+const CNG_NLSF_SMTH_Q16: i32 = 16348; // 0.25
+const CNG_RAND_SEED: i32 = 3_176_576;
+
+/// How [`SilkDecoder::decode`] treats the current frame (libopus'
+/// `lostFlag`: `FLAG_DECODE_NORMAL`, `FLAG_PACKET_LOST`, `FLAG_DECODE_LBRR`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SilkMode {
+	/// Decode the frame from the packet.
+	Normal,
+	/// The packet is missing: conceal the frame.
+	Lost,
+	/// Decode the LBRR (FEC) copy of the previous packet's frame from the
+	/// current packet; frames without LBRR data are concealed.
+	Lbrr,
+}
 
 // --- Fixed-point helpers (SigProc_FIX.h, macros.h, Inlines.h). ---
 
@@ -114,6 +159,61 @@ fn clz32(a: i32) -> i32 {
 #[inline]
 fn silk_rand(seed: i32) -> i32 {
 	907_633_515i32.wrapping_add(seed.wrapping_mul(196_314_165))
+}
+
+/// `silk_SQRT_APPROX`: approximate square root in the input's Q domain / 2.
+fn sqrt_approx(x: i32) -> i32 {
+	if x <= 0 {
+		return 0;
+	}
+	// silk_CLZ_FRAC: leading zeros and the 7 bits after the leading one.
+	let lz = clz32(x);
+	let rot = 24 - lz;
+	let rotated = if rot >= 0 {
+		(x as u32).rotate_right(rot as u32)
+	} else {
+		(x as u32).rotate_left((-rot) as u32)
+	};
+	let frac_q7 = (rotated & 0x7F) as i32;
+	let mut y = if lz & 1 != 0 { 32768 } else { 46214 }; // 46214 = sqrt(2) * 32768
+	y >>= lz >> 1;
+	smlawb(y, y, smulbb(213, frac_q7))
+}
+
+/// `silk_sum_sqr_shift`: energy of `x` and the right shift applied to keep
+/// it within 32 bits with two bits of headroom.
+fn sum_sqr_shift(x: &[i16]) -> (i32, i32) {
+	let len = x.len();
+	let pass = |init: i32, shift: i32| -> i32 {
+		let shift = shift as u32;
+		let mut nrg = init as u32;
+		let mut i = 0;
+		while i + 1 < len {
+			let t = (smulbb(i32::from(x[i]), i32::from(x[i])) as u32)
+				.wrapping_add(smulbb(i32::from(x[i + 1]), i32::from(x[i + 1])) as u32);
+			nrg = nrg.wrapping_add(t >> shift);
+			i += 2;
+		}
+		if i < len {
+			nrg = nrg.wrapping_add((smulbb(i32::from(x[i]), i32::from(x[i])) as u32) >> shift);
+		}
+		nrg as i32
+	};
+	let first_shift = 31 - clz32(len as i32);
+	let nrg = pass(len as i32, first_shift);
+	let shift = (first_shift + 3 - clz32(nrg)).max(0);
+	(pass(0, shift), shift)
+}
+
+/// `silk_bwexpander`: chirps a 16-bit AR filter in place.
+fn bwexpander(ar: &mut [i16], mut chirp_q16: i32) {
+	let Some(last) = ar.len().checked_sub(1) else { return };
+	let chirp_minus_one_q16 = chirp_q16 - 65536;
+	for v in &mut ar[..last] {
+		*v = rshift_round(chirp_q16.wrapping_mul(i32::from(*v)), 16) as i16;
+		chirp_q16 += rshift_round(chirp_q16.wrapping_mul(chirp_minus_one_q16), 16);
+	}
+	ar[last] = rshift_round(chirp_q16.wrapping_mul(i32::from(ar[last])), 16) as i16;
 }
 
 fn div32_var_q(a32: i32, b32: i32, qres: i32) -> i32 {
@@ -420,6 +520,77 @@ struct ChannelState {
 	resampler: Resampler,
 	indices: Indices,
 	prev_signal_type: i32,
+	/// Consecutive concealed frames (`lossCnt`).
+	loss_cnt: i32,
+	plc: PlcState,
+	cng: CngState,
+}
+
+/// Packet-loss concealment state (`silk_PLC_struct`).
+#[derive(Debug, Clone)]
+struct PlcState {
+	/// Pitch lag to use for voiced concealment (Q8).
+	pitch_l_q8: i32,
+	/// LTP filter for voiced concealment (only the centre tap is non-zero).
+	ltp_coef_q14: [i16; LTP_ORDER],
+	prev_lpc_q12: [i16; MAX_LPC_ORDER],
+	last_frame_lost: bool,
+	rand_seed: i32,
+	rand_scale_q14: i16,
+	/// Energy of the last concealed frame, for fading in the next good one.
+	conc_energy: i32,
+	conc_energy_shift: i32,
+	prev_ltp_scale_q14: i16,
+	prev_gain_q16: [i32; 2],
+	fs_khz: i32,
+	nb_subfr: usize,
+	subfr_length: usize,
+}
+
+impl PlcState {
+	/// The state after `silk_init_decoder` (zeroed, then `silk_PLC_Reset`
+	/// with no frame length yet).
+	fn new() -> Self {
+		Self {
+			pitch_l_q8: 0,
+			ltp_coef_q14: [0; LTP_ORDER],
+			prev_lpc_q12: [0; MAX_LPC_ORDER],
+			last_frame_lost: false,
+			rand_seed: 0,
+			rand_scale_q14: 0,
+			conc_energy: 0,
+			conc_energy_shift: 0,
+			prev_ltp_scale_q14: 0,
+			prev_gain_q16: [1 << 16; 2],
+			fs_khz: 0,
+			nb_subfr: 2,
+			subfr_length: 20,
+		}
+	}
+}
+
+/// Comfort-noise state (`silk_CNG_struct`).
+#[derive(Debug, Clone)]
+struct CngState {
+	exc_buf_q14: [i32; MAX_FRAME_LENGTH],
+	smth_nlsf_q15: [i16; MAX_LPC_ORDER],
+	synth_state: [i32; MAX_LPC_ORDER],
+	smth_gain_q16: i32,
+	rand_seed: i32,
+	fs_khz: i32,
+}
+
+impl CngState {
+	fn new() -> Self {
+		Self {
+			exc_buf_q14: [0; MAX_FRAME_LENGTH],
+			smth_nlsf_q15: [0; MAX_LPC_ORDER],
+			synth_state: [0; MAX_LPC_ORDER],
+			smth_gain_q16: 0,
+			rand_seed: CNG_RAND_SEED,
+			fs_khz: 0,
+		}
+	}
 }
 
 impl ChannelState {
@@ -451,6 +622,9 @@ impl ChannelState {
 			resampler: Resampler::default(),
 			indices: Indices::default(),
 			prev_signal_type: 0,
+			loss_cnt: 0,
+			plc: PlcState::new(),
+			cng: CngState::new(),
 		}
 	}
 
@@ -921,6 +1095,7 @@ fn nlsf2a(nlsf: &[i16], d: usize) -> [i16; MAX_LPC_ORDER] {
 	a_q12
 }
 
+#[derive(Default)]
 struct DecoderControl {
 	pitch_l: [i32; MAX_NB_SUBFR],
 	gains_q16: [i32; MAX_NB_SUBFR],
@@ -978,6 +1153,12 @@ fn decode_parameters(st: &mut ChannelState, cond: i32) -> DecoderControl {
 		ctrl.pred_coef_q12[0] = ctrl.pred_coef_q12[1];
 	}
 	st.prev_nlsf_q15 = nlsf;
+
+	// After a packet loss, bandwidth-expand the LPC filters.
+	if st.loss_cnt != 0 {
+		bwexpander(&mut ctrl.pred_coef_q12[0][..order], BWE_AFTER_LOSS_Q16);
+		bwexpander(&mut ctrl.pred_coef_q12[1][..order], BWE_AFTER_LOSS_Q16);
+	}
 
 	if st.indices.signal_type == TYPE_VOICED {
 		// silk_decode_pitch
@@ -1059,9 +1240,9 @@ fn decode_core(st: &mut ChannelState, ctrl: &mut DecoderControl, xq: &mut [i16],
 	let mut lag = 0usize;
 	for k in 0..st.nb_subfr {
 		let a_q12 = ctrl.pred_coef_q12[k >> 1];
-		let b_q14: [i16; LTP_ORDER] =
+		let mut b_q14: [i16; LTP_ORDER] =
 			ctrl.ltp_coef_q14[k * LTP_ORDER..(k + 1) * LTP_ORDER].try_into().unwrap_or([0; LTP_ORDER]);
-		let signal_type = st.indices.signal_type;
+		let mut signal_type = st.indices.signal_type;
 		let gain_q10 = ctrl.gains_q16[k] >> 6;
 		let mut inv_gain_q31 = inverse32_var_q(ctrl.gains_q16[k], 47);
 		let gain_adj_q16;
@@ -1074,6 +1255,18 @@ fn decode_core(st: &mut ChannelState, ctrl: &mut DecoderControl, xq: &mut [i16],
 			gain_adj_q16 = 1 << 16;
 		}
 		st.prev_gain_q16 = ctrl.gains_q16[k];
+
+		// Avoid an abrupt switch from voiced concealment to unvoiced decoding.
+		if st.loss_cnt != 0
+			&& st.prev_signal_type == TYPE_VOICED
+			&& st.indices.signal_type != TYPE_VOICED
+			&& k < MAX_NB_SUBFR / 2
+		{
+			b_q14 = [0; LTP_ORDER];
+			b_q14[LTP_ORDER / 2] = 4096; // 0.25 in Q14
+			signal_type = TYPE_VOICED;
+			ctrl.pitch_l[k] = st.lag_prev;
+		}
 
 		if signal_type == TYPE_VOICED {
 			lag = ctrl.pitch_l[k] as usize;
@@ -1129,25 +1322,383 @@ fn decode_core(st: &mut ChannelState, ctrl: &mut DecoderControl, xq: &mut [i16],
 	let _ = lag;
 }
 
+/// `silk_decode_frame`: decodes (or conceals) one frame into `out` and
+/// returns its length.
 fn decode_frame(
 	st: &mut ChannelState,
 	dec: &mut RangeDecoder,
 	out: &mut [i16],
+	mode: SilkMode,
 	cond: i32,
 ) -> usize {
 	let l = st.frame_length;
-	let mut pulses = vec![0i32; (l + SHELL_CODEC_FRAME_LENGTH - 1) & !(SHELL_CODEC_FRAME_LENGTH - 1)];
-	decode_indices(st, dec, st.n_frames_decoded, false, cond);
-	decode_pulses(dec, &mut pulses, st.indices.signal_type, st.indices.quant_offset_type, l);
-	let mut ctrl = decode_parameters(st, cond);
-	decode_core(st, &mut ctrl, out, &pulses);
-	st.prev_signal_type = st.indices.signal_type;
-	st.first_frame_after_reset = false;
+	let mut ctrl = DecoderControl::default();
+	let has_data = match mode {
+		SilkMode::Normal => true,
+		SilkMode::Lbrr => st.lbrr_flags[st.n_frames_decoded.min(2)],
+		SilkMode::Lost => false,
+	};
+	if has_data {
+		let mut pulses =
+			vec![0i32; (l + SHELL_CODEC_FRAME_LENGTH - 1) & !(SHELL_CODEC_FRAME_LENGTH - 1)];
+		decode_indices(st, dec, st.n_frames_decoded, mode == SilkMode::Lbrr, cond);
+		decode_pulses(dec, &mut pulses, st.indices.signal_type, st.indices.quant_offset_type, l);
+		ctrl = decode_parameters(st, cond);
+		decode_core(st, &mut ctrl, out, &pulses);
+		plc(st, &mut ctrl, out, false);
+		st.loss_cnt = 0;
+		st.prev_signal_type = st.indices.signal_type;
+		st.first_frame_after_reset = false;
+	} else {
+		plc(st, &mut ctrl, out, true);
+	}
 	let mv = st.ltp_mem_length - l;
 	st.out_buf.copy_within(l..l + mv, 0);
 	st.out_buf[mv..mv + l].copy_from_slice(&out[..l]);
+	cng(st, &ctrl, &mut out[..l]);
+	plc_glue_frames(st, &mut out[..l]);
 	st.lag_prev = ctrl.pitch_l[st.nb_subfr - 1];
 	l
+}
+
+// --- Packet-loss concealment (PLC.c). ---
+
+/// `silk_PLC_Reset`.
+fn plc_reset(st: &mut ChannelState) {
+	st.plc.pitch_l_q8 = (st.frame_length as i32) << 7;
+	st.plc.prev_gain_q16 = [1 << 16; 2];
+	st.plc.subfr_length = 20;
+	st.plc.nb_subfr = 2;
+}
+
+/// `silk_PLC`: conceals a lost frame into `frame`, or learns from a good one.
+fn plc(st: &mut ChannelState, ctrl: &mut DecoderControl, frame: &mut [i16], lost: bool) {
+	if st.fs_khz != st.plc.fs_khz {
+		plc_reset(st);
+		st.plc.fs_khz = st.fs_khz;
+	}
+	if lost {
+		plc_conceal(st, ctrl, frame);
+		st.loss_cnt += 1;
+	} else {
+		plc_update(st, ctrl);
+	}
+}
+
+/// `silk_PLC_update`: keeps the parameters of the last good frame.
+fn plc_update(st: &mut ChannelState, ctrl: &DecoderControl) {
+	let nb_subfr = st.nb_subfr;
+	let subfr_length = st.subfr_length as i32;
+	st.prev_signal_type = st.indices.signal_type;
+	let plc = &mut st.plc;
+	if st.indices.signal_type == TYPE_VOICED {
+		// The strongest LTP filter among the subframes within one pitch
+		// period of the end.
+		let mut ltp_gain_q14 = 0i32;
+		let mut j = 0usize;
+		while (j as i32) * subfr_length < ctrl.pitch_l[nb_subfr - 1] && j < nb_subfr {
+			let sub = nb_subfr - 1 - j;
+			let taps = &ctrl.ltp_coef_q14[sub * LTP_ORDER..(sub + 1) * LTP_ORDER];
+			let gain: i32 = taps.iter().map(|&t| i32::from(t)).sum();
+			if gain > ltp_gain_q14 {
+				ltp_gain_q14 = gain;
+				plc.ltp_coef_q14.copy_from_slice(taps);
+				plc.pitch_l_q8 = ctrl.pitch_l[sub] << 8;
+			}
+			j += 1;
+		}
+		// As in libopus, only the summed gain is kept, on the centre tap.
+		plc.ltp_coef_q14 = [0; LTP_ORDER];
+		plc.ltp_coef_q14[LTP_ORDER / 2] = ltp_gain_q14 as i16;
+		if ltp_gain_q14 < V_PITCH_GAIN_START_MIN_Q14 {
+			let scale_q10 = (V_PITCH_GAIN_START_MIN_Q14 << 10) / ltp_gain_q14.max(1);
+			for c in &mut plc.ltp_coef_q14 {
+				*c = (smulbb(i32::from(*c), scale_q10) >> 10) as i16;
+			}
+		} else if ltp_gain_q14 > V_PITCH_GAIN_START_MAX_Q14 {
+			let scale_q14 = (V_PITCH_GAIN_START_MAX_Q14 << 14) / ltp_gain_q14.max(1);
+			for c in &mut plc.ltp_coef_q14 {
+				*c = (smulbb(i32::from(*c), scale_q14) >> 14) as i16;
+			}
+		}
+	} else {
+		plc.pitch_l_q8 = smulbb(st.fs_khz, 18) << 8;
+		plc.ltp_coef_q14 = [0; LTP_ORDER];
+	}
+	let order = st.lpc_order;
+	plc.prev_lpc_q12[..order].copy_from_slice(&ctrl.pred_coef_q12[1][..order]);
+	plc.prev_ltp_scale_q14 = ctrl.ltp_scale_q14 as i16;
+	plc.prev_gain_q16 = [ctrl.gains_q16[nb_subfr - 2], ctrl.gains_q16[nb_subfr - 1]];
+	plc.subfr_length = st.subfr_length;
+	plc.nb_subfr = nb_subfr;
+}
+
+/// `silk_PLC_energy`: energies of the last two subframes' excitation.
+fn plc_energy(st: &ChannelState, prev_gain_q10: [i32; 2]) -> (i32, i32, i32, i32) {
+	let subfr_length = st.subfr_length;
+	let mut exc_buf = vec![0i16; 2 * subfr_length];
+	for k in 0..2 {
+		let src = (k + st.nb_subfr - 2) * subfr_length;
+		for i in 0..subfr_length {
+			exc_buf[k * subfr_length + i] =
+				sat16(smulww(st.exc_q14[src + i], prev_gain_q10[k]) >> 8) as i16;
+		}
+	}
+	let (energy1, shift1) = sum_sqr_shift(&exc_buf[..subfr_length]);
+	let (energy2, shift2) = sum_sqr_shift(&exc_buf[subfr_length..]);
+	(energy1, shift1, energy2, shift2)
+}
+
+/// `silk_PLC_conceal`: extrapolates a lost frame from the last excitation
+/// (pitch pulses for voiced speech, random excitation otherwise), through
+/// the last LPC filter, with decaying gains.
+fn plc_conceal(st: &mut ChannelState, ctrl: &mut DecoderControl, frame: &mut [i16]) {
+	let ltp_mem = st.ltp_mem_length;
+	let frame_length = st.frame_length;
+	let order = st.lpc_order;
+	let mut s_ltp_q14 = vec![0i32; ltp_mem + frame_length];
+	let mut s_ltp = vec![0i16; ltp_mem];
+	let prev_gain_q10 = [st.plc.prev_gain_q16[0] >> 6, st.plc.prev_gain_q16[1] >> 6];
+	if st.first_frame_after_reset {
+		st.plc.prev_lpc_q12 = [0; MAX_LPC_ORDER];
+	}
+	let (energy1, shift1, energy2, shift2) = plc_energy(st, prev_gain_q10);
+	// Use the quieter of the last two subframes as the noise source.
+	let plc_frame = (st.plc.nb_subfr * st.plc.subfr_length) as i32;
+	let rand_at = if (energy1 >> shift2) < (energy2 >> shift1) {
+		(plc_frame - st.plc.subfr_length as i32 - RAND_BUF_SIZE as i32).max(0)
+	} else {
+		(plc_frame - RAND_BUF_SIZE as i32).max(0)
+	} as usize;
+
+	let mut rand_scale_q14 = st.plc.rand_scale_q14;
+	let att = (st.loss_cnt as usize).min(NB_ATT - 1);
+	let harm_gain_q15 = HARM_ATT_Q15[att];
+	let mut rand_gain_q15 = if st.prev_signal_type == TYPE_VOICED {
+		PLC_RAND_ATTENUATE_V_Q15[att]
+	} else {
+		PLC_RAND_ATTENUATE_UV_Q15[att]
+	};
+	bwexpander(&mut st.plc.prev_lpc_q12[..order], BWE_COEF_Q16);
+	let a_q12 = st.plc.prev_lpc_q12;
+
+	if st.loss_cnt == 0 {
+		// First lost frame.
+		rand_scale_q14 = 1 << 14;
+		if st.prev_signal_type == TYPE_VOICED {
+			// Less noise for voiced frames.
+			for &b in &st.plc.ltp_coef_q14 {
+				rand_scale_q14 = rand_scale_q14.wrapping_sub(b);
+			}
+			rand_scale_q14 = rand_scale_q14.max(3277); // 0.2
+			rand_scale_q14 =
+				(smulbb(i32::from(rand_scale_q14), i32::from(st.plc.prev_ltp_scale_q14)) >> 14) as i16;
+		} else {
+			// Less noise for unvoiced frames with a high LPC gain.
+			let inv_gain_q30 = lpc_inverse_pred_gain(&st.plc.prev_lpc_q12[..order]);
+			let down_scale_q30 = inv_gain_q30.clamp(
+				(1i32 << 30) >> LOG2_INV_LPC_GAIN_LOW_THRES,
+				(1i32 << 30) >> LOG2_INV_LPC_GAIN_HIGH_THRES,
+			) << LOG2_INV_LPC_GAIN_HIGH_THRES;
+			rand_gain_q15 = smulwb(down_scale_q30, rand_gain_q15) >> 14;
+		}
+	}
+
+	let mut rand_seed = st.plc.rand_seed;
+	// The pitch lag never exceeds MAX_PITCH_LAG_MS (and libopus asserts the
+	// filter history fits); the clamp only keeps damaged state in bounds.
+	const MIN_PLC_LAG: i32 = LTP_ORDER as i32 / 2 + 1;
+	let max_lag = (ltp_mem - order - LTP_ORDER / 2 - 1) as i32;
+	let mut lag = rshift_round(st.plc.pitch_l_q8, 8).clamp(MIN_PLC_LAG, max_lag) as usize;
+	let mut s_ltp_buf_idx = ltp_mem;
+
+	// Re-whiten the LTP state.
+	let idx = ltp_mem - lag - order - LTP_ORDER / 2;
+	lpc_analysis_filter(&mut s_ltp[idx..], &st.out_buf[idx..], &a_q12, ltp_mem - idx, order);
+	let inv_gain_q30 = inverse32_var_q(st.plc.prev_gain_q16[1], 46).min(i32::MAX >> 1);
+	for i in idx + order..ltp_mem {
+		s_ltp_q14[i] = smulwb(inv_gain_q30, i32::from(s_ltp[i]));
+	}
+
+	// LTP synthesis.
+	let b_q14 = &mut st.plc.ltp_coef_q14;
+	for _ in 0..st.nb_subfr {
+		let pred_start = s_ltp_buf_idx - lag + LTP_ORDER / 2;
+		for pred_at in pred_start..pred_start + st.subfr_length {
+			let mut ltp_pred_q12 = 2i32;
+			for (tap, &b) in b_q14.iter().enumerate() {
+				ltp_pred_q12 = smlawb(ltp_pred_q12, s_ltp_q14[pred_at - tap], i32::from(b));
+			}
+			rand_seed = silk_rand(rand_seed);
+			let r = ((rand_seed >> 25) & RAND_BUF_MASK) as usize;
+			s_ltp_q14[s_ltp_buf_idx] =
+				smlawb(ltp_pred_q12, st.exc_q14[rand_at + r], i32::from(rand_scale_q14)).wrapping_shl(2);
+			s_ltp_buf_idx += 1;
+		}
+		for b in b_q14.iter_mut() {
+			*b = (smulbb(harm_gain_q15, i32::from(*b)) >> 15) as i16;
+		}
+		rand_scale_q14 = (smulbb(i32::from(rand_scale_q14), rand_gain_q15) >> 15) as i16;
+		// Slowly lengthen the pitch period.
+		st.plc.pitch_l_q8 = smlawb(st.plc.pitch_l_q8, st.plc.pitch_l_q8, PITCH_DRIFT_FAC_Q16);
+		st.plc.pitch_l_q8 = st.plc.pitch_l_q8.min(smulbb(MAX_PITCH_LAG_MS, st.fs_khz) << 8);
+		lag = rshift_round(st.plc.pitch_l_q8, 8).clamp(MIN_PLC_LAG, max_lag) as usize;
+	}
+
+	// LPC synthesis, in place over the excitation.
+	let base = ltp_mem - MAX_LPC_ORDER;
+	s_ltp_q14[base..ltp_mem].copy_from_slice(&st.s_lpc_q14_buf);
+	for i in 0..frame_length {
+		let at = base + MAX_LPC_ORDER + i;
+		let mut pred_q10 = (order >> 1) as i32;
+		for j in 0..order {
+			pred_q10 = smlawb(pred_q10, s_ltp_q14[at - j - 1], i32::from(a_q12[j]));
+		}
+		s_ltp_q14[at] = add_sat32(s_ltp_q14[at], lshift_sat32(pred_q10, 4));
+		frame[i] = sat16(rshift_round(smulww(s_ltp_q14[at], prev_gain_q10[1]), 8)) as i16;
+	}
+	st.s_lpc_q14_buf
+		.copy_from_slice(&s_ltp_q14[base + frame_length..base + frame_length + MAX_LPC_ORDER]);
+
+	st.plc.rand_seed = rand_seed;
+	st.plc.rand_scale_q14 = rand_scale_q14;
+	ctrl.pitch_l = [lag as i32; MAX_NB_SUBFR];
+}
+
+/// `silk_PLC_glue_frames`: remembers the energy of concealed frames and
+/// fades in the first good frame when it is louder.
+fn plc_glue_frames(st: &mut ChannelState, frame: &mut [i16]) {
+	let plc = &mut st.plc;
+	if st.loss_cnt != 0 {
+		(plc.conc_energy, plc.conc_energy_shift) = sum_sqr_shift(frame);
+		plc.last_frame_lost = true;
+		return;
+	}
+	if plc.last_frame_lost {
+		let (mut energy, energy_shift) = sum_sqr_shift(frame);
+		if energy_shift > plc.conc_energy_shift {
+			plc.conc_energy >>= energy_shift - plc.conc_energy_shift;
+		} else if energy_shift < plc.conc_energy_shift {
+			energy >>= plc.conc_energy_shift - energy_shift;
+		}
+		if energy > plc.conc_energy {
+			let lz = clz32(plc.conc_energy) - 1;
+			plc.conc_energy = plc.conc_energy.wrapping_shl(lz as u32);
+			energy >>= (24 - lz).max(0);
+			let frac_q24 = plc.conc_energy / energy.max(1);
+			let mut gain_q16 = sqrt_approx(frac_q24) << 4;
+			// Four times steeper than linear, so onsets after DTX survive.
+			let slope_q16 = (((1 << 16) - gain_q16) / frame.len() as i32) << 2;
+			for v in frame.iter_mut() {
+				*v = smulwb(gain_q16, i32::from(*v)) as i16;
+				gain_q16 += slope_q16;
+				if gain_q16 > 1 << 16 {
+					break;
+				}
+			}
+		}
+	}
+	plc.last_frame_lost = false;
+}
+
+// --- Comfort noise (CNG.c). ---
+
+/// `silk_CNG_Reset`.
+fn cng_reset(st: &mut ChannelState) {
+	let order = st.lpc_order;
+	let step_q15 = i32::from(i16::MAX) / (order as i32 + 1);
+	let mut acc_q15 = 0;
+	for v in &mut st.cng.smth_nlsf_q15[..order] {
+		acc_q15 += step_q15;
+		*v = acc_q15 as i16;
+	}
+	st.cng.smth_gain_q16 = 0;
+	st.cng.rand_seed = CNG_RAND_SEED;
+}
+
+/// `silk_CNG`: tracks the background noise during inactive frames and adds
+/// it to concealed frames.
+fn cng(st: &mut ChannelState, ctrl: &DecoderControl, frame: &mut [i16]) {
+	if st.fs_khz != st.cng.fs_khz {
+		cng_reset(st);
+		st.cng.fs_khz = st.fs_khz;
+	}
+	let order = st.lpc_order;
+	let cng = &mut st.cng;
+	if st.loss_cnt == 0 && st.prev_signal_type == TYPE_NO_VOICE_ACTIVITY {
+		for i in 0..order {
+			let smth = i32::from(cng.smth_nlsf_q15[i]);
+			cng.smth_nlsf_q15[i] =
+				smth.wrapping_add(smulwb(i32::from(st.prev_nlsf_q15[i]) - smth, CNG_NLSF_SMTH_Q16)) as i16;
+		}
+		// The excitation of the loudest subframe feeds the noise buffer.
+		let mut max_gain_q16 = 0;
+		let mut subfr = 0;
+		for i in 0..st.nb_subfr {
+			if ctrl.gains_q16[i] > max_gain_q16 {
+				max_gain_q16 = ctrl.gains_q16[i];
+				subfr = i;
+			}
+		}
+		let sub = st.subfr_length;
+		cng.exc_buf_q14.copy_within(..(st.nb_subfr - 1) * sub, sub);
+		cng.exc_buf_q14[..sub].copy_from_slice(&st.exc_q14[subfr * sub..(subfr + 1) * sub]);
+		for i in 0..st.nb_subfr {
+			let gain = ctrl.gains_q16[i];
+			cng.smth_gain_q16 = cng
+				.smth_gain_q16
+				.wrapping_add(smulwb(gain.wrapping_sub(cng.smth_gain_q16), CNG_GAIN_SMTH_Q16));
+			// Adapt quickly when the smoothed gain is 3 dB above this one.
+			if smulww(cng.smth_gain_q16, CNG_GAIN_SMTH_THRESHOLD_Q16) > gain {
+				cng.smth_gain_q16 = gain;
+			}
+		}
+	}
+	if st.loss_cnt == 0 {
+		cng.synth_state[..order].fill(0);
+		return;
+	}
+	// Noise gain: what the smoothed background has beyond the concealment.
+	let smultt = |a: i32, b: i32| (a >> 16).wrapping_mul(b >> 16);
+	let mut gain_q16 = smulww(i32::from(st.plc.rand_scale_q14), st.plc.prev_gain_q16[1]);
+	if gain_q16 >= 1 << 21 || cng.smth_gain_q16 > 1 << 23 {
+		gain_q16 = smultt(gain_q16, gain_q16);
+		gain_q16 = smultt(cng.smth_gain_q16, cng.smth_gain_q16).wrapping_sub(gain_q16.wrapping_shl(5));
+		gain_q16 = sqrt_approx(gain_q16).wrapping_shl(16);
+	} else {
+		gain_q16 = smulww(gain_q16, gain_q16);
+		gain_q16 = smulww(cng.smth_gain_q16, cng.smth_gain_q16).wrapping_sub(gain_q16.wrapping_shl(5));
+		gain_q16 = sqrt_approx(gain_q16).wrapping_shl(8);
+	}
+	let gain_q10 = gain_q16 >> 6;
+
+	// silk_CNG_exc: random excitation drawn from the buffer.
+	let length = frame.len();
+	let mut sig_q14 = vec![0i32; length + MAX_LPC_ORDER];
+	let mut exc_mask = CNG_BUF_MASK_MAX;
+	while exc_mask > length as i32 {
+		exc_mask >>= 1;
+	}
+	let mut seed = cng.rand_seed;
+	for v in &mut sig_q14[MAX_LPC_ORDER..] {
+		seed = silk_rand(seed);
+		*v = cng.exc_buf_q14[((seed >> 24) & exc_mask) as usize];
+	}
+	cng.rand_seed = seed;
+
+	let a_q12 = nlsf2a(&cng.smth_nlsf_q15, order);
+	sig_q14[..MAX_LPC_ORDER].copy_from_slice(&cng.synth_state);
+	for i in 0..length {
+		let at = MAX_LPC_ORDER + i;
+		let mut pred_q10 = (order >> 1) as i32;
+		for j in 0..order {
+			pred_q10 = smlawb(pred_q10, sig_q14[at - j - 1], i32::from(a_q12[j]));
+		}
+		sig_q14[at] = add_sat32(sig_q14[at], lshift_sat32(pred_q10, 4));
+		let noise = sat16(rshift_round(smulww(sig_q14[at], gain_q10), 8));
+		frame[i] = sat16(i32::from(frame[i]) + noise) as i16;
+	}
+	cng.synth_state.copy_from_slice(&sig_q14[length..length + MAX_LPC_ORDER]);
 }
 
 fn stereo_decode_pred(dec: &mut RangeDecoder) -> [i32; 2] {
@@ -1250,9 +1801,16 @@ impl SilkDecoder {
 	/// `silk_Decode` for one SILK frame (10 or 20 ms). Writes interleaved
 	/// samples at 48 kHz (unit scale) to `out` and returns the samples per
 	/// channel.
+	///
+	/// With [`SilkMode::Lost`], `dec` is not read and the frame is concealed;
+	/// the caller passes the channel count and rate of the last packet (as
+	/// libopus keeps them in `DecControl`) and the concealed duration as
+	/// `payload_ms` (10 or 20 ms).
+	#[allow(clippy::too_many_lines)]
 	pub fn decode(
 		&mut self,
 		dec: &mut RangeDecoder,
+		mode: SilkMode,
 		channels_internal: usize,
 		internal_rate: u32,
 		payload_ms: usize,
@@ -1275,6 +1833,7 @@ impl SilkDecoder {
 		if self.channel_state[0].n_frames_decoded == 0 {
 			for n in 0..ci {
 				let st = &mut self.channel_state[n];
+				// A lost payload (0 ms) is concealed as 10 ms.
 				let (frames, subfr) = match payload_ms {
 					0 | 10 => (1, 2),
 					20 => (1, 4),
@@ -1298,7 +1857,10 @@ impl SilkDecoder {
 		}
 		self.channels_internal = ci;
 
-		if self.channel_state[0].n_frames_decoded == 0 {
+		let mut ms_pred_q13 = [0i32; 2];
+		let mut decode_only_middle = false;
+		if mode != SilkMode::Lost && self.channel_state[0].n_frames_decoded == 0 {
+			// First call for this payload: VAD and LBRR flags.
 			for n in 0..ci {
 				let st = &mut self.channel_state[n];
 				for i in 0..st.n_frames_per_packet {
@@ -1322,15 +1884,18 @@ impl SilkDecoder {
 					}
 				}
 			}
-			// Skip the LBRR (forward error correction) data.
-			let frames = self.channel_state[0].n_frames_per_packet;
-			for i in 0..frames {
-				for n in 0..ci {
-					if self.channel_state[n].lbrr_flags[i] {
+			if mode == SilkMode::Normal {
+				// Regular decoding skips the LBRR (FEC) data.
+				let frames = self.channel_state[0].n_frames_per_packet;
+				for i in 0..frames {
+					for n in 0..ci {
+						if !self.channel_state[n].lbrr_flags[i] {
+							continue;
+						}
 						if ci == 2 && n == 0 {
-							let _ = stereo_decode_pred(dec);
+							ms_pred_q13 = stereo_decode_pred(dec);
 							if !self.channel_state[1].lbrr_flags[i] {
-								let _ = dec.icdf(&STEREO_ONLY_CODE_MID_I_CDF, 8);
+								decode_only_middle = dec.icdf(&STEREO_ONLY_CODE_MID_I_CDF, 8) != 0;
 							}
 						}
 						let cond = if i > 0 && self.channel_state[n].lbrr_flags[i - 1] {
@@ -1353,15 +1918,26 @@ impl SilkDecoder {
 			}
 		}
 
-		let mut ms_pred_q13 = [0i32; 2];
-		let mut decode_only_middle = false;
+		// Mid/side predictor and the mid-only flag.
 		if ci == 2 {
-			ms_pred_q13 = stereo_decode_pred(dec);
-			let fi = self.channel_state[0].n_frames_decoded;
-			if !self.channel_state[1].vad_flags[fi.min(2)] {
-				decode_only_middle = dec.icdf(&STEREO_ONLY_CODE_MID_I_CDF, 8) != 0;
+			let fi = self.channel_state[0].n_frames_decoded.min(2);
+			let coded = match mode {
+				SilkMode::Normal => true,
+				SilkMode::Lbrr => self.channel_state[0].lbrr_flags[fi],
+				SilkMode::Lost => false,
+			};
+			if coded {
+				ms_pred_q13 = stereo_decode_pred(dec);
+				let side_missing = match mode {
+					SilkMode::Normal => !self.channel_state[1].vad_flags[fi],
+					_ => !self.channel_state[1].lbrr_flags[fi],
+				};
+				decode_only_middle = side_missing && dec.icdf(&STEREO_ONLY_CODE_MID_I_CDF, 8) != 0;
+			} else {
+				ms_pred_q13 = self.stereo.pred_prev_q13;
 			}
 		}
+		// Reset the side channel's prediction memory for its first coded frame.
 		if ci == 2 && !decode_only_middle && self.prev_decode_only_middle {
 			let st = &mut self.channel_state[1];
 			st.out_buf.fill(0);
@@ -1373,24 +1949,41 @@ impl SilkDecoder {
 		}
 
 		let frame_length = self.channel_state[0].frame_length;
+		if frame_length > MAX_FRAME_LENGTH || frame_length == 0 {
+			return Err("invalid silk frame length");
+		}
 		let mut tmp = [vec![0i16; frame_length + 2], vec![0i16; frame_length + 2]];
-		let has_side = !decode_only_middle;
+		let has_side = match mode {
+			SilkMode::Normal => !decode_only_middle,
+			_ => {
+				!self.prev_decode_only_middle
+					|| (ci == 2
+						&& mode == SilkMode::Lbrr
+						&& self.channel_state[1].lbrr_flags[self.channel_state[1].n_frames_decoded.min(2)])
+			}
+		};
 		let mut n_out_dec = frame_length;
 		for n in 0..ci {
 			if n == 0 || has_side {
 				let frame_index = self.channel_state[0].n_frames_decoded as i32 - n as i32;
 				let cond = if frame_index <= 0 {
 					CODE_INDEPENDENTLY
+				} else if mode == SilkMode::Lbrr {
+					if self.channel_state[n].lbrr_flags[(frame_index - 1).min(2) as usize] {
+						CODE_CONDITIONALLY
+					} else {
+						CODE_INDEPENDENTLY
+					}
 				} else if n > 0 && self.prev_decode_only_middle {
 					CODE_INDEPENDENTLY_NO_LTP_SCALING
 				} else {
 					CODE_CONDITIONALLY
 				};
 				let st = &mut self.channel_state[n];
-				if st.frame_length > MAX_FRAME_LENGTH || st.frame_length == 0 {
+				if st.frame_length != frame_length {
 					return Err("invalid silk frame length");
 				}
-				n_out_dec = decode_frame(st, dec, &mut tmp[n][2..], cond);
+				n_out_dec = decode_frame(st, dec, &mut tmp[n][2..], mode, cond);
 			} else {
 				tmp[n][2..2 + n_out_dec].fill(0);
 			}
@@ -1425,7 +2018,15 @@ impl SilkDecoder {
 				}
 			}
 		}
-		self.prev_decode_only_middle = decode_only_middle;
+		if mode == SilkMode::Lost {
+			// Remove the gain clamping so the energy does not "bounce back"
+			// when packets are lost while it is going down.
+			for st in &mut self.channel_state[..ci] {
+				st.last_gain_index = 10;
+			}
+		} else {
+			self.prev_decode_only_middle = decode_only_middle;
+		}
 		Ok(n_out)
 	}
 }
