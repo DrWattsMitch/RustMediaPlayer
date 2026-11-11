@@ -667,19 +667,6 @@ pub struct OpusDecoderState {
 	pub concealed_samples: u64,
 }
 
-/// Vorbis → FFmpeg channel order for mapping family 1
-/// (`ff_vorbis_channel_layout_offsets`).
-const VORBIS_ORDER: [&[usize]; 8] = [
-	&[0],
-	&[0, 1],
-	&[0, 2, 1],
-	&[0, 1, 2, 3],
-	&[0, 2, 1, 3, 4],
-	&[0, 2, 1, 5, 3, 4],
-	&[0, 2, 1, 6, 5, 3, 4],
-	&[0, 2, 1, 7, 5, 6, 3, 4],
-];
-
 /// Default for [`OpusDecoderState::max_gap`]: 2 s.
 pub const DEFAULT_MAX_GAP: usize = 2 * SAMPLE_RATE as usize;
 /// Concealment granularity: 2.5 ms.
@@ -701,7 +688,7 @@ impl OpusDecoderState {
 			.collect();
 		let channels = usize::from(head.channels);
 		let map: Vec<u8> = if m.family == 1 && channels <= 8 {
-			VORBIS_ORDER[channels - 1].iter().map(|&i| m.mapping[i]).collect()
+			crate::codecs::vorbis::CHANNEL_ORDER[channels - 1].iter().map(|&i| m.mapping[i]).collect()
 		} else {
 			m.mapping.clone()
 		};

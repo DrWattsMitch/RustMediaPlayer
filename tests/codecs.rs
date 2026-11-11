@@ -25,3 +25,9 @@ mod opus_plc_test;
 
 #[path = "codecs/encoder_test.rs"]
 mod encoder_test;
+
+#[path = "codecs/vorbis_decoder_test.rs"]
+mod vorbis_decoder_test;
+
+#[path = "codecs/vp9_decoder_test.rs"]
+mod vp9_decoder_test;

@@ -76,7 +76,7 @@ rmp -i input.mkv -c copy out.webm  # WebM takes only VP8/VP9/AV1, Opus/Vorbis, W
 
 ### Decoding and re-encoding
 
-RMP decodes PCM, ADPCM, MP3, AAC, H.264, FLAC and Opus, and encodes AAC-LC,
+RMP decodes PCM, ADPCM, MP3, AAC, H.264, VP9, FLAC, Opus and Vorbis, and encodes AAC-LC,
 H.264, FLAC, PCM and raw video. Without `-c:a`/`-c:v`, each container gets a
 sensible default (WAV → `pcm_s16le`, MP4/M4A/MOV → AAC and FLAC/Ogg/Matroska
 → FLAC when the source can't be copied, Y4M → `rawvideo`):
@@ -85,6 +85,9 @@ sensible default (WAV → `pcm_s16le`, MP4/M4A/MOV → AAC and FLAC/Ogg/Matroska
 rmp -i song.mp3 song.flac                          # MP3 → FLAC
 rmp -i song.m4a song.wav                           # AAC → 16-bit PCM WAV
 rmp -i voice.opus voice.wav -c:a pcm_f32le         # Opus → 32-bit float WAV
+rmp -i music.ogg music.flac                        # Vorbis → FLAC
+rmp -i clip.webm frames.y4m                        # VP9 → raw YUV
+rmp -i clip.webm clip.mp4                          # VP9 + Opus → H.264 + Opus in MP4
 rmp -i song.mp3 song.ogg                           # MP3 → FLAC in Ogg
 rmp -i input.mp4 output.mkv -c:a flac              # copy H.264, AAC → FLAC
 rmp -i input.wav output.flac -compression_level 8  # FLAC level 0-12
@@ -282,6 +285,15 @@ Codecs:
   0–12, FFmpeg's defaults, files within ~3% of FFmpeg's size).
 - **Opus**: decoder for SILK, hybrid and CELT packets, mono, stereo and
   multichannel (SILK bit-exact with libopus, CELT within float rounding).
+- **Vorbis**: decoder for every Vorbis I stream (floor 0 and 1, residue
+  types 0–2, channel coupling, up to 255 channels in FFmpeg's channel
+  order), within one 16-bit step of FFmpeg's decoder. Ogg Vorbis packets
+  get exact timestamps and durations from the granule positions.
+- **VP9**: decoder for profiles 0 and 1 (8-bit 4:2:0, 4:2:2, 4:4:4 and
+  sRGB): every frame type including hidden alt-refs, superframes and
+  `show_existing_frame`, tiles, segmentation, compound prediction,
+  lossless frames and backward probability adaptation. Bit-exact with
+  libvpx / FFmpeg.
 
 Processing (`rmp::process`), so files can be transcoded and not only
 remuxed: sample-format conversion, resampling (polyphase windowed sinc),
@@ -293,7 +305,9 @@ See [docs/WAV_Y4M.md](docs/WAV_Y4M.md), [docs/MP3_MP4.md](docs/MP3_MP4.md),
 [docs/AAC_H264.md](docs/AAC_H264.md),
 [docs/AAC_H264_ENCODING.md](docs/AAC_H264_ENCODING.md),
 [docs/MKV_FLAC_OPUS_PROCESSING.md](docs/MKV_FLAC_OPUS_PROCESSING.md) and
-[docs/MKV_OGG_MUXING_CLI.md](docs/MKV_OGG_MUXING_CLI.md) for how each part
+[docs/MKV_OGG_MUXING_CLI.md](docs/MKV_OGG_MUXING_CLI.md),
+[docs/OPUS_PLC.md](docs/OPUS_PLC.md) and
+[docs/VORBIS_VP9.md](docs/VORBIS_VP9.md) for how each part
 works and how to extend it. The examples show single features in a few
 lines each:
 
@@ -369,7 +383,7 @@ Default codecs per output container (when `-c:a`/`-c:v` aren't given):
 | `.flac` | `flac` | dropped | dropped |
 | `.mp3` | copy (MP3 only) | dropped | dropped |
 | `.y4m` | dropped | `rawvideo` | dropped |
-| `.mp4`, `.mov` | copy if MP4 holds it, else `aac` | copy | dropped |
+| `.mp4`, `.mov` | copy if MP4 holds it, else `aac` | copy if MP4 holds it, else `h264` (VP9) | dropped |
 | `.m4a` | copy if MP4 holds it, else `aac` | dropped | dropped |
 | `.mkv` | copy if Matroska holds it, else `flac` | copy | copy |
 | `.mka` | copy if Matroska holds it, else `flac` | dropped | copy |
@@ -381,7 +395,8 @@ Default codecs per output container (when `-c:a`/`-c:v` aren't given):
 MP4/M4A/MOV, FLAC elsewhere); `-s` and `-pix_fmt` switch it to `h264` (to
 `rawvideo` for Y4M, or when the pixel format isn't `yuv420p`), and so do
 `-b:v` and `-qp`. RMP has no Opus, Vorbis, MP3 or VP9 encoder, so WebM,
-`.opus` and `.mp3` output are stream copies.
+`.opus` and `.mp3` output are stream copies; their decoders let those
+streams go to any other format.
 
 ## Fork Notice
 
@@ -392,7 +407,7 @@ preserved, and this fork is distributed under the same terms.
 
 FFmpReg set out to support WAV and Y4M containers and the PCM, ADPCM, and raw
 video codecs. RMP completes those and extends them with additional file types
-and codecs, starting with MP3, MP4, AAC, H.264, Matroska, FLAC, Ogg and Opus. If you find FFmpReg useful, please consider supporting the original
+and codecs, starting with MP3, MP4, AAC, H.264, Matroska, FLAC, Ogg, Opus, Vorbis and VP9. If you find FFmpReg useful, please consider supporting the original
 author on [Ko-fi](https://ko-fi.com/yazaldefilimone).
 
 ## Versioning

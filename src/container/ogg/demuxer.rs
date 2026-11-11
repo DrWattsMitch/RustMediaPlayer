@@ -9,13 +9,18 @@
 //! as FFmpeg's `ogg_calc_pts` does.
 //!
 //! Supported mappings: Opus (RFC 7845), FLAC (the `0x7F "FLAC"` mapping)
-//! and Vorbis (demux only; RMP has no Vorbis decoder). Other logical
-//! streams are skipped.
+//! and Vorbis (Vorbis I §A). Other logical streams are skipped.
 //!
 //! Timestamps follow RMP's gapless convention: they start at 0 and the Opus
 //! pre-skip is reported as `encoder_delay` metadata (FFmpeg instead starts
 //! the first packet at `-pre_skip`); end trimming shows up as a shorter
-//! last packet and `encoder_padding`.
+//! last packet.
+//!
+//! Vorbis packet durations come from [`VorbisParser`] (each depends on the
+//! previous packet's block size). The first Vorbis packet only primes the
+//! decoder: FFmpeg gives it a negative pts; RMP leaves its pts unset (the
+//! decoder returns nothing for it and the Ogg muxer ends it at granule 0),
+//! and every later packet has FFmpeg's timestamp and duration.
 //!
 //! FFmpeg: `libavformat/oggdec.c`, `oggparseopus.c`, `oggparseflac.c`,
 //! `oggparsevorbis.c`.
@@ -25,6 +30,7 @@ use std::collections::VecDeque;
 use crate::codecs::duration::packet_samples;
 use crate::codecs::flac::StreamInfo;
 use crate::codecs::opus::header::OpusHead;
+use crate::codecs::vorbis::VorbisParser;
 use crate::container::xiph;
 use crate::core::{
 	CodecId, Demuxer, Metadata, Packet, Parameters, RawValue, Stream, StreamId, StreamKind,
@@ -131,6 +137,8 @@ struct Logical {
 	headers_left: Option<usize>,
 	/// Vorbis headers, kept to build FFmpeg's xiph-laced extradata.
 	vorbis_headers: Vec<Vec<u8>>,
+	/// Vorbis packet durations, once the setup header is in.
+	vorbis: Option<VorbisParser>,
 	pre_skip: u64,
 	partial: Vec<u8>,
 	/// The partial packet's start was lost (after a seek or a damaged page).
@@ -214,6 +222,7 @@ fn new_logical(first: &[u8], serial: u32, index: usize) -> Option<Logical> {
 		metadata,
 		headers_left,
 		vorbis_headers,
+		vorbis: None,
 		pre_skip,
 		partial: Vec::new(),
 		partial_broken: false,
@@ -444,8 +453,13 @@ fn handle_page(
 	}
 
 	let tb = TimeBase::new(1, l.rate());
-	let durations: Vec<Option<u64>> =
-		audio.iter().map(|p| packet_samples(&l.parameters, p).map(|(n, _)| n)).collect();
+	let durations: Vec<Option<u64>> = audio
+		.iter()
+		.map(|p| match l.vorbis.as_mut() {
+			Some(parser) => parser.packet_samples(p).map(u64::from),
+			None => packet_samples(&l.parameters, p).map(|(n, _)| n),
+		})
+		.collect();
 	let n = audio.len();
 	let mut pts: Vec<Option<u64>> = vec![None; n];
 	let mut trimmed_last: Option<u64> = None;
@@ -473,6 +487,11 @@ fn handle_page(
 		if known {
 			for i in (0..n).rev() {
 				let Some(d) = durations[i] else { break };
+				if end < d && l.mapping == Mapping::Vorbis {
+					// Starts before 0: the priming packet (FFmpeg's
+					// negative pts) keeps no timestamp.
+					break;
+				}
 				end = end.saturating_sub(d);
 				pts[i] = Some(end);
 			}
@@ -534,6 +553,9 @@ fn take_header(l: &mut Logical, packet: &[u8], container: Option<&mut Metadata>)
 			}
 			if l.vorbis_headers.len() < 3 {
 				l.vorbis_headers.push(packet.to_vec());
+				if let [identification, _, setup] = l.vorbis_headers.as_slice() {
+					l.vorbis = VorbisParser::new(identification, setup);
+				}
 			}
 		}
 	}
@@ -629,6 +651,9 @@ impl Demuxer for OggDemuxer {
 			l.partial.clear();
 			l.partial_broken = false;
 			l.next_pts = None;
+			if let Some(parser) = l.vorbis.as_mut() {
+				parser.reset();
+			}
 		}
 		match best {
 			// Resume after the last page that ends before the target: its

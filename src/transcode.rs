@@ -15,7 +15,7 @@
 //! | `.flac` | `flac` | dropped | dropped |
 //! | `.mp3` | copy | dropped | dropped |
 //! | `.y4m` | dropped | `rawvideo` | dropped |
-//! | `.mp4`, `.mov` | copy when MP4 holds the codec, else `aac` | copy (`h264` when converting) | dropped |
+//! | `.mp4`, `.mov` | copy when MP4 holds the codec, else `aac` | copy when MP4 holds the codec (`h264` when converting or when it doesn't, e.g. VP9) | dropped |
 //! | `.m4a` | as `.mp4` | dropped | dropped |
 //! | `.mkv` | copy when Matroska holds the codec, else `flac` | copy (`h264` when converting) | copy |
 //! | `.mka` | as `.mkv` | dropped | copy |
@@ -578,6 +578,9 @@ pub fn transcode(input: &str, output: &str, options: &Options) -> Result<Summary
 				let default = match ext.as_str() {
 					"y4m" => "rawvideo",
 					_ if options.video_bitrate.is_some() || options.qp.is_some() => "h264",
+					// MP4 can't hold the codec (VP9 from WebM, say): decode and
+					// re-encode when RMP has a decoder.
+					"mp4" | "mov" if !muxer_supports(&codec_in) && resolver.has_decoder(&codec_in) => "h264",
 					_ if options.converts_video() => {
 						if yuv420 {
 							"h264"

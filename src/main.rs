@@ -61,7 +61,7 @@ Stream options:
 
 Containers read: WAV, Y4M, MP3, MP4/M4A/MOV, Matroska/WebM, FLAC, Ogg (Opus/FLAC/Vorbis).
 Containers written: all of the above.
-Decoders: PCM, ADPCM, MP3, AAC-LC, H.264, FLAC, Opus. Encoders: PCM, FLAC, AAC-LC, H.264 (Constrained Baseline), raw video.";
+Decoders: PCM, ADPCM, MP3, AAC-LC, H.264, VP9, FLAC, Opus, Vorbis. Encoders: PCM, FLAC, AAC-LC, H.264 (Constrained Baseline), raw video.";
 
 /// Parsed command line.
 #[derive(Default)]

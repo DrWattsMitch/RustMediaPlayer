@@ -38,6 +38,8 @@ pub enum CodecPrivate {
 	AacEncoder(Box<crate::codecs::aac::AacEncoderState>),
 	H264Encoder(Box<crate::codecs::h264::H264EncoderState>),
 	Opus(Box<crate::codecs::opus::OpusDecoderState>),
+	Vorbis(Box<crate::codecs::vorbis::VorbisDecoderState>),
+	Vp9(Box<crate::codecs::vp9::Vp9DecoderState>),
 }
 
 #[derive(Debug, Clone)]

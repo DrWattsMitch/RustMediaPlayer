@@ -1,4 +1,4 @@
-use crate::codecs::{aac, adpcm, flac, h264, mp3, opus, pcm, raw};
+use crate::codecs::{aac, adpcm, flac, h264, mp3, opus, pcm, raw, vorbis, vp9};
 use crate::core::{CodecId, Decoder, Demuxer, Encoder, Muxer, Stream};
 
 #[derive(Debug, Clone, Default)]
@@ -32,7 +32,7 @@ impl Resolver {
 	pub fn has_decoder(&self, codec: &str) -> bool {
 		pcm::PcmCodec::from_id(codec).is_some()
 			|| adpcm::AdpcmDecoder::for_id(codec).is_some()
-			|| matches!(codec, "mp3" | "aac" | "h264" | "flac" | "opus" | "rawvideo")
+			|| matches!(codec, "mp3" | "aac" | "h264" | "flac" | "opus" | "vorbis" | "vp9" | "rawvideo")
 			|| crate::core::Pixel::from_name(codec).is_some()
 	}
 
@@ -52,6 +52,8 @@ impl Resolver {
 			"h264" => Some(Box::new(h264::H264Decoder::new())),
 			"flac" => Some(Box::new(flac::FlacDecoder::new())),
 			"opus" => Some(Box::new(opus::OpusDecoder::new())),
+			"vorbis" => Some(Box::new(vorbis::VorbisDecoder::new())),
+			"vp9" => Some(Box::new(vp9::Vp9Decoder::new())),
 			_ => Some(Box::new(raw::decoder::Decoder::new(stream.kind))),
 		}
 	}

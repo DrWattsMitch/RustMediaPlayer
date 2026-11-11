@@ -102,6 +102,27 @@ ff -i /tmp/rmp_voice_st.wav -t 2 -ar 44100 -c:a flac -metadata title=FlacOgg ogg
 ff -i /tmp/rmp_voice_st.wav -t 2 -c:a libvorbis -q:a 2 ogg/vorbis.ogg
 for f in ogg/*.opus ogg/*.oga ogg/*.ogg; do packets "$f"; done
 
+# Vorbis decoder references: FFmpeg's native float decoder (first-packet
+# priming and Ogg end trimming applied, as RMP does).
+mkdir -p vorbis
+ff -i /tmp/rmp_voice_mono.wav -t 1 -ar 22050 -c:a libvorbis -q:a -1 vorbis/mono_22k_q-1.ogg
+ff -i /tmp/rmp_voice_st.wav -t 0.8 -ar 44100 -c:a libvorbis -q:a 8 vorbis/st_44k_q8.webm
+ff -f lavfi -i "aevalsrc='0.3*sin(2*PI*300*t)|0.3*sin(2*PI*500*t)|0.3*sin(2*PI*700*t)|0.2*sin(2*PI*90*t)|0.3*sin(2*PI*1100*t)|0.3*sin(2*PI*1300*t):s=22050:d=0.5:c=5.1'" \
+	-c:a libvorbis -q:a 3 vorbis/51_22k.ogg
+for f in vorbis/*.ogg vorbis/*.webm; do ff -c:a vorbis -i "$f" -f s16le "${f%.*}.ffmpeg.s16le"; done
+
+# VP9 decoder references: per-frame adler32 (framecrc) of FFmpeg's decode.
+mkdir -p vp9
+ff -f lavfi -i testsrc2=s=176x144:r=25:d=1 -c:v libvpx-vp9 -b:v 150k -g 25 -auto-alt-ref 1 -lag-in-frames 10 vp9/altref_176x144.webm
+ff -f lavfi -i "mandelbrot=s=99x61:r=25" -t 0.6 -c:v libvpx-vp9 -crf 40 -b:v 0 vp9/odd_444_99x61.webm
+ff -f lavfi -i testsrc2=s=64x48:r=25:d=0.4 -c:v libvpx-vp9 -lossless 1 vp9/lossless_64x48.webm
+ff -f lavfi -i testsrc2=s=512x128:r=25:d=0.4 -c:v libvpx-vp9 -b:v 200k -tile-columns 1 -tile-rows 2 vp9/tiles_512x128.webm
+ff -f lavfi -i testsrc2=s=96x64:r=25:d=0.6 -pix_fmt yuv422p -c:v libvpx-vp9 -b:v 100k vp9/p1_422_96x64.webm
+ff -f lavfi -i "testsrc2=s=160x96:r=30:d=0.8,noise=alls=12:allf=t" -c:v libvpx-vp9 -deadline realtime -cpu-used 8 \
+	-aq-mode 3 -error-resilient 1 -b:v 150k vp9/rt_aq_errres_160x96.webm
+ff -f lavfi -i "mandelbrot=s=128x72:r=30" -t 0.6 -pix_fmt yuv420p -c:v libvpx-vp9 -frame-parallel 1 -b:v 120k vp9/frame_parallel_128x72.webm
+for f in vp9/*.webm; do ff -c:v vp9 -i "$f" -f framecrc "${f%.webm}.framecrc"; done
+
 # Opus decoder references: libopus through FFmpeg, pre-skip kept.
 ff -i /tmp/rmp_voice_mono.wav -t 1 -ar 8000 -c:a libopus -b:a 8k -application voip opus/silk_nb_mono.webm
 ff -i /tmp/rmp_voice_st.wav -t 1 -ar 16000 -c:a libopus -b:a 24k -application voip -frame_duration 40 opus/silk_wb_st_40ms.webm

@@ -59,7 +59,9 @@ fn assert_matches_ffmpeg(file: &str, check_timing: bool) {
 		assert_eq!(p.data.len(), size, "{at}: size");
 		assert_eq!(adler32(&p.data), hash, "{at}: payload");
 		if check_timing {
-			assert_eq!(p.pts.map(|t| t.ticks() as i64), Some(pts + shift), "{at}: pts");
+			// FFmpeg's negative pts (the Vorbis priming packet) is unset.
+			let expected = Some(pts + shift).filter(|&t| t >= 0);
+			assert_eq!(p.pts.map(|t| t.ticks() as i64), expected, "{at}: pts");
 			assert_eq!(p.duration.map(|t| t.ticks()), duration, "{at}: duration");
 		}
 	}
@@ -79,8 +81,30 @@ fn flac_packets_match_ffmpeg() {
 
 #[test]
 fn vorbis_packets_match_ffmpeg() {
-	// RMP has no Vorbis parser for per-packet durations; payloads match.
-	assert_matches_ffmpeg("vorbis.ogg", false);
+	// Durations from the block sizes, timestamps walked back from the
+	// granule positions; the first packet (pts -128 in FFmpeg) has none.
+	assert_matches_ffmpeg("vorbis.ogg", true);
+}
+
+#[test]
+fn vorbis_end_trimming_and_seek() {
+	// The last granule cuts the final packet short (FFmpeg's end trimming).
+	let mut demuxer = open("vorbis.ogg");
+	let packets = read_all(&mut demuxer);
+	let last = packets.last().unwrap();
+	let end = last.pts.unwrap().ticks() + last.duration.unwrap().ticks();
+	assert_eq!(end, demuxer.duration().ticks());
+
+	// After a seek, timestamps resume from the page granules and match the
+	// linear read.
+	demuxer.seek(1.0).unwrap();
+	let first = demuxer.read().unwrap().unwrap();
+	let at = packets.iter().position(|p| p.data == first.data).unwrap();
+	assert_eq!(first.pts, packets[at].pts);
+	for expected in &packets[at + 1..at + 20] {
+		let p = demuxer.read().unwrap().unwrap();
+		assert_eq!((p.pts, p.duration), (expected.pts, expected.duration));
+	}
 }
 
 #[test]

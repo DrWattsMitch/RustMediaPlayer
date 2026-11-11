@@ -151,6 +151,115 @@ fn flac_demuxer_and_decoder_survive_corruption() {
 }
 
 #[test]
+fn vp9_decoder_survives_corrupted_frames() {
+	use rmp::codecs::vp9::Vp9DecoderState;
+	let names = [
+		"altref_176x144",
+		"odd_444_99x61",
+		"p1_422_96x64",
+		"lossless_64x48",
+		"tiles_512x128",
+		"rt_aq_errres_160x96",
+	];
+	let mut rng = Rng::new(seed() ^ 17);
+	for (n, name) in names.iter().enumerate() {
+		let data = fixture(&format!("vp9/{name}.webm"));
+		let mut demuxer = MkvDemuxer::new(memory(data)).unwrap();
+		let packets: Vec<Vec<u8>> =
+			std::iter::from_fn(|| demuxer.read().ok().flatten()).map(|p| p.data).collect();
+		for round in 0..rounds() / 6 + 1 {
+			// Damage a few packets (bit flips, truncation, garbage) in an
+			// otherwise valid stream, so later frames reference broken ones.
+			let mut dec = Vp9DecoderState::new();
+			for (i, packet) in packets.iter().enumerate() {
+				let mut p = packet.clone();
+				if (i as u64 + round + n as u64).is_multiple_of(3) && !p.is_empty() {
+					match rng.below(3) {
+						0 => p.truncate(rng.below(p.len())),
+						1 => {
+							for _ in 0..1 + rng.below(16) {
+								let at = rng.below(p.len());
+								p[at] ^= 1 << rng.below(8);
+							}
+						}
+						_ => {
+							let at = rng.below(p.len());
+							for b in &mut p[at..] {
+								*b = rng.next() as u8;
+							}
+						}
+					}
+				}
+				let _ = dec.decode_packet(&p);
+			}
+		}
+	}
+	// Random bytes behind a valid key frame header byte.
+	let mut dec = Vp9DecoderState::new();
+	for _ in 0..rounds() * 2 {
+		let len = 1 + rng.below(300);
+		let mut p: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+		p[0] = 0x82 | (p[0] & 0x30);
+		let _ = dec.decode_packet(&p);
+	}
+	// Whole corrupted WebM files through the demuxer and decoder.
+	for round in 0..rounds() / 2 {
+		let name = names[round as usize % names.len()];
+		if let Ok(mut demuxer) =
+			MkvDemuxer::new(memory(mutate(&fixture(&format!("vp9/{name}.webm")), &mut rng)))
+		{
+			decode_every_stream(&mut demuxer);
+		}
+	}
+}
+
+#[test]
+fn vorbis_headers_and_packets_survive_corruption() {
+	let sources = [fixture("vorbis/mono_22k_q-1.ogg"), fixture("vorbis/51_22k.ogg")];
+	let mut rng = Rng::new(seed() ^ 13);
+	for round in 0..rounds() {
+		let data = mutate(&sources[round as usize % sources.len()], &mut rng);
+		if let Ok(mut demuxer) = OggDemuxer::new(memory(data)) {
+			decode_every_stream(&mut demuxer);
+		}
+	}
+	let webm = fixture("vorbis/st_44k_q8.webm");
+	for _ in 0..rounds() / 2 {
+		if let Ok(mut demuxer) = MkvDemuxer::new(memory(mutate(&webm, &mut rng))) {
+			decode_every_stream(&mut demuxer);
+		}
+	}
+	// Damaged setup headers, and random audio packets for a valid setup.
+	use rmp::codecs::vorbis::VorbisDecoderState;
+	let demuxer = OggDemuxer::new(memory(sources[1].clone())).unwrap();
+	let extradata = demuxer.streams().streams[0].parameters.extradata.clone();
+	let headers = rmp::container::xiph::vorbis_headers(&extradata).unwrap();
+	for _ in 0..rounds() * 2 {
+		let mut setup = headers[2].clone();
+		for _ in 0..1 + rng.below(8) {
+			let at = 7 + rng.below(setup.len() - 7);
+			setup[at] ^= 1 << rng.below(8);
+		}
+		if rng.below(4) == 0 {
+			setup.truncate(7 + rng.below(setup.len() - 7));
+		}
+		if let Ok(mut state) = VorbisDecoderState::new(&headers[0], &setup) {
+			for _ in 0..8 {
+				let len = rng.below(300);
+				let packet: Vec<u8> = (0..len).map(|_| rng.next() as u8 & !1).collect();
+				let _ = state.decode_packet(&packet);
+			}
+		}
+	}
+	let mut state = VorbisDecoderState::new(&headers[0], &headers[2]).unwrap();
+	for _ in 0..rounds() * 4 {
+		let len = rng.below(600);
+		let packet: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+		let _ = state.decode_packet(&packet);
+	}
+}
+
+#[test]
 fn ogg_demuxer_and_opus_decoder_survive_corruption() {
 	let sources = [
 		fixture("ogg/mono.opus"),
