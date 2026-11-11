@@ -56,15 +56,27 @@ impl Resolver {
 		}
 	}
 
-	/// Picks an encoder producing the stream's codec. PCM codecs and FLAC get a
-	/// real encoder (which converts from any sample format); everything else
-	/// falls back to raw pass-through.
+	/// Picks an encoder producing the stream's codec. PCM codecs, FLAC, AAC
+	/// and H.264 (AAC and H.264 at `parameters.bitrate`, if set) get a real
+	/// encoder; everything else falls back to raw pass-through.
 	pub fn encoder_for(&self, stream: &Stream) -> Option<Box<dyn Encoder>> {
 		if let Some(encoder) = pcm::PcmEncoder::for_id(stream.id, &stream.parameters.codec.id) {
 			return Some(Box::new(encoder));
 		}
-		if stream.parameters.codec.id == "flac" {
-			return Some(Box::new(flac::FlacEncoder::new(stream.id)));
+		match stream.parameters.codec.id.as_str() {
+			"flac" => return Some(Box::new(flac::FlacEncoder::new(stream.id))),
+			"aac" => {
+				let bitrate = stream.parameters.bitrate.filter(|&b| b > 0);
+				return Some(Box::new(aac::AacEncoder::new(stream.id).with_bitrate(bitrate)));
+			}
+			"h264" => {
+				let bitrate = stream.parameters.bitrate.filter(|&b| b > 0);
+				let encoder = h264::H264Encoder::new(stream.id)
+					.with_rate(None, bitrate)
+					.with_time_base(stream.time_base);
+				return Some(Box::new(encoder));
+			}
+			_ => {}
 		}
 		Some(Box::new(raw::encoder::Encoder::new(stream.id, stream.kind)))
 	}

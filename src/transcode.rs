@@ -15,21 +15,25 @@
 //! | `.flac` | `flac` | dropped | dropped |
 //! | `.mp3` | copy | dropped | dropped |
 //! | `.y4m` | dropped | `rawvideo` | dropped |
-//! | `.mp4`, `.mov` | copy when MP4 holds the codec, else `flac` | copy | dropped |
+//! | `.mp4`, `.mov` | copy when MP4 holds the codec, else `aac` | copy (`h264` when converting) | dropped |
 //! | `.m4a` | as `.mp4` | dropped | dropped |
-//! | `.mkv` | copy when Matroska holds the codec, else `flac` | copy | copy |
+//! | `.mkv` | copy when Matroska holds the codec, else `flac` | copy (`h264` when converting) | copy |
 //! | `.mka` | as `.mkv` | dropped | copy |
 //! | `.webm` | copy (Opus/Vorbis only) | copy (VP8/VP9/AV1 only) | copy (WebVTT only) |
 //! | `.ogg`, `.oga` | copy for Opus/FLAC/Vorbis, else `flac` | dropped | dropped |
 //! | `.opus` | copy (Opus only) | dropped | dropped |
 //!
-//! RMP's encoders are FLAC, PCM and raw video, so a transcode can produce
-//! those codecs; anything else is a stream copy.
+//! RMP's encoders are AAC-LC, FLAC, PCM, H.264 (Constrained Baseline) and
+//! raw video, so a transcode can produce those codecs; anything else is a
+//! stream copy. Video is "converted" by `-s`, `-pix_fmt`, `-b:v` or `-qp`,
+//! or by naming a codec with `-c:v`.
 
 use std::collections::HashMap;
 
 use crate::Message;
+use crate::codecs::aac::{self, AacEncoder};
 use crate::codecs::flac::FlacEncoder;
+use crate::codecs::h264::H264Encoder;
 use crate::codecs::pcm::PcmCodec;
 use crate::container::mkv::tracks::mux_codec;
 use crate::container::mp4::codec::muxer_supports;
@@ -41,7 +45,7 @@ use crate::core::{
 use crate::io::{Input, Output};
 use crate::message::Result;
 use crate::process::{
-	AudioConverter, AudioSpec, ScaleFilter, VideoConverter, VideoOptions, VideoSpec,
+	AudioConverter, AudioSpec, ScaleFilter, VideoConverter, VideoOptions, VideoSpec, audio::Gapless,
 };
 
 /// What to do with the input, in FFmpeg's option vocabulary.
@@ -61,6 +65,13 @@ pub struct Options {
 	pub sample_format: Option<(SampleFormat, SampleLayout)>,
 	/// `-compression_level` (FLAC 0-12, default 5).
 	pub level: Option<u8>,
+	/// `-b:a`, `-b:v`: target bit rates in bits per second (`128k`, `2M`).
+	pub audio_bitrate: Option<u32>,
+	pub video_bitrate: Option<u32>,
+	/// `-qp`: constant H.264 quantiser (0-51).
+	pub qp: Option<u8>,
+	/// `-g`: H.264 keyframe interval in frames.
+	pub gop: Option<u32>,
 	/// `-s WxH`, `-pix_fmt`, `-sws_flags`.
 	pub size: Option<(u32, u32)>,
 	pub pixel: Option<Pixel>,
@@ -126,6 +137,12 @@ impl Options {
 					| "-ac"
 					| "-sample_fmt"
 					| "-compression_level"
+					| "-b:a"
+					| "-ab"
+					| "-b:v"
+					| "-vb"
+					| "-qp"
+					| "-g"
 					| "-s"
 					| "-pix_fmt"
 					| "-sws_flags"
@@ -180,6 +197,26 @@ impl Options {
 						.filter(|&l| l <= 12)
 						.ok_or_else(|| format!("compression level must be 0-12: {v}"))?,
 				);
+			}
+			"-b:a" | "-ab" => self.audio_bitrate = Some(parse_bitrate(need()?)?),
+			"-b:v" | "-vb" => self.video_bitrate = Some(parse_bitrate(need()?)?),
+			"-qp" => {
+				let v = need()?;
+				let n = number(v)?;
+				self.qp = Some(
+					u8::try_from(n)
+						.ok()
+						.filter(|&q| q <= 51)
+						.ok_or_else(|| format!("-qp must be 0-51: {v}"))?,
+				);
+			}
+			"-g" => {
+				let v = need()?;
+				let n = number(v)?;
+				if n == 0 {
+					return Err(format!("-g must be at least 1: {v}"));
+				}
+				self.gop = Some(n);
 			}
 			"-s" => {
 				let v = need()?;
@@ -245,6 +282,22 @@ impl Options {
 	}
 }
 
+/// Parses a bit rate such as `128000`, `128k` or `2.5M` (FFmpeg's SI
+/// suffixes).
+pub fn parse_bitrate(value: &str) -> std::result::Result<u32, String> {
+	let bad = || format!("invalid bit rate: {value}");
+	let (number, scale) = match value.chars().last() {
+		Some('k' | 'K') => (&value[..value.len() - 1], 1e3),
+		Some('M' | 'm') => (&value[..value.len() - 1], 1e6),
+		_ => (value, 1.0),
+	};
+	let v = number.parse::<f64>().map_err(|_| bad())? * scale;
+	if !(1000.0..=4.0e9).contains(&v) {
+		return Err(bad());
+	}
+	Ok(v.round() as u32)
+}
+
 /// Applies `-metadata` pairs, using the field names FFmpeg uses.
 pub fn apply_metadata(metadata: &mut Metadata, pairs: &[(String, String)]) {
 	for (key, value) in pairs {
@@ -294,6 +347,8 @@ struct AudioRoute {
 	enc_state: State,
 	target: AudioSpec,
 	converter: Option<AudioConverter>,
+	/// Source priming / padding to drop from the decoded audio.
+	gapless: Gapless,
 }
 
 struct VideoRoute {
@@ -346,18 +401,40 @@ fn audio_target(stream: &Stream, codec: &str, o: &Options) -> Result<(Stream, Au
 		let encoder = FlacEncoder::new(StreamId(0)).with_level(o.level.unwrap_or(5));
 		out.parameters.extradata = encoder.extradata(&out.parameters)?;
 		(if bits > 16 { SampleFormat::S32 } else { SampleFormat::S16 }, SampleLayout::Interleaved)
+	} else if codec == "aac" {
+		let encoder = AacEncoder::new(StreamId(0)).with_bitrate(o.audio_bitrate);
+		out.parameters.extradata = encoder.extradata(&out.parameters)?;
+		out.parameters.bitrate = Some(encoder.bitrate_for(&out.parameters));
+		(SampleFormat::F32, SampleLayout::Planar)
 	} else {
 		let pcm = PcmCodec::from_id(codec).ok_or(Message::Codec(
-			"unsupported audio codec: RMP encodes flac and pcm_* (or use -c:a copy)",
+			"unsupported audio codec: RMP encodes aac, flac and pcm_* (or use -c:a copy)",
 		))?;
 		(pcm.sample_format(), SampleLayout::Interleaved)
 	};
-	// Gapless metadata describes the source timing; it doesn't survive
-	// decoding (the decoded audio still contains the priming samples).
+	// Gapless metadata describes the source's timing: the transcode drops
+	// those samples (see `gapless_of`), and the encoder states its own.
 	out.metadata.raw.remove("encoder_delay");
 	out.metadata.raw.remove("encoder_padding");
+	if codec == "aac" {
+		// The encoder's priming; the MP4 muxer turns it into an edit list.
+		out
+			.metadata
+			.raw
+			.insert("encoder_delay".into(), RawValue::String(aac::encoder::ENCODER_DELAY.to_string()));
+	}
 	let format = o.sample_format.map_or((format, layout), |f| f);
 	Ok((out, AudioSpec::new(rate, channels, format.0, format.1)))
+}
+
+/// Priming and padding samples to drop from a decoded stream, from the
+/// demuxer's gapless metadata.
+fn gapless_of(stream: &Stream) -> Gapless {
+	let samples = |key: &str| match stream.metadata.raw.get(key) {
+		Some(RawValue::String(v)) => v.parse::<u64>().unwrap_or(0),
+		_ => 0,
+	};
+	Gapless::new(samples("encoder_delay"), samples("encoder_padding"))
 }
 
 /// Frame rate of a video stream from its first packet duration.
@@ -382,6 +459,7 @@ fn default_audio(ext: &str, stream: &Stream) -> Option<&'static str> {
 		"flac" => "flac",
 		"mp3" => "copy",
 		"mp4" | "m4a" | "mov" if muxer_supports(codec) => "copy",
+		"mp4" | "m4a" | "mov" => "aac",
 		"mkv" | "mka" | "mks" if matroska_holds(stream, false) => "copy",
 		// WebM and .opus only hold codecs RMP can't encode: copy, and let
 		// the muxer explain when the codec doesn't fit.
@@ -436,12 +514,14 @@ pub fn transcode(input: &str, output: &str, options: &Options) -> Result<Summary
 				let Some(mut default) = default_audio(&ext, stream) else { continue };
 				if default == "copy" && options.converts_audio() {
 					// Resampling or remixing means re-encoding (as in FFmpeg).
-					default = if matches!(ext.as_str(), "webm" | "opus" | "mp3") {
-						return Err(Message::Codec(
-							"-ar/-ac/-sample_fmt need re-encoding, and RMP has no encoder for this container's audio",
-						));
-					} else {
-						"flac"
+					default = match ext.as_str() {
+						"webm" | "opus" | "mp3" => {
+							return Err(Message::Codec(
+								"-ar/-ac/-sample_fmt need re-encoding, and RMP has no encoder for this container's audio",
+							));
+						}
+						"mp4" | "m4a" | "mov" => "aac",
+						_ => "flac",
 					};
 				}
 				let codec = options.audio_codec.clone().unwrap_or_else(|| default.to_string());
@@ -464,6 +544,8 @@ pub fn transcode(input: &str, output: &str, options: &Options) -> Result<Summary
 					let dec_state = decoder.create_state(&stream.parameters);
 					let encoder: Box<dyn Encoder> = if codec == "flac" {
 						Box::new(FlacEncoder::new(out_id).with_level(options.level.unwrap_or(5)))
+					} else if codec == "aac" {
+						Box::new(AacEncoder::new(out_id).with_bitrate(options.audio_bitrate))
 					} else {
 						resolver.encoder_for(&out).ok_or("no encoder")?
 					};
@@ -482,14 +564,29 @@ pub fn transcode(input: &str, output: &str, options: &Options) -> Result<Summary
 							enc_state,
 							target,
 							converter: None,
+							gapless: gapless_of(stream),
 						})),
 					);
 				}
 				next_out += 1;
 			}
 			StreamKind::Video if !options.no_video && keeps_video(&ext) => {
-				// Scaling or a pixel format change means decoding (rawvideo out).
-				let default = if ext == "y4m" || options.converts_video() { "rawvideo" } else { "copy" };
+				// Scaling or a pixel format change means re-encoding: raw for
+				// Y4M, H.264 for the containers that hold it.
+				// The H.264 encoder is 4:2:0; other pixel formats stay raw.
+				let yuv420 = options.pixel.as_ref().is_none_or(|p| p.name() == "yuv420p");
+				let default = match ext.as_str() {
+					"y4m" => "rawvideo",
+					_ if options.video_bitrate.is_some() || options.qp.is_some() => "h264",
+					_ if options.converts_video() => {
+						if yuv420 {
+							"h264"
+						} else {
+							"rawvideo"
+						}
+					}
+					_ => "copy",
+				};
 				let codec = options.video_codec.clone().unwrap_or_else(|| default.to_string());
 				if codec == "copy" {
 					let mut s = stream.clone();
@@ -498,8 +595,8 @@ pub fn transcode(input: &str, output: &str, options: &Options) -> Result<Summary
 					routes.insert(stream.id, Route::Copy { out: out_id });
 					summary.streams.push(format!("stream {}: video {codec_in} (copy)", stream.id.0));
 				} else {
-					if codec != "rawvideo" {
-						return Err(Message::Codec("RMP encodes only rawvideo (or use -c:v copy)"));
+					if codec != "rawvideo" && codec != "h264" {
+						return Err(Message::Codec("RMP encodes h264 and rawvideo (or use -c:v copy)"));
 					}
 					if !resolver.has_decoder(&codec_in) {
 						return Err(Message::Codec(
@@ -517,20 +614,39 @@ pub fn transcode(input: &str, output: &str, options: &Options) -> Result<Summary
 					}
 					let p = &stream.parameters;
 					let (w, h) = options.size.unwrap_or((p.width.unwrap_or(0), p.height.unwrap_or(0)));
-					let pixel = options
-						.pixel
-						.clone()
-						.or_else(|| p.pixel_format.as_deref().and_then(Pixel::from_name))
-						.unwrap_or_default();
-					let mut out = Stream::video(out_id, w, h, &pixel.name(), CodecId::new("rawvideo"));
+					let pixel = if codec == "h264" {
+						// The encoder takes 8-bit 4:2:0.
+						let yuv420p = Pixel::from_name("yuv420p").unwrap_or_default();
+						if options.pixel.as_ref().is_some_and(|p| *p != yuv420p) {
+							return Err(Message::Codec("the h264 encoder supports only -pix_fmt yuv420p"));
+						}
+						yuv420p
+					} else {
+						options
+							.pixel
+							.clone()
+							.or_else(|| p.pixel_format.as_deref().and_then(Pixel::from_name))
+							.unwrap_or_default()
+					};
+					let mut out = Stream::video(out_id, w, h, &pixel.name(), CodecId::new(&codec));
 					out.time_base = frame_time_base(stream, first);
-					muxer.add(&out)?;
 					let decoder = resolver.decoder_for(stream).ok_or("no decoder")?;
 					let dec_state = decoder.create_state(&stream.parameters);
-					let encoder = resolver.encoder_for(&out).ok_or("no encoder")?;
+					let encoder: Box<dyn Encoder> = if codec == "h264" {
+						let h264 = H264Encoder::new(out_id)
+							.with_rate(options.qp, options.video_bitrate)
+							.with_gop(options.gop)
+							.with_time_base(out.time_base);
+						out.parameters.extradata = h264.extradata(&out.parameters)?;
+						out.parameters.bitrate = options.video_bitrate;
+						Box::new(h264)
+					} else {
+						resolver.encoder_for(&out).ok_or("no encoder")?
+					};
+					muxer.add(&out)?;
 					let enc_state = encoder.create_state(&out.parameters);
 					summary.streams.push(format!(
-						"stream {}: video {codec_in} -> rawvideo {w}x{h} {}",
+						"stream {}: video {codec_in} -> {codec} {w}x{h} {}",
 						stream.id.0,
 						pixel.name()
 					));
@@ -609,6 +725,9 @@ pub fn transcode(input: &str, output: &str, options: &Options) -> Result<Summary
 			Route::Audio(r) => {
 				let frames = r.decoder.flush(&mut r.dec_state)?.value;
 				packets_out += audio_frames(r, frames, &mut muxer, &mut frames_out)?;
+				for frame in r.gapless.finish() {
+					packets_out += encode_audio(r, frame, &mut muxer, &mut frames_out)?;
+				}
 				if let Some(frame) = r.converter.as_mut().map(AudioConverter::flush).transpose()?.flatten()
 				{
 					for mut p in r.encoder.encode(&mut r.enc_state, Frame::Audio(frame))?.value {
@@ -647,17 +766,31 @@ fn audio_frames(
 		if a.nb_samples == 0 {
 			continue;
 		}
-		let converter = match &mut r.converter {
-			Some(c) => c,
-			None => r.converter.insert(AudioConverter::new(AudioSpec::of(&a), r.target)?),
-		};
-		let Some(converted) = converter.convert(&a)? else { continue };
-		*count += 1;
-		for mut p in r.encoder.encode(&mut r.enc_state, Frame::Audio(converted))?.value {
-			p.stream_id = r.out;
-			written += 1;
-			muxer.write(p)?;
+		for a in r.gapless.push(a) {
+			written += encode_audio(r, a, muxer, count)?;
 		}
+	}
+	Ok(written)
+}
+
+/// Converts one decoded frame to the target format and encodes it.
+fn encode_audio(
+	r: &mut AudioRoute,
+	a: crate::core::AudioFrame,
+	muxer: &mut Output,
+	count: &mut u64,
+) -> Result<u64> {
+	let converter = match &mut r.converter {
+		Some(c) => c,
+		None => r.converter.insert(AudioConverter::new(AudioSpec::of(&a), r.target)?),
+	};
+	let Some(converted) = converter.convert(&a)? else { return Ok(0) };
+	*count += 1;
+	let mut written = 0;
+	for mut p in r.encoder.encode(&mut r.enc_state, Frame::Audio(converted))?.value {
+		p.stream_id = r.out;
+		written += 1;
+		muxer.write(p)?;
 	}
 	Ok(written)
 }

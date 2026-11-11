@@ -1,9 +1,11 @@
-//! AAC (MPEG-4 Audio, ISO/IEC 14496-3) decoder.
+//! AAC (MPEG-4 Audio, ISO/IEC 14496-3) decoder and AAC-LC encoder.
 //!
 //! * [`config`] — AudioSpecificConfig, ADTS headers, program config.
 //! * [`ics`] — individual channel stream: sections, scalefactors, Huffman
 //!   spectral data, pulses, TNS, inverse quantisation, noise substitution.
 //! * [`decoder`] — element loop, M/S and intensity stereo, IMDCT filterbank.
+//! * [`encoder`] — AAC-LC encoder: block switching, MDCT, psychoacoustic
+//!   thresholds, M/S, rate loop, Huffman sectioning.
 //!
 //! Supported: AAC-LC (and the LC core of HE-AAC v1/v2 streams), mono to 7.1,
 //! sine and KBD windows, all window sequences, PNS, M/S, intensity stereo,
@@ -19,8 +21,10 @@
 
 pub mod config;
 pub mod decoder;
+pub mod encoder;
 pub mod ics;
 mod tables;
 
 pub use config::{AacConfig, AdtsHeader};
 pub use decoder::{AacDecoder, AacDecoderState, DecodedFrame};
+pub use encoder::{AacEncoder, AacEncoderState};

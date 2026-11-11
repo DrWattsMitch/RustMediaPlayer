@@ -20,3 +20,6 @@ mod flac_codec_test;
 
 #[path = "codecs/opus_decoder_test.rs"]
 mod opus_decoder_test;
+
+#[path = "codecs/encoder_test.rs"]
+mod encoder_test;

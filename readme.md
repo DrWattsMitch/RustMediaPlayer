@@ -76,10 +76,10 @@ rmp -i input.mkv -c copy out.webm  # WebM takes only VP8/VP9/AV1, Opus/Vorbis, W
 
 ### Decoding and re-encoding
 
-RMP decodes PCM, ADPCM, MP3, AAC, H.264, FLAC and Opus, and encodes FLAC,
-PCM and raw video. Without `-c:a`/`-c:v`, each container gets a sensible
-default (WAV → `pcm_s16le`, FLAC/Ogg/Matroska → FLAC when the source can't be
-copied, Y4M → `rawvideo`):
+RMP decodes PCM, ADPCM, MP3, AAC, H.264, FLAC and Opus, and encodes AAC-LC,
+H.264, FLAC, PCM and raw video. Without `-c:a`/`-c:v`, each container gets a
+sensible default (WAV → `pcm_s16le`, MP4/M4A/MOV → AAC and FLAC/Ogg/Matroska
+→ FLAC when the source can't be copied, Y4M → `rawvideo`):
 
 ```bash
 rmp -i song.mp3 song.flac                          # MP3 → FLAC
@@ -88,6 +88,17 @@ rmp -i voice.opus voice.wav -c:a pcm_f32le         # Opus → 32-bit float WAV
 rmp -i song.mp3 song.ogg                           # MP3 → FLAC in Ogg
 rmp -i input.mp4 output.mkv -c:a flac              # copy H.264, AAC → FLAC
 rmp -i input.wav output.flac -compression_level 8  # FLAC level 0-12
+rmp -i song.flac song.m4a -b:a 192k                # FLAC → AAC-LC
+rmp -i input.mkv output.mp4 -c:a aac               # copy H.264, re-encode audio
+```
+
+H.264 encoding (Constrained Baseline: plays everywhere) takes a constant
+quantiser or a bit rate:
+
+```bash
+rmp -i frames.y4m video.mp4 -c:v h264              # QP 23
+rmp -i input.mp4 small.mp4 -s 640x360 -b:v 1M      # scale, re-encode at 1 Mb/s
+rmp -i input.mkv out.mp4 -c:v h264 -qp 20 -g 60 -c:a aac -b:a 128k
 ```
 
 Resampling, remixing and sample-format changes re-encode (as in FFmpeg):
@@ -260,6 +271,13 @@ Codecs:
 - **MP3 (MPEG audio Layer III)**: decoder to 16-bit PCM, within ±1 LSB of
   FFmpeg.
 - **AAC-LC** and **H.264** (Baseline/Main/High, 8-bit 4:2:0) decoders.
+- **AAC-LC encoder**: block switching, psychoacoustic model, M/S stereo,
+  bit reservoir; mono to 7.1 at 8-96 kHz; bit rate within ~0.5% of the
+  target and SNR on par with FFmpeg's native `aac` encoder.
+- **H.264 encoder**: Constrained Baseline (CAVLC, I/P, Intra16x16/4x4,
+  P_Skip and 16x16-8x8 partitions, quarter-sample motion, deblocking),
+  constant QP or bit rate; FFmpeg decodes its output bit-exactly to the
+  encoder's own reconstruction.
 - **FLAC**: decoder (bit-exact with FFmpeg) and encoder (compression levels
   0–12, FFmpeg's defaults, files within ~3% of FFmpeg's size).
 - **Opus**: decoder for SILK, hybrid and CELT packets, mono, stereo and
@@ -273,6 +291,7 @@ limited or full range).
 
 See [docs/WAV_Y4M.md](docs/WAV_Y4M.md), [docs/MP3_MP4.md](docs/MP3_MP4.md),
 [docs/AAC_H264.md](docs/AAC_H264.md),
+[docs/AAC_H264_ENCODING.md](docs/AAC_H264_ENCODING.md),
 [docs/MKV_FLAC_OPUS_PROCESSING.md](docs/MKV_FLAC_OPUS_PROCESSING.md) and
 [docs/MKV_OGG_MUXING_CLI.md](docs/MKV_OGG_MUXING_CLI.md) for how each part
 works and how to extend it. The examples show single features in a few
@@ -350,17 +369,19 @@ Default codecs per output container (when `-c:a`/`-c:v` aren't given):
 | `.flac` | `flac` | dropped | dropped |
 | `.mp3` | copy (MP3 only) | dropped | dropped |
 | `.y4m` | dropped | `rawvideo` | dropped |
-| `.mp4`, `.mov` | copy if MP4 holds it, else `flac` | copy | dropped |
-| `.m4a` | copy if MP4 holds it, else `flac` | dropped | dropped |
+| `.mp4`, `.mov` | copy if MP4 holds it, else `aac` | copy | dropped |
+| `.m4a` | copy if MP4 holds it, else `aac` | dropped | dropped |
 | `.mkv` | copy if Matroska holds it, else `flac` | copy | copy |
 | `.mka` | copy if Matroska holds it, else `flac` | dropped | copy |
 | `.webm` | copy (Opus, Vorbis) | copy (VP8, VP9, AV1) | copy (WebVTT) |
 | `.ogg`, `.oga` | copy (Opus, FLAC, Vorbis), else `flac` | dropped | dropped |
 | `.opus` | copy (Opus only) | dropped | dropped |
 
-`-ar`, `-ac` and `-sample_fmt` switch a copy default to FLAC; `-s` and
-`-pix_fmt` switch it to `rawvideo`. RMP has no Opus, Vorbis, AAC, MP3 or
-H.264/VP9 encoder, so WebM, `.opus` and `.mp3` output are stream copies.
+`-ar`, `-ac` and `-sample_fmt` switch a copy default to a re-encode (AAC in
+MP4/M4A/MOV, FLAC elsewhere); `-s` and `-pix_fmt` switch it to `h264` (to
+`rawvideo` for Y4M, or when the pixel format isn't `yuv420p`), and so do
+`-b:v` and `-qp`. RMP has no Opus, Vorbis, MP3 or VP9 encoder, so WebM,
+`.opus` and `.mp3` output are stream copies.
 
 ## Fork Notice
 

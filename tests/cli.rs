@@ -163,3 +163,61 @@ fn library_options_parse_like_ffmpeg() {
 	let input = Input::open(out.to_str().unwrap()).unwrap();
 	assert_eq!(input.streams().streams[0].parameters.codec.id, "flac");
 }
+
+#[test]
+fn encodes_aac_and_h264() {
+	let dir = tempfile::tempdir().unwrap();
+	// MP4-family outputs re-encode audio to AAC by default.
+	let out = tmp(&dir, "a.m4a");
+	let (ok, _, err) = rmp(&[
+		"-i",
+		&fixture("wav/wav_stereo_44k_mix_sample.wav"),
+		"-b:a",
+		"96k",
+		out.to_str().unwrap(),
+	]);
+	assert!(ok, "{err}");
+	assert_eq!(kinds(&out), vec![(StreamKind::Audio, "aac".to_string())]);
+
+	let out = tmp(&dir, "v.mp4");
+	let (ok, _, err) = rmp(&[
+		"-i",
+		&fixture("y4m/yuv420p_34x18.y4m"),
+		"-c:v",
+		"h264",
+		"-b:v",
+		"200k",
+		"-g",
+		"12",
+		out.to_str().unwrap(),
+	]);
+	assert!(ok, "{err}");
+	assert_eq!(kinds(&out), vec![(StreamKind::Video, "h264".to_string())]);
+
+	// Scaling into MP4 now encodes H.264 instead of failing on rawvideo.
+	let out = tmp(&dir, "s.mp4");
+	let (ok, _, err) =
+		rmp(&["-i", &fixture("mkv/h264_aac.mkv"), "-s", "32x24", out.to_str().unwrap()]);
+	assert!(ok, "{err}");
+	assert_eq!(
+		kinds(&out),
+		vec![(StreamKind::Video, "h264".to_string()), (StreamKind::Audio, "aac".to_string())]
+	);
+
+	let (ok, _, err) = rmp(&[
+		"-i",
+		&fixture("y4m/yuv420p_34x18.y4m"),
+		"-qp",
+		"60",
+		tmp(&dir, "x.mp4").to_str().unwrap(),
+	]);
+	assert!(!ok && err.contains("-qp"), "{err}");
+	let (ok, _, err) = rmp(&[
+		"-i",
+		&fixture("wav/wav_stereo_44k_mix_sample.wav"),
+		"-b:a",
+		"fast",
+		tmp(&dir, "x.m4a").to_str().unwrap(),
+	]);
+	assert!(!ok && err.contains("bit rate"), "{err}");
+}

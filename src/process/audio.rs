@@ -429,3 +429,103 @@ mod tests {
 		assert_eq!(first_pts.map(|t| t.ticks()), Some(1088));
 	}
 }
+
+/// Drops the gapless priming (`encoder_delay`) and padding
+/// (`encoder_padding`) samples a demuxer reports, as FFmpeg's
+/// `skip_samples` / end trimming do, so a decode → encode keeps the
+/// source's exact length and timing.
+///
+/// Frames pass through [`Gapless::push`]; the last `padding` samples are
+/// held back until [`Gapless::finish`] drops them.
+#[derive(Debug, Clone, Default)]
+pub struct Gapless {
+	skip: u64,
+	padding: u64,
+	held: std::collections::VecDeque<AudioFrame>,
+	held_samples: u64,
+}
+
+impl Gapless {
+	pub fn new(delay: u64, padding: u64) -> Self {
+		Self { skip: delay, padding, held: Default::default(), held_samples: 0 }
+	}
+
+	/// Accepts a decoded frame; returns the frames now safe to emit.
+	pub fn push(&mut self, frame: AudioFrame) -> Vec<AudioFrame> {
+		let mut frame = frame;
+		if self.skip > 0 {
+			let n = frame.nb_samples as u64;
+			let drop = self.skip.min(n);
+			self.skip -= drop;
+			if drop == n {
+				return Vec::new();
+			}
+			frame = slice_frame(&frame, drop as usize, (n - drop) as usize);
+		}
+		if self.padding == 0 {
+			return vec![frame];
+		}
+		self.held_samples += frame.nb_samples as u64;
+		self.held.push_back(frame);
+		let mut out = Vec::new();
+		while let Some(front) = self.held.front() {
+			let n = front.nb_samples as u64;
+			if self.held_samples - n < self.padding {
+				break;
+			}
+			self.held_samples -= n;
+			out.extend(self.held.pop_front());
+		}
+		out
+	}
+
+	/// End of stream: the held frames minus the trailing padding.
+	pub fn finish(&mut self) -> Vec<AudioFrame> {
+		let mut keep = self.held_samples.saturating_sub(self.padding);
+		let mut out = Vec::new();
+		while let Some(frame) = self.held.pop_front() {
+			let n = frame.nb_samples as u64;
+			if keep == 0 {
+				break;
+			}
+			if n <= keep {
+				keep -= n;
+				out.push(frame);
+			} else {
+				out.push(slice_frame(&frame, 0, keep as usize));
+				keep = 0;
+			}
+		}
+		self.held.clear();
+		self.held_samples = 0;
+		out
+	}
+}
+
+/// `len` samples of `frame` from sample `start` (any layout), with the
+/// timestamp moved accordingly.
+pub fn slice_frame(frame: &AudioFrame, start: usize, len: usize) -> AudioFrame {
+	let channels = usize::from(frame.channels.count()).max(1);
+	let size = frame.format.bytes();
+	let start = start.min(frame.nb_samples);
+	let len = len.min(frame.nb_samples - start);
+	let data = if frame.layout.is_planar() {
+		let plane = frame.data.len() / channels;
+		let mut data = Vec::with_capacity(len * size * channels);
+		for c in 0..channels {
+			let base = c * plane;
+			data.extend_from_slice(
+				frame.data.get(base + start * size..base + (start + len) * size).unwrap_or(&[]),
+			);
+		}
+		data
+	} else {
+		let stride = size * channels;
+		frame.data.get(start * stride..(start + len) * stride).unwrap_or(&[]).to_vec()
+	};
+	let pts = frame.pts.and_then(|pts| {
+		let offset = Time::new(start as u64, TimeBase::new(1, frame.sample_rate.max(1)));
+		offset.rescale(pts.base()).and_then(|o| pts.checked_add(o))
+	});
+	AudioFrame { data, nb_samples: len, pts, ..frame.clone() }
+}

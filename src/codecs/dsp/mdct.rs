@@ -95,9 +95,82 @@ impl Imdct {
 	}
 }
 
+/// Forward MDCT: `N` windowed samples to `N/2` coefficients,
+///
+/// ```text
+/// X[k] = scale · Σ_n x[n] · cos(2π/N · (n + N/4 + 1/2) · (k + 1/2))
+/// ```
+///
+/// computed by folding the input into a half-length DCT-IV (the inverse of
+/// the mapping used by [`Imdct`]) and reusing its quarter-length FFT.
+/// FFmpeg: `ff_mdct_calc` / `av_tx` (`AV_TX_FLOAT_MDCT`).
+#[derive(Debug, Clone)]
+pub struct Mdct {
+	inner: Imdct,
+}
+
+impl Mdct {
+	/// Creates an MDCT taking `n` samples (a power of two ≥ 16).
+	pub fn new(n: usize, scale: f32) -> Self {
+		Self { inner: Imdct::new(n, scale) }
+	}
+
+	pub fn len(&self) -> usize {
+		self.inner.n
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.inner.n == 0
+	}
+
+	/// `input` has `N` samples; `output` receives `N/2` coefficients.
+	/// `scratch` must hold at least `N/2` floats and `buf` `N/4` complex
+	/// values.
+	pub fn forward(
+		&self,
+		input: &[f32],
+		output: &mut [f32],
+		scratch: &mut [f32],
+		buf: &mut [Complex],
+	) {
+		let n = self.inner.n;
+		let (q, h, tq) = (n / 4, n / 2, 3 * n / 4);
+		let u = &mut scratch[..h];
+		// Time-domain aliasing fold: with x = [a b c d] (quarters),
+		// u = [-c_r - d, a - b_r].
+		for i in 0..q {
+			u[i] = -input[tq - 1 - i] - input[tq + i];
+			u[q + i] = input[i] - input[h - 1 - i];
+		}
+		self.inner.dct4(u, &mut output[..h], buf);
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn forward_matches_direct_formula() {
+		for n in [16usize, 64, 256, 2048] {
+			let mdct = Mdct::new(n, 1.0);
+			let input: Vec<f32> = (0..n).map(|i| ((i * 7919) % 31) as f32 - 15.0).collect();
+			let mut out = vec![0.0; n / 2];
+			let mut scratch = vec![0.0; n / 2];
+			let mut buf = vec![Complex::default(); n / 4];
+			mdct.forward(&input, &mut out, &mut scratch, &mut buf);
+			for (k, &y) in out.iter().enumerate() {
+				let mut want = 0.0f64;
+				for (i, &x) in input.iter().enumerate() {
+					let arg = 2.0 * std::f64::consts::PI / n as f64
+						* (i as f64 + n as f64 / 4.0 + 0.5)
+						* (k as f64 + 0.5);
+					want += f64::from(x) * arg.cos();
+				}
+				assert!((f64::from(y) - want).abs() < 2e-3 * (n as f64), "n={n} k={k} {y} {want}");
+			}
+		}
+	}
 
 	#[test]
 	fn matches_direct_formula() {

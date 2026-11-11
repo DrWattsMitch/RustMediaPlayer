@@ -1,4 +1,4 @@
-//! H.264 / AVC (ISO/IEC 14496-10) video decoder.
+//! H.264 / AVC (ISO/IEC 14496-10) video decoder and encoder.
 //!
 //! * [`nal`] — `avcC`, length-prefixed and Annex B framing.
 //! * [`params`] — SPS/PPS, scaling matrices, dequantisation tables.
@@ -10,6 +10,8 @@
 //! * `deblock` — loop filter.
 //! * [`dpb`] — POC, reference lists and marking, output order.
 //! * [`decoder`] — picture lifecycle and the [`crate::core::Decoder`] impl.
+//! * [`encoder`] — Constrained Baseline encoder (CAVLC, I/P, quarter-sample
+//!   motion), reconstructing with the decoder's own `recon`/`deblock`.
 //!
 //! Supported: Constrained Baseline, Main and High profiles at 8-bit 4:2:0,
 //! progressive frames — CAVLC and CABAC, I/P/B slices, 8x8 transform,
@@ -32,6 +34,7 @@ mod deblock;
 pub mod decode;
 pub mod decoder;
 pub mod dpb;
+pub mod encoder;
 mod inter;
 mod mb;
 pub mod nal;
@@ -41,3 +44,4 @@ pub mod slice;
 mod tables;
 
 pub use decoder::{DecodedPicture, H264Decoder, H264DecoderState};
+pub use encoder::{H264Encoder, H264EncoderState};

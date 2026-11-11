@@ -40,14 +40,18 @@ Global options:
 
 Stream options:
   -an | -vn | -sn       drop audio / video / subtitles
-  -c:a <codec|copy>     audio codec: flac, pcm_s16le, pcm_s24le, pcm_f32le, ...
-  -c:v <codec|copy>     video codec: rawvideo or copy
+  -c:a <codec|copy>     audio codec: aac, flac, pcm_s16le, pcm_s24le, pcm_f32le, ...
+  -c:v <codec|copy>     video codec: h264, rawvideo or copy
   -c:s copy             copy subtitles (Matroska, WebM)
   -c copy               copy every stream
   -ar <rate>            output sample rate (resampled)
   -ac <channels>        output channels (FFmpeg's default remix)
   -sample_fmt <fmt>     u8, s16, s32, s64, flt, dbl (add p for planar)
   -compression_level n  FLAC level 0-12 (default 5)
+  -b:a <rate>           AAC bit rate, e.g. 128k (default 64k per channel)
+  -b:v <rate>           H.264 average bit rate, e.g. 2M
+  -qp <0-51>            H.264 constant quantiser (default 23)
+  -g <frames>           H.264 keyframe interval (default 250)
   -s <W>x<H>            output picture size
   -pix_fmt <name>       yuv420p, yuv422p, yuv444p, yuv420p10le, gray, rgb24, nv12, ...
   -sws_flags <filter>   point, bilinear, bicubic (default), lanczos
@@ -57,7 +61,7 @@ Stream options:
 
 Containers read: WAV, Y4M, MP3, MP4/M4A/MOV, Matroska/WebM, FLAC, Ogg (Opus/FLAC/Vorbis).
 Containers written: all of the above.
-Decoders: PCM, ADPCM, MP3, AAC-LC, H.264, FLAC, Opus. Encoders: PCM, FLAC, raw video.";
+Decoders: PCM, ADPCM, MP3, AAC-LC, H.264, FLAC, Opus. Encoders: PCM, FLAC, AAC-LC, H.264 (Constrained Baseline), raw video.";
 
 /// Parsed command line.
 #[derive(Default)]

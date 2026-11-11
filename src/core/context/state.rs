@@ -35,6 +35,8 @@ pub enum CodecPrivate {
 	H264(Box<crate::codecs::h264::H264DecoderState>),
 	Flac(Box<crate::codecs::flac::FlacDecoderState>),
 	FlacEncoder(Box<crate::codecs::flac::encoder::FlacEncoderState>),
+	AacEncoder(Box<crate::codecs::aac::AacEncoderState>),
+	H264Encoder(Box<crate::codecs::h264::H264EncoderState>),
 	Opus(Box<crate::codecs::opus::OpusDecoderState>),
 }
 
