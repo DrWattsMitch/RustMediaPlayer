@@ -42,6 +42,15 @@ fn clip(v: i32) -> u8 {
 
 /// Adds a 4x4 inverse-transformed residual (8.5.12.2) at (x, y).
 pub fn idct4_add(p: &mut Plane, x: usize, y: usize, c: &[i32; 16]) {
+	if crate::simd::enabled() {
+		super::simd::idct4_add(p, x, y, c)
+	} else {
+		idct4_add_scalar(p, x, y, c)
+	}
+}
+
+/// Scalar version of [`idct4_add`]: the fallback and the reference.
+pub(super) fn idct4_add_scalar(p: &mut Plane, x: usize, y: usize, c: &[i32; 16]) {
 	let mut t = [0i32; 16];
 	for i in 0..4 {
 		let r = &c[i * 4..i * 4 + 4];
@@ -89,6 +98,15 @@ fn idct8_1d(s: [i32; 8]) -> [i32; 8] {
 
 /// Adds an 8x8 inverse-transformed residual (8.5.13.2) at (x, y).
 pub fn idct8_add(p: &mut Plane, x: usize, y: usize, c: &[i32; 64]) {
+	if crate::simd::enabled() {
+		super::simd::idct8_add(p, x, y, c)
+	} else {
+		idct8_add_scalar(p, x, y, c)
+	}
+}
+
+/// Scalar version of [`idct8_add`]: the fallback and the reference.
+pub(super) fn idct8_add_scalar(p: &mut Plane, x: usize, y: usize, c: &[i32; 64]) {
 	let mut t = [0i32; 64];
 	for i in 0..8 {
 		let mut row = [0i32; 8];
@@ -599,7 +617,7 @@ fn avg(a: u8, b: u8) -> u8 {
 
 /// Copies the (w x h) area at (x, y) of `r` into `dst` (row stride
 /// `stride`), clamping coordinates at the picture edges.
-fn fetch(r: &Plane, x: i32, y: i32, w: usize, h: usize, dst: &mut [u8], stride: usize) {
+pub(super) fn fetch(r: &Plane, x: i32, y: i32, w: usize, h: usize, dst: &mut [u8], stride: usize) {
 	let inside =
 		x >= 0 && y >= 0 && x + w as i32 <= r.width as i32 && y + h as i32 <= r.height as i32;
 	for j in 0..h {
@@ -625,6 +643,25 @@ fn fetch(r: &Plane, x: i32, y: i32, w: usize, h: usize, dst: &mut [u8], stride: 
 /// needs them, then averaged for quarter positions.
 #[allow(clippy::too_many_arguments)]
 pub fn mc_luma(r: &Plane, x: i32, y: i32, fx: i32, fy: i32, bw: usize, bh: usize, out: &mut [u8]) {
+	if crate::simd::enabled() && matches!(bw, 4 | 8 | 16) {
+		super::simd::mc_luma(r, x, y, fx, fy, bw, bh, out)
+	} else {
+		mc_luma_scalar(r, x, y, fx, fy, bw, bh, out)
+	}
+}
+
+/// Scalar version of [`mc_luma`]: the fallback and the reference.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn mc_luma_scalar(
+	r: &Plane,
+	x: i32,
+	y: i32,
+	fx: i32,
+	fy: i32,
+	bw: usize,
+	bh: usize,
+	out: &mut [u8],
+) {
 	let mut win = [0u8; WIN * WIN];
 	fetch(r, x - 2, y - 2, bw + 5, bh + 5, &mut win, WIN);
 	let g = |i: usize, j: usize| win[(j + 2) * WIN + i + 2];
@@ -734,6 +771,25 @@ pub fn mc_chroma(
 	bh: usize,
 	out: &mut [u8],
 ) {
+	if crate::simd::enabled() && matches!(bw, 4 | 8) {
+		super::simd::mc_chroma(r, x, y, fx, fy, bw, bh, out)
+	} else {
+		mc_chroma_scalar(r, x, y, fx, fy, bw, bh, out)
+	}
+}
+
+/// Scalar version of [`mc_chroma`]: the fallback and the reference.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn mc_chroma_scalar(
+	r: &Plane,
+	x: i32,
+	y: i32,
+	fx: i32,
+	fy: i32,
+	bw: usize,
+	bh: usize,
+	out: &mut [u8],
+) {
 	const CW: usize = 9;
 	let mut win = [0u8; CW * CW];
 	fetch(r, x, y, bw + 1, bh + 1, &mut win, CW);
@@ -763,6 +819,25 @@ pub enum Weighting {
 /// Combines one or two prediction blocks into the plane (8.4.2.3).
 #[allow(clippy::too_many_arguments)]
 pub fn store_prediction(
+	p: &mut Plane,
+	x: usize,
+	y: usize,
+	bw: usize,
+	bh: usize,
+	l0: Option<&[u8]>,
+	l1: Option<&[u8]>,
+	wt: Weighting,
+) {
+	if crate::simd::enabled() && matches!(bw, 4 | 8 | 16) && super::simd::weights_supported(wt) {
+		super::simd::store_prediction(p, x, y, bw, bh, l0, l1, wt)
+	} else {
+		store_prediction_scalar(p, x, y, bw, bh, l0, l1, wt)
+	}
+}
+
+/// Scalar version of [`store_prediction`]: the fallback and the reference.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn store_prediction_scalar(
 	p: &mut Plane,
 	x: usize,
 	y: usize,

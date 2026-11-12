@@ -166,6 +166,34 @@ fn filter_edge(
 	if alpha == 0 || beta == 0 {
 		return;
 	}
+	let mut tc0 = [0i32; 4];
+	for (t, &s) in tc0.iter_mut().zip(bs) {
+		if (1..4).contains(&s) {
+			*t = i32::from(TC0[index_a][usize::from(s) - 1]);
+		}
+	}
+	if crate::simd::enabled() {
+		super::simd::filter_edge(plane, x, y, len, vertical, bs, &tc0, alpha, beta, chroma);
+	} else {
+		filter_edge_scalar(plane, x, y, len, vertical, bs, &tc0, alpha, beta, chroma);
+	}
+}
+
+/// Scalar edge filter: the fallback and the reference for
+/// [`super::simd::filter_edge`].
+#[allow(clippy::too_many_arguments)]
+pub(super) fn filter_edge_scalar(
+	plane: &mut Plane,
+	x: usize,
+	y: usize,
+	len: usize,
+	vertical: bool,
+	bs: &[u8; 4],
+	tc0: &[i32; 4],
+	alpha: i32,
+	beta: i32,
+	chroma: bool,
+) {
 	let w = plane.width;
 	let seg = len / 4;
 	for i in 0..len {
@@ -173,10 +201,9 @@ fn filter_edge(
 		if s == 0 {
 			continue;
 		}
-		let tc0 = if s < 4 { i32::from(TC0[index_a][usize::from(s) - 1]) } else { 0 };
 		let (base, step) =
 			if vertical { ((y + i) * w + x, 1isize) } else { (y * w + x + i, w as isize) };
-		filter_line(&mut plane.data, base, step, s, alpha, beta, tc0, chroma);
+		filter_line(&mut plane.data, base, step, s, alpha, beta, tc0[i / seg], chroma);
 	}
 }
 

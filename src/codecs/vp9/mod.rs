@@ -33,6 +33,7 @@ mod mode;
 mod probs;
 pub mod range;
 mod residual;
+mod simd;
 mod tables;
 mod transform;
 

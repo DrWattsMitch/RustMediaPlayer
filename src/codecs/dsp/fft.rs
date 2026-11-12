@@ -2,6 +2,7 @@
 //! bit-reversal permutation.
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[repr(C)]
 pub struct Complex {
 	pub re: f32,
 	pub im: f32,
@@ -26,6 +27,10 @@ pub struct Fft {
 	twiddles: Vec<Complex>,
 	/// Bit-reversed index for every position.
 	rev: Vec<u32>,
+	/// The twiddles of each stage with `half >= 4`, contiguous: for a stage
+	/// of `half` butterflies, `half` real parts then `half` imaginary parts
+	/// (`twiddles[k * step]`), for the vector butterflies.
+	stage_twiddles: Vec<f32>,
 }
 
 impl Fft {
@@ -41,12 +46,27 @@ impl Fft {
 			.collect();
 		let rev =
 			(0..n as u32).map(|i| if bits == 0 { 0 } else { i.reverse_bits() >> (32 - bits) }).collect();
-		Self { n, twiddles, rev }
+		let twiddles: Vec<Complex> = twiddles;
+		let mut stage_twiddles = Vec::new();
+		let mut size = 8;
+		while size <= n {
+			let (half, step) = (size / 2, n / size);
+			stage_twiddles.extend((0..half).map(|k| twiddles[k * step].re));
+			stage_twiddles.extend((0..half).map(|k| twiddles[k * step].im));
+			size *= 2;
+		}
+		Self { n, twiddles, rev, stage_twiddles }
 	}
 
 	/// Forward transform `X[k] = Σ x[j]·exp(-2πi·jk/n)`. `data.len()` must
 	/// equal the size passed to [`Fft::new`].
 	pub fn forward(&self, data: &mut [Complex]) {
+		self.forward_with(data, crate::simd::enabled());
+	}
+
+	/// [`Fft::forward`] with the vector stages on or off (tests compare
+	/// the two).
+	pub(crate) fn forward_with(&self, data: &mut [Complex], vector: bool) {
 		let n = self.n;
 		if data.len() != n {
 			return;
@@ -58,8 +78,16 @@ impl Fft {
 			}
 		}
 		let mut size = 2;
+		let mut tw_at = 0;
 		while size <= n {
 			let half = size / 2;
+			if vector && half >= 4 {
+				let tw = &self.stage_twiddles[tw_at..tw_at + 2 * half];
+				super::simd::fft_stage(data, size, tw);
+				tw_at += 2 * half;
+				size *= 2;
+				continue;
+			}
 			let step = n / size;
 			for start in (0..n).step_by(size) {
 				let (lo, hi) = data[start..start + size].split_at_mut(half);

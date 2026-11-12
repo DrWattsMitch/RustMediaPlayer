@@ -429,6 +429,16 @@ MP4/M4A/MOV, FLAC elsewhere); `-s` and `-pix_fmt` switch it to `h264` (to
 `.opus` and `.mp3` output are stream copies; their decoders let those
 streams go to any other format.
 
+## SIMD
+
+The hot loops (H.264 and VP9 motion compensation, deblocking and loop
+filters, H.264 inverse transforms, the IMDCT/FFT behind AAC, Vorbis and
+Opus) run on SSE2 on x86_64 and NEON on aarch64, with an AVX2 build of the
+same kernels picked at run time. Every vector kernel is bit-exact with the
+scalar code, which stays as the fallback. All `unsafe` is confined to the
+small audited `src/simd` module. Set `RMP_SIMD=scalar` (or `sse2`, `neon`,
+`avx2`) to cap the level. See [docs/SIMD.md](docs/SIMD.md).
+
 ## Fork Notice
 
 RMP is a fork of [FFmpReg](https://github.com/yazaldefilimone/ffmpreg),

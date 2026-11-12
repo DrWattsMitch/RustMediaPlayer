@@ -133,6 +133,39 @@ const FIXED: [&[i64]; 5] = [&[], &[1], &[2, -1], &[3, -3, 1], &[4, -6, 4, -1]];
 /// `x[i] = r[i] + (Σ c[j]·x[i-1-j]) >> shift`. Wrapping arithmetic keeps
 /// hostile streams from overflowing (conforming ones never do).
 fn predict(samples: &mut [i64], coefs: &[i64], shift: u32) {
+	// One loop per order, so the window and coefficients stay in
+	// registers with no bounds checks: FLAC's hot loop. Wrapping sums are
+	// associative, so the result is the same as the generic loop's.
+	macro_rules! orders {
+		($($n:literal)*) => {
+			match coefs.len() {
+				$($n => {
+					if let Ok(c) = <&[i64; $n]>::try_from(coefs) {
+						return predict_n::<$n>(samples, c, shift);
+					}
+				})*
+				_ => {}
+			}
+		};
+	}
+	orders!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32);
+	predict_generic(samples, coefs, shift);
+}
+
+#[inline(always)]
+fn predict_n<const N: usize>(samples: &mut [i64], coefs: &[i64; N], shift: u32) {
+	for i in N..samples.len() {
+		let window = &samples[i - N..i];
+		let mut sum: i64 = 0;
+		for j in 0..N {
+			sum = sum.wrapping_add(coefs[j].wrapping_mul(window[N - 1 - j]));
+		}
+		samples[i] = samples[i].wrapping_add(sum >> shift);
+	}
+}
+
+/// The reference loop (any order, including 0).
+fn predict_generic(samples: &mut [i64], coefs: &[i64], shift: u32) {
 	let order = coefs.len();
 	for i in order..samples.len() {
 		let mut sum: i64 = 0;
@@ -462,5 +495,31 @@ mod tests {
 	fn rejects_garbage() {
 		assert_eq!(decode_frame(&[0xFF, 0xF8, 0, 0], None).err(), Some(Invalid::Header));
 		assert!(FlacDecoderState::default().decode_packet(b"nonsense").is_err());
+	}
+}
+
+#[cfg(test)]
+mod predict_tests {
+	use super::{predict, predict_generic};
+
+	#[test]
+	fn specialised_orders_match_the_generic_loop() {
+		let mut seed = 3u64;
+		let mut next = || {
+			seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+			(seed >> 1) as i64 - (1 << 62)
+		};
+		for order in 0..=32usize {
+			for big in [false, true] {
+				let coefs: Vec<i64> =
+					(0..order).map(|_| if big { next() } else { next() % 4096 }).collect();
+				let init: Vec<i64> = (0..300).map(|_| if big { next() } else { next() % 65536 }).collect();
+				let (mut a, mut b) = (init.clone(), init);
+				let shift = (order % 16) as u32;
+				predict(&mut a, &coefs, shift);
+				predict_generic(&mut b, &coefs, shift);
+				assert_eq!(a, b, "order {order} big {big}");
+			}
+		}
 	}
 }

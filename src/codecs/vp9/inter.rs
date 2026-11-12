@@ -19,12 +19,12 @@ pub struct RefPlane<'a> {
 }
 
 /// Largest source block: 64 pixels plus the 7-pixel filter margin.
-const MAX: usize = 64 + 7;
+pub(super) const MAX: usize = 64 + 7;
 
 /// Reusable buffers for [`predict`].
 pub struct Scratch {
-	block: Vec<u8>,
-	temp: Vec<u8>,
+	pub(super) block: Vec<u8>,
+	pub(super) temp: Vec<u8>,
 }
 
 impl Default for Scratch {
@@ -51,6 +51,29 @@ fn tap8(px: &[u8], k: &[i16; 8]) -> u8 {
 /// already holds.
 #[allow(clippy::too_many_arguments)]
 pub fn predict(
+	scratch: &mut Scratch,
+	src: &RefPlane,
+	dst: &mut [u8],
+	dst_stride: usize,
+	x: usize,
+	y: usize,
+	w: usize,
+	h: usize,
+	mv_row: i32,
+	mv_col: i32,
+	filter: u8,
+	avg: bool,
+) {
+	if crate::simd::enabled() && (w == 4 || w.is_multiple_of(8)) {
+		super::simd::predict(scratch, src, dst, dst_stride, x, y, w, h, mv_row, mv_col, filter, avg);
+	} else {
+		predict_scalar(scratch, src, dst, dst_stride, x, y, w, h, mv_row, mv_col, filter, avg);
+	}
+}
+
+/// Scalar version of [`predict`]: the fallback and the reference.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn predict_scalar(
 	scratch: &mut Scratch,
 	src: &RefPlane,
 	dst: &mut [u8],

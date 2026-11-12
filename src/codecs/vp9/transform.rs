@@ -914,7 +914,22 @@ fn iwht4x4(input: &[i32], dst: &mut [u8], stride: usize) {
 	}
 }
 
+/// Adds `v` to every pixel of the `n` x `n` block, clipped.
+fn add_constant(dst: &mut [u8], stride: usize, n: usize, v: i64) {
+	if crate::simd::enabled() {
+		super::simd::add_constant(dst, stride, n, v);
+		return;
+	}
+	for r in 0..n {
+		for p in &mut dst[r * stride..r * stride + n] {
+			add_clip(p, v);
+		}
+	}
+}
+
 /// Adds the inverse transform of `coefs` (raster order) to `dst`.
+/// `eob` is the number of coefficients decoded in scan order (only used to
+/// spot DC-only blocks; the result is the same as the full transform).
 /// `tx_type` selects ADST in the vertical (1) or horizontal (2) direction
 /// or both (3); 32x32 is always a DCT.
 pub fn inverse_transform_add(
@@ -924,9 +939,27 @@ pub fn inverse_transform_add(
 	tx_size: u8,
 	tx_type: u8,
 	lossless: bool,
+	eob: usize,
 ) {
 	if lossless {
 		iwht4x4(coefs, dst, stride);
+		return;
+	}
+	if eob == 1 && tx_type == 0 {
+		// Only the DC coefficient (every scan starts there): the 2-D DCT
+		// is a constant, libvpx's `vpx_idctNxN_1_add`.
+		let n = 4usize << tx_size.min(3);
+		let shift = if tx_size == 0 {
+			4
+		} else if tx_size == 1 {
+			5
+		} else {
+			6
+		};
+		let a = wl(rs(i64::from(coefs[0]) * COSPI_16_64));
+		let b = wl(rs(a * COSPI_16_64));
+		let v = (b + (1 << (shift - 1))) >> shift;
+		add_constant(dst, stride, n, v);
 		return;
 	}
 	let (n, shift) = match tx_size {
@@ -943,7 +976,28 @@ pub fn inverse_transform_add(
 	};
 	let cols = if tx_type & 1 != 0 { adst } else { dct };
 	let rows = if tx_type & 2 != 0 { adst } else { dct };
-	let mut out = [0i32; 32 * 32];
+	// Scratch sized to the transform: zeroing a 32x32 buffer for every 4x4
+	// block was the decoder's single largest `memset`.
+	match n {
+		4 => transform_2d::<4, 16>(coefs, dst, stride, rows, cols, shift),
+		8 => transform_2d::<8, 64>(coefs, dst, stride, rows, cols, shift),
+		16 => transform_2d::<16, 256>(coefs, dst, stride, rows, cols, shift),
+		_ => transform_2d::<32, 1024>(coefs, dst, stride, rows, cols, shift),
+	}
+}
+
+/// Rows then columns of an `N` x `N` (`NN` = `N * N`) transform, added to
+/// `dst` with rounding `shift`.
+fn transform_2d<const N: usize, const NN: usize>(
+	coefs: &[i32],
+	dst: &mut [u8],
+	stride: usize,
+	rows: Transform1d,
+	cols: Transform1d,
+	shift: u32,
+) {
+	let n = N;
+	let mut out = [0i32; NN];
 	for i in 0..n {
 		let row = &coefs[i * n..(i + 1) * n];
 		// The transform of a zero row is zero.
@@ -951,14 +1005,14 @@ pub fn inverse_transform_add(
 			rows(row, &mut out[i * n..(i + 1) * n]);
 		}
 	}
-	let mut temp_in = [0i32; 32];
-	let mut temp_out = [0i32; 32];
+	let mut temp_in = [0i32; N];
+	let mut temp_out = [0i32; N];
 	let round = 1i64 << (shift - 1);
 	for i in 0..n {
 		for j in 0..n {
 			temp_in[j] = out[j * n + i];
 		}
-		cols(&temp_in[..n], &mut temp_out[..n]);
+		cols(&temp_in, &mut temp_out);
 		for j in 0..n {
 			add_clip(&mut dst[j * stride + i], (i64::from(temp_out[j]) + round) >> shift);
 		}
@@ -977,7 +1031,7 @@ mod tests {
 			let mut coefs = [0i32; 64];
 			coefs[0] = dc;
 			let mut dst = [128u8; 64];
-			inverse_transform_add(&coefs, &mut dst, 8, 1, 0, false);
+			inverse_transform_add(&coefs, &mut dst, 8, 1, 0, false, 64);
 			let out = rs(i64::from(dc) * COSPI_16_64);
 			let out = rs(out * COSPI_16_64);
 			let a1 = (out + 16) >> 5;
@@ -991,11 +1045,39 @@ mod tests {
 		let mut coefs = [0i32; 16];
 		coefs[0] = 40;
 		let mut dst = [100u8; 16];
-		inverse_transform_add(&coefs, &mut dst, 4, 0, 0, true);
+		inverse_transform_add(&coefs, &mut dst, 4, 0, 0, true, 16);
 		// vpx_iwht4x4_1_add: a1 = 10, e1 = 5 → row 0 [5, 5, 5, 5] ... first
 		// column split again: [3, 2, 2, 2] for 5 and [3, 2, 2, 2] for e1 = 5.
 		assert_eq!(dst[0], 103);
 		assert_eq!(dst[1], 103);
 		assert_eq!(dst[4], 102);
+	}
+
+	#[test]
+	fn dc_only_shortcut_equals_the_full_transform() {
+		let mut seed = 0x51u64;
+		let mut next = || {
+			seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+			(seed >> 33) as i32
+		};
+		for tx_size in 0..4u8 {
+			let n = 4usize << tx_size;
+			for round in 0..3000 {
+				let dc = match round % 3 {
+					0 => next() % 64,
+					1 => next() % 70000,
+					_ => next() % (1 << 24),
+				};
+				let mut coefs = vec![0i32; n * n];
+				coefs[0] = dc;
+				let init: Vec<u8> = (0..n * n).map(|_| next() as u8).collect();
+				let mut full = init.clone();
+				let mut fast = init;
+				// eob = n * n forces the full transform.
+				inverse_transform_add(&coefs, &mut full, n, tx_size, 0, false, n * n);
+				inverse_transform_add(&coefs, &mut fast, n, tx_size, 0, false, 1);
+				assert_eq!(full, fast, "{n}x{n} dc {dc}");
+			}
+		}
 	}
 }

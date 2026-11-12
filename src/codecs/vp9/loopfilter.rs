@@ -131,6 +131,15 @@ fn reach(taps: u8) -> usize {
 
 /// Filters an 8-pixel stretch of a vertical edge at (`x`, `y`).
 fn vertical(plane: &mut Plane, x: usize, y: usize, t: &Thresholds, taps: u8) {
+	if crate::simd::enabled() {
+		super::simd::vertical(plane, x, y, t, taps)
+	} else {
+		vertical_scalar(plane, x, y, t, taps)
+	}
+}
+
+/// Scalar version of [`vertical`]: the fallback and the reference.
+pub(super) fn vertical_scalar(plane: &mut Plane, x: usize, y: usize, t: &Thresholds, taps: u8) {
 	let n = reach(taps);
 	let stride = plane.stride;
 	for r in 0..8 {
@@ -141,6 +150,15 @@ fn vertical(plane: &mut Plane, x: usize, y: usize, t: &Thresholds, taps: u8) {
 
 /// Filters an 8-pixel stretch of a horizontal edge at (`x`, `y`).
 fn horizontal(plane: &mut Plane, x: usize, y: usize, t: &Thresholds, taps: u8) {
+	if crate::simd::enabled() {
+		super::simd::horizontal(plane, x, y, t, taps)
+	} else {
+		horizontal_scalar(plane, x, y, t, taps)
+	}
+}
+
+/// Scalar version of [`horizontal`]: the fallback and the reference.
+pub(super) fn horizontal_scalar(plane: &mut Plane, x: usize, y: usize, t: &Thresholds, taps: u8) {
 	let n = reach(taps);
 	let stride = plane.stride;
 	let mut px = [0u8; 16];

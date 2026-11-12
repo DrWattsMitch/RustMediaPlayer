@@ -40,6 +40,7 @@ mod mb;
 pub mod nal;
 pub mod params;
 mod recon;
+mod simd;
 pub mod slice;
 mod tables;
 

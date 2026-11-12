@@ -57,8 +57,27 @@ impl Imdct {
 	/// DCT-IV of `input` (length `N/2`) into `out` (length `N/2`), scaled.
 	/// `buf` is scratch of length `N/4`.
 	fn dct4(&self, input: &[f32], out: &mut [f32], buf: &mut [Complex]) {
+		self.dct4_with(input, out, buf, crate::simd::enabled());
+	}
+
+	/// [`Self::dct4`] with the vector loops on or off (tests compare the
+	/// two).
+	pub(crate) fn dct4_with(
+		&self,
+		input: &[f32],
+		out: &mut [f32],
+		buf: &mut [Complex],
+		vector: bool,
+	) {
 		let l = self.n / 2;
 		let quarter = l / 2;
+		if vector && quarter.is_multiple_of(4) {
+			let buf = &mut buf[..quarter];
+			super::simd::dct4_pre(&input[..l], &self.pre, buf);
+			self.fft.forward_with(buf, true);
+			super::simd::dct4_post(buf, &self.post, &mut out[..l], self.scale);
+			return;
+		}
 		for (k, slot) in buf.iter_mut().enumerate().take(quarter) {
 			let z = Complex::new(input[2 * k], input[l - 1 - 2 * k]);
 			*slot = z.times(self.pre[k]);

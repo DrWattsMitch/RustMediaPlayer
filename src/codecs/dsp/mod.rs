@@ -7,6 +7,7 @@
 
 pub mod fft;
 pub mod mdct;
+mod simd;
 
 pub use fft::{Complex, Fft};
 pub use mdct::{Imdct, Mdct};

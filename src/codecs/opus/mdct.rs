@@ -8,6 +8,8 @@
 //! output equals libopus's up to floating-point rounding.
 
 use std::f64::consts::PI;
+
+use crate::simd::F32x4;
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -57,13 +59,19 @@ impl Fft {
 
 	/// Transforms `data` (length `n`) in place.
 	pub fn process(&self, data: &mut [Cpx]) {
+		self.process_with(data, crate::simd::enabled());
+	}
+
+	/// [`Fft::process`] with the vector loop on or off (tests compare the
+	/// two).
+	pub(crate) fn process_with(&self, data: &mut [Cpx], vector: bool) {
 		let input = data.to_vec();
-		self.recurse(&input, 1, data, 0);
+		self.recurse(&input, 1, data, 0, vector);
 	}
 
 	/// Decimation in time: `out` receives the DFT of `x[0], x[stride],
 	/// x[2·stride], ...` (`out.len()` points).
-	fn recurse(&self, x: &[Cpx], stride: usize, out: &mut [Cpx], level: usize) {
+	fn recurse(&self, x: &[Cpx], stride: usize, out: &mut [Cpx], level: usize, vector: bool) {
 		let len = out.len();
 		if len == 1 {
 			out[0] = x[0];
@@ -72,24 +80,80 @@ impl Fft {
 		let p = self.factors[level];
 		let m = len / p;
 		for r in 0..p {
-			self.recurse(&x[r * stride..], stride * p, &mut out[r * m..(r + 1) * m], level + 1);
+			self.recurse(&x[r * stride..], stride * p, &mut out[r * m..(r + 1) * m], level + 1, vector);
 		}
-		// W_len^e is twiddles[e · n / len].
+		// W_len^e is twiddles[e · n / len]; r·k < len, so no wrap is needed.
 		let step = self.n / len;
-		let w = |e: usize| self.twiddles[(e * step) % self.n];
+		let w = |e: usize| self.twiddles[e * step];
+		// The combining twiddles W_len^(r·q·m) depend only on (r, q).
+		let mut wq = [[Cpx::default(); 5]; 5];
+		for (r, row) in wq[..p].iter_mut().enumerate() {
+			for (q, v) in row[..p].iter_mut().enumerate() {
+				*v = w((r * q * m) % len);
+			}
+		}
+		let mut k = 0;
+		if m >= 4 && vector {
+			k = butterflies(out, p, m, step, &self.twiddles, &wq);
+		}
 		let mut terms = [Cpx::default(); 5];
-		for k in 0..m {
+		for k in k..m {
 			for (r, t) in terms[..p].iter_mut().enumerate() {
 				*t = out[r * m + k].mul(w(r * k));
 			}
 			for q in 0..p {
 				let mut acc = terms[0];
 				for (r, t) in terms[..p].iter().enumerate().skip(1) {
-					acc = acc.add(t.mul(w((r * q * m) % len)));
+					acc = acc.add(t.mul(wq[r][q]));
 				}
 				out[q * m + k] = acc;
 			}
 		}
+	}
+}
+
+/// Four lanes of complex values as (real parts, imaginary parts).
+type Cv = (F32x4, F32x4);
+
+/// `Cpx::mul` lane-wise.
+#[inline(always)]
+fn cmul(a: Cv, b: Cv) -> Cv {
+	(a.0.mul(b.0).sub(a.1.mul(b.1)), a.0.mul(b.1).add(a.1.mul(b.0)))
+}
+
+#[inline(always)]
+fn gather(c: [Cpx; 4]) -> Cv {
+	(F32x4::from_array(c.map(|v| v.re)), F32x4::from_array(c.map(|v| v.im)))
+}
+
+crate::multiversion! {
+	/// The combining loop of [`Fft::recurse`] for `k` in steps of four, with
+	/// each lane doing exactly the scalar operations. Returns the first `k`
+	/// left for the scalar loop.
+	fn butterflies(out: &mut [Cpx], p: usize, m: usize, step: usize, tw: &[Cpx], wq: &[[Cpx; 5]; 5]) -> usize {
+		let mut k = 0;
+		while k + 4 <= m {
+			let mut terms = [(F32x4::splat(0.0), F32x4::splat(0.0)); 5];
+			for (r, t) in terms[..p].iter_mut().enumerate() {
+				let x = gather(std::array::from_fn(|j| out[r * m + k + j]));
+				let w = gather(std::array::from_fn(|j| tw[r * (k + j) * step]));
+				*t = cmul(x, w);
+			}
+			for q in 0..p {
+				let mut acc = terms[0];
+				for r in 1..p {
+					let w = (F32x4::splat(wq[r][q].re), F32x4::splat(wq[r][q].im));
+					let v = cmul(terms[r], w);
+					acc = (acc.0.add(v.0), acc.1.add(v.1));
+				}
+				let (re, im) = (acc.0.to_array(), acc.1.to_array());
+				for j in 0..4 {
+					out[q * m + k + j] = Cpx { re: re[j], im: im[j] };
+				}
+			}
+			k += 4;
+		}
+		k
 	}
 }
 
@@ -203,6 +267,26 @@ impl Mdct {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn vector_fft_is_bit_identical_to_scalar() {
+		for n in [60usize, 120, 240, 480, 8, 30] {
+			let fft = Fft::new(n);
+			let input: Vec<Cpx> = (0..n)
+				.map(|i| Cpx {
+					re: ((i * 7919) % 1013) as f32 / 7.0 - 70.0,
+					im: ((i * 31) % 97) as f32 / 3.0,
+				})
+				.collect();
+			let mut a = input.clone();
+			let mut b = input;
+			fft.process_with(&mut a, false);
+			fft.process_with(&mut b, true);
+			let bits =
+				|v: &[Cpx]| v.iter().flat_map(|c| [c.re.to_bits(), c.im.to_bits()]).collect::<Vec<_>>();
+			assert_eq!(bits(&a), bits(&b), "n={n}");
+		}
+	}
 
 	#[test]
 	#[allow(clippy::needless_range_loop)]

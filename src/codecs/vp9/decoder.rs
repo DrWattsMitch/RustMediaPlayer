@@ -442,8 +442,14 @@ impl FrameDecoder {
 							tx_size,
 							tx_type,
 							lossless,
+							eob,
 						);
-						coefs.fill(0);
+						// A DC-only block wrote just its first coefficient.
+						if eob == 1 {
+							coefs[0] = 0;
+						} else {
+							coefs.fill(0);
+						}
 					}
 					eobs += eob;
 				}
