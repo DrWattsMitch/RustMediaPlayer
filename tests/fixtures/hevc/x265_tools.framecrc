@@ -1,0 +1,12 @@
+#software: Lavf60.16.100
+#tb 0: 1/25
+#media_type 0: video
+#codec_id 0: rawvideo
+#dimensions 0: 128x96
+#sar 0: 1/1
+0,          0,          0,        1,    18432, 0xc171b8de
+0,          1,          1,        1,    18432, 0x9212b8eb
+0,          2,          2,        1,    18432, 0xb040bd22
+0,          3,          3,        1,    18432, 0x5ebab637
+0,          4,          4,        1,    18432, 0xd6fdb7c5
+0,          5,          5,        1,    18432, 0x092cba26
