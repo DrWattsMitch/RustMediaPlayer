@@ -97,3 +97,63 @@ fn damaged_frames_are_concealed_with_silence() {
 	assert!(frames[0].pcm.iter().all(|&s| s == 0));
 	assert_eq!(dec.concealed_frames, 1);
 }
+
+/// Decodes every audio packet of a demuxer through the Decoder trait.
+fn decode_all(demuxer: &mut dyn Demuxer) -> (Vec<i16>, u8, u32) {
+	let stream = demuxer.streams().iter().find(|s| s.kind == StreamKind::Audio).unwrap().clone();
+	let decoder = AacDecoder::new();
+	let mut state = decoder.create_state(&stream.parameters);
+	let (mut out, mut channels, mut rate) = (Vec::new(), 0, 0);
+	for packet in read_all(demuxer) {
+		for frame in decoder.decode(&mut state, packet).unwrap().value {
+			let Frame::Audio(frame) = frame else { panic!("audio expected") };
+			channels = frame.channels.count();
+			rate = frame.sample_rate;
+			out.extend(samples(&frame.data));
+		}
+	}
+	(out, channels, rate)
+}
+
+/// HE-AAC references come from FFmpeg's float SBR/PS decoder, whose DSP
+/// runs in SIMD with a different summation order, so the comparison allows
+/// a few LSB of float noise instead of one.
+fn assert_close(ours: &[i16], reference: &[i16], max_diff: i32, min_snr: f64) {
+	assert_eq!(ours.len(), reference.len(), "sample count");
+	let (mut signal, mut noise, mut worst) = (0f64, 0f64, 0);
+	for (&a, &b) in ours.iter().zip(reference) {
+		let diff = i32::from(a) - i32::from(b);
+		worst = worst.max(diff.abs());
+		signal += f64::from(b).powi(2);
+		noise += f64::from(diff).powi(2);
+	}
+	let snr = 10.0 * (signal / noise.max(1.0)).log10();
+	assert!(worst <= max_diff && snr > min_snr, "max diff {worst}, SNR {snr:.1} dB");
+}
+
+#[test]
+fn he_aac_v1_adts_with_implicit_sbr_matches_ffmpeg() {
+	let mut d =
+		rmp::container::adts::demuxer::AdtsDemuxer::new(memory(fixture("aac/he_aac_v1.aac"))).unwrap();
+	let (pcm, channels, rate) = decode_all(&mut d);
+	assert_eq!((channels, rate), (2, 44_100));
+	assert_close(&pcm, &samples(&fixture("aac/he_aac_v1.ffmpeg.s16le")), 4, 80.0);
+}
+
+#[test]
+fn he_aac_v2_parametric_stereo_matches_ffmpeg() {
+	let mut d = Mp4Demuxer::new(memory(fixture("aac/he_aac_v2.m4a"))).unwrap();
+	let (pcm, channels, rate) = decode_all(&mut d);
+	assert_eq!((channels, rate), (2, 44_100));
+	assert_close(&pcm, &samples(&fixture("aac/he_aac_v2.ffmpeg.s16le")), 8, 80.0);
+}
+
+#[test]
+fn mono_he_aac_decodes_as_stereo_like_ffmpeg() {
+	let mut d =
+		rmp::container::adts::demuxer::AdtsDemuxer::new(memory(fixture("aac/he_aac_mono.aac")))
+			.unwrap();
+	let (pcm, channels, rate) = decode_all(&mut d);
+	assert_eq!((channels, rate), (2, 44_100));
+	assert_close(&pcm, &samples(&fixture("aac/he_aac_mono.ffmpeg.s16le")), 16, 75.0);
+}

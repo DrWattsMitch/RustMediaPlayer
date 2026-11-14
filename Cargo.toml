@@ -9,6 +9,9 @@ license = "Apache-2.0"
 
 [dependencies]
 clap = { version = "4.5.60", features = ["derive"] }
+libc = { version = "0.2", optional = true }
+# AV1: the Rust port of dav1d (BSD-2-Clause). Its asm needs `nasm` on x86-64.
+rav1d = { version = "1.1.0", optional = true, default-features = false, features = ["asm", "bitdepth_8", "bitdepth_16"] }
 nom = "8.0.0"
 reqwest = { version = "0.13.2", features = ["blocking", "default-tls"] }
 rustc-hash = "2.1.1"
@@ -19,6 +22,9 @@ serde_json = "1.0.139"
 tempfile = "3.10"
 
 [features]
+default = ["av1"]
+# AV1 decoding through rav1d (see src/codecs/av1).
+av1 = ["dep:rav1d", "dep:libc"]
 
 [profile.release]
 opt-level = 3
@@ -63,3 +69,11 @@ overflow-checks = true # Catch arithmetic overflow errors
 [profile.dev-no-debug-assertions]
 inherits = "dev"
 debug-assertions = false
+
+# Quick-to-build profile for callgrind (not used for timings).
+[profile.prof]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+strip = false
+debug = true

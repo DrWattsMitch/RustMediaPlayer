@@ -257,6 +257,16 @@ pub struct Packet {
 }
 ```
 
+A `VideoFrame` doesn't own a `Vec`: each plane is a reference-counted
+`FrameBuffer` plus an offset and a stride (FFmpeg's `AVFrame` `buf[]` /
+`linesize[]`). Decoders return views into their own reference pictures, so
+decoding copies nothing on output, `frame.clone()` is an atomic increment,
+and a player can pass `plane.bytes()` and `plane.stride()` straight to a
+texture upload. Picture buffers come from per-decoder pools and go back to
+them once nothing references them. `frame.data()` / `write_packed()` give
+the packed planar layout when you need it. See
+[docs/ZERO_COPY.md](docs/ZERO_COPY.md).
+
 A `Stream` describes one track: its kind (audio, video, subtitle), time
 base, codec `Parameters` (codec ID using FFmpeg's names, sample rate,
 channels, picture size, pixel format, `extradata`) and metadata. Gapless
@@ -332,8 +342,12 @@ See [docs/WAV_Y4M.md](docs/WAV_Y4M.md), [docs/MP3_MP4.md](docs/MP3_MP4.md),
 [docs/AAC_H264_ENCODING.md](docs/AAC_H264_ENCODING.md),
 [docs/MKV_FLAC_OPUS_PROCESSING.md](docs/MKV_FLAC_OPUS_PROCESSING.md) and
 [docs/MKV_OGG_MUXING_CLI.md](docs/MKV_OGG_MUXING_CLI.md),
-[docs/OPUS_PLC.md](docs/OPUS_PLC.md) and
-[docs/VORBIS_VP9.md](docs/VORBIS_VP9.md) for how each part
+[docs/OPUS_PLC.md](docs/OPUS_PLC.md),
+[docs/VORBIS_VP9.md](docs/VORBIS_VP9.md) and
+[docs/THREADING.md](docs/THREADING.md) (H.264 frame threads, VP9 tile
+threads, the transcode pipeline and how they compare with FFmpeg) and
+[docs/ZERO_COPY.md](docs/ZERO_COPY.md) (reference-counted frames and buffer
+pools) for how each part
 works and how to extend it. The examples show single features in a few
 lines each:
 
@@ -346,6 +360,7 @@ cargo run --release --example mp3_to_wav  -- input.mp3 output.wav
 cargo run --release --example transcode   -- input.mkv output.flac -ar 48000
 cargo run --release --example transcode   -- input.opus output.wav -c:a pcm_f32le
 cargo run --release --example framecrc    -- input.mkv   # like ffmpeg -f framecrc
+cargo run --release --example zero_copy   -- input.mp4   # frames to a "render" thread, no copies
 ```
 
 Raw video is the `rawvideo` codec with its layout in `pixel_format`, and

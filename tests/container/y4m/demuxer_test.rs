@@ -40,7 +40,7 @@ fn high_bit_depth_frames_decode_through_the_raw_codec() {
 	};
 	assert_eq!((frame.width, frame.height, frame.pixel.depth), (16, 8, 10));
 	assert_eq!(frame.pixel.name(), "yuv422p10le");
-	assert_eq!(frame.data, fixture("y4m/yuv422p10_16x8.ffmpeg.yuv")[..512]);
+	assert_eq!(frame.data()[..], fixture("y4m/yuv422p10_16x8.ffmpeg.yuv")[..512]);
 }
 
 #[test]

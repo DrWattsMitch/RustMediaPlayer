@@ -69,7 +69,7 @@ pub fn decode_all(demuxer: &mut dyn Demuxer) -> Vec<u8> {
 		for frame in decoder.decode(&mut state, packet).expect("decode").value {
 			match frame {
 				Frame::Audio(a) => out.extend_from_slice(&a.data),
-				Frame::Video(v) => out.extend_from_slice(&v.data),
+				Frame::Video(v) => out.extend_from_slice(&v.data()),
 			}
 		}
 	}

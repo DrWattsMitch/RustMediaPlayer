@@ -69,7 +69,7 @@ impl core::Encoder for PcmEncoder {
 		})
 	}
 
-	fn encode(&self, state: &mut State, frame: Frame) -> Result<EncodeOut<State>> {
+	fn encode(&self, state: &mut State, frame: Frame) -> Result<EncodeOut> {
 		let Frame::Audio(frame) = frame else {
 			return Err(Message::Codec("pcm encoder requires audio frames"));
 		};
@@ -82,11 +82,11 @@ impl core::Encoder for PcmEncoder {
 		let mut packet = Packet::new(self.stream_id, data);
 		packet.pts = frame.pts;
 		packet.dts = frame.pts;
-		Ok(EncodeOut { value: vec![packet], state: state.clone() })
+		Ok(EncodeOut { value: vec![packet] })
 	}
 
-	fn flush(&self, state: &mut State) -> Result<EncodeOut<State>> {
-		Ok(EncodeOut { value: Vec::new(), state: state.clone() })
+	fn flush(&self, _state: &mut State) -> Result<EncodeOut> {
+		Ok(EncodeOut { value: Vec::new() })
 	}
 }
 

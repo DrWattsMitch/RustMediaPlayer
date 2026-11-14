@@ -31,3 +31,13 @@ mod vorbis_decoder_test;
 
 #[path = "codecs/vp9_decoder_test.rs"]
 mod vp9_decoder_test;
+
+#[path = "codecs/ac3_decoder_test.rs"]
+mod ac3_decoder_test;
+
+#[cfg(feature = "av1")]
+#[path = "codecs/av1_decoder_test.rs"]
+mod av1_decoder_test;
+
+#[path = "codecs/hevc_decoder_test.rs"]
+mod hevc_decoder_test;

@@ -46,7 +46,7 @@ fn scaling_matches_swscale() {
 		[(100, 75, "process/testsrc_100x75.yuv"), (48, 32, "process/testsrc_48x32.yuv")]
 	{
 		let ours = convert(&src, w, h, "yuv420p");
-		let (db, max) = psnr(&ours.data, &fixture(reference));
+		let (db, max) = psnr(&ours.data(), &fixture(reference));
 		eprintln!("scale {w}x{h}: {db:.1} dB, max {max}");
 		assert!(db > 50.0 && max <= 8, "{w}x{h}: {db:.1} dB, max {max}");
 	}
@@ -57,18 +57,24 @@ fn scaling_matches_swscale() {
 fn color_conversion_matches_swscale() {
 	let src = source_picture();
 	let rgb = convert(&src, 96, 64, "rgb24");
-	let (db, _) = psnr(&rgb.data, &fixture("process/testsrc_96x64.accurate.rgb24"));
+	let (db, _) = psnr(&rgb.data(), &fixture("process/testsrc_96x64.accurate.rgb24"));
 	eprintln!("yuv420p -> rgb24: {db:.1} dB");
 	assert!(db > 35.0, "yuv420p -> rgb24: {db:.1} dB");
-	let mut from_rgb = rgb.clone();
-	from_rgb.data = fixture("process/testsrc_96x64.rgb24");
+	let from_rgb = VideoFrame::from_packed(
+		fixture("process/testsrc_96x64.rgb24"),
+		rgb.width,
+		rgb.height,
+		rgb.pixel.clone(),
+		rgb.keyframe,
+		rgb.pts,
+	);
 	let yuv = convert(&from_rgb, 96, 64, "yuv420p");
-	let (db, _) = psnr(&yuv.data, &fixture("process/from_rgb_96x64.accurate.yuv"));
+	let (db, _) = psnr(&yuv.data(), &fixture("process/from_rgb_96x64.accurate.yuv"));
 	eprintln!("rgb24 -> yuv420p: {db:.1} dB");
 	assert!(db > 40.0, "rgb24 -> yuv420p: {db:.1} dB");
 	// Packed orders are consistent.
 	let bgra = convert(&src, 96, 64, "bgra");
-	for (px, rgb_px) in bgra.data.chunks(4).zip(rgb.data.chunks(3)) {
+	for (px, rgb_px) in bgra.data().chunks(4).zip(rgb.data().chunks(3)) {
 		assert_eq!([px[2], px[1], px[0], px[3]], [rgb_px[0], rgb_px[1], rgb_px[2], 255]);
 	}
 }

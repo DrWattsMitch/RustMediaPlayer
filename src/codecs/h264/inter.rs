@@ -122,7 +122,10 @@ impl<'a> SliceDecoder<'a> {
 			.and_then(|r| r.as_ref())
 			.ok_or(BadMb("direct mode without RefPicList1[0]"))?;
 		let addr = self.mby * self.f.mb_w + self.mbx;
-		let col = col_pic.pic.motion.get(addr).copied().unwrap_or_default();
+		// Frame threading: the co-located picture may still be decoding.
+		let data = &col_pic.pic.data;
+		let col =
+			data.with(data.need_motion(self.mby), |p| p.motion.get(addr).copied()).unwrap_or_default();
 		let inference = self.sps.direct_8x8_inference;
 		if self.h.direct_spatial {
 			let mut refs = [-1i8; 2];
@@ -297,19 +300,22 @@ impl<'a> SliceDecoder<'a> {
 				.ok_or(BadMb("reference picture missing"))?;
 			let mv = cur.mv[list][idx];
 			let (mx, my) = (i32::from(mv[0]), i32::from(mv[1]));
-			recon::mc_luma(
-				&r.pic.y,
-				px as i32 + (mx >> 2),
-				py as i32 + (my >> 2),
-				mx & 3,
-				my & 3,
-				bw,
-				bh,
-				&mut luma[list],
-			);
+			let (lx, ly) = (px as i32 + (mx >> 2), py as i32 + (my >> 2));
 			let (cx, cy) = ((px / 2) as i32 + (mx >> 3), (py / 2) as i32 + (my >> 3));
-			recon::mc_chroma(&r.pic.cb, cx, cy, mx & 7, my & 7, bw / 2, bh / 2, &mut chroma[0][list]);
-			recon::mc_chroma(&r.pic.cr, cx, cy, mx & 7, my & 7, bw / 2, bh / 2, &mut chroma[1][list]);
+			// Frame threading (FFmpeg `await_references`): wait until the
+			// reference rows this block reads are final. The 6-tap window
+			// reaches 3 rows below the block, the bilinear chroma one 1 row;
+			// coordinates outside the picture are clamped onto its edge.
+			let data = &r.pic.data;
+			let luma_bottom = (ly + bh as i32 + 2).clamp(0, self.f.y.height as i32 - 1) as usize;
+			let chroma_bottom = (cy + (bh / 2) as i32).clamp(0, self.f.cb.height as i32 - 1) as usize;
+			let need = data.need_luma(luma_bottom).max(data.need_chroma(chroma_bottom));
+			let (l, c) = (&mut luma[list], &mut chroma);
+			data.with(need, |p| {
+				recon::mc_luma(&p.y, lx, ly, mx & 3, my & 3, bw, bh, l);
+				recon::mc_chroma(&p.cb, cx, cy, mx & 7, my & 7, bw / 2, bh / 2, &mut c[0][list]);
+				recon::mc_chroma(&p.cr, cx, cy, mx & 7, my & 7, bw / 2, bh / 2, &mut c[1][list]);
+			});
 		}
 		let w_luma = self.weighting(refs, 0);
 		let (l0, l1) = (&luma[0][..], &luma[1][..]);

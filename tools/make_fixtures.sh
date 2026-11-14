@@ -172,3 +172,32 @@ ff -f rawvideo -pix_fmt rgb24 -s 96x64 -i process/testsrc_96x64.rgb24 -sws_flags
 ff -f lavfi -i "aevalsrc='0.5*sin(2*PI*1000*t)|0.4*sin(2*PI*3000*t)':s=44100:d=0.25" -c:a pcm_s16le process/tone_44k_stereo.wav
 ff -i process/tone_44k_stereo.wav -ar 48000 -f f32le process/tone_48k_stereo.ffmpeg.f32le
 ff -i process/tone_44k_stereo.wav -ar 8000 -ac 1 -f f32le process/tone_8k_mono.ffmpeg.f32le
+
+# ---------------------------------------------------------------------------
+# Codec fixtures that need encoders outside a stock FFmpeg build. They are
+# checked in; the commands are kept here for reference.
+#
+# AC-3 / E-AC-3 (ac3/): FFmpeg's ac3/eac3 encoders; references are
+#   `ffmpeg -i X -f s16le` of FFmpeg's float decoder.
+# HE-AAC (aac/): fdk-aac's `aac-enc` (-t 5 for SBR, -t 29 for SBR + PS);
+#   references are FFmpeg's decoder output.
+# AV1 (av1/): libaom; references are `-f framecrc` of libdav1d's output.
+#
+# HEVC (hevc/): x265 (through FFmpeg) and Kvazaar. FFmpeg mis-decodes tiles
+# combined with WPP, so kvazaar_tiles_wpp.framecrc is the encoder's own
+# reconstruction (--debug).
+# ff -f lavfi -i testsrc2=size=160x96:rate=25 -vf fade=in:0:6 -frames:v 14 -c:v libx265 -pix_fmt yuv420p \
+# 	-x265-params "keyint=8:min-keyint=8:open-gop=1:bframes=3:b-pyramid=1:amp=1:rect=1:weightp=1:weightb=1:rd=6:ref=3" \
+# 	hevc/x265_main.mp4
+# ff -f lavfi -i testsrc2=size=192x192:rate=25 -frames:v 6 -c:v libx265 -pix_fmt yuv420p10le \
+# 	-x265-params "keyint=30:bframes=2:slices=2" hevc/x265_main10.mkv
+# ff -f lavfi -i testsrc2=size=128x96:rate=25 -frames:v 6 -c:v libx265 -pix_fmt yuv420p \
+# 	-x265-params "keyint=30:bframes=1:tskip=1:scaling-list=default:cu-lossless=1:rd=6:ctu=32:qg-size=16:cbqpoffs=2:crqpoffs=-2" \
+# 	hevc/x265_tools.mp4
+# for n in x265_main x265_tools; do ff -i hevc/$n.mp4 -f framecrc hevc/$n.framecrc; done
+# ff -i hevc/x265_main10.mkv -f framecrc hevc/x265_main10.framecrc
+# ff -f lavfi -i testsrc2=size=192x128:rate=25 -frames:v 6 -pix_fmt yuv420p /tmp/kv.yuv
+# kvazaar -i /tmp/kv.yuv --input-res 192x128 -o /tmp/kv.hevc --tiles 2x2 --wpp --threads 0 --owf 0 --gop 0 -p 0 \
+# 	--debug /tmp/kv_rec.yuv
+# ff -fflags +genpts -r 25 -i /tmp/kv.hevc -c copy hevc/kvazaar_tiles_wpp.mp4
+# ff -f rawvideo -s 192x128 -pix_fmt yuv420p -r 25 -i /tmp/kv_rec.yuv -f framecrc hevc/kvazaar_tiles_wpp.framecrc

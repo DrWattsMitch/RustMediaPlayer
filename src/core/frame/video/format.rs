@@ -166,26 +166,34 @@ impl Pixel {
 		if self.depth > 8 { 2 } else { 1 }
 	}
 
+	/// `(bytes per row, rows)` of each plane of a `width` x `height`
+	/// picture, or `None` if a size does not fit in `usize`. Chroma
+	/// dimensions round up, as with FFmpeg's `AV_CEIL_RSHIFT`.
+	pub fn plane_dims(&self, width: u32, height: u32) -> Option<Vec<(usize, usize)>> {
+		let bps = self.bytes_per_sample();
+		let (sx, sy) = self.format.chroma_shift();
+		let (w, h) = (width as usize, height as usize);
+		w.checked_mul(h)?;
+		if self.format.is_rgb() {
+			return Some(vec![(w.checked_mul(self.format.packed_bytes())?, h)]);
+		}
+		let luma = (w.checked_mul(bps)?, h);
+		let cw = w.div_ceil(1 << sx);
+		let ch = h.div_ceil(1 << sy);
+		let chroma = (cw.checked_mul(bps)?, ch);
+		Some(match self.format {
+			PixelFormat::Gray => vec![luma],
+			PixelFormat::NV12 => vec![luma, (chroma.0.checked_mul(2)?, ch)],
+			PixelFormat::YUVA444 => vec![luma, chroma, chroma, luma],
+			_ => vec![luma, chroma, chroma],
+		})
+	}
+
 	/// Byte sizes of each plane for a `width` x `height` picture, or `None` if
 	/// the size does not fit in `usize`. Chroma dimensions round up, as with
 	/// FFmpeg's `AV_CEIL_RSHIFT`.
 	pub fn plane_sizes(&self, width: u32, height: u32) -> Option<Vec<usize>> {
-		let bps = self.bytes_per_sample();
-		let (sx, sy) = self.format.chroma_shift();
-		let pixels = (width as usize).checked_mul(height as usize)?;
-		if self.format.is_rgb() {
-			return Some(vec![pixels.checked_mul(self.format.packed_bytes())?]);
-		}
-		let luma = pixels.checked_mul(bps)?;
-		let cw = (width as usize).div_ceil(1 << sx);
-		let ch = (height as usize).div_ceil(1 << sy);
-		let chroma = cw.checked_mul(ch)?.checked_mul(bps)?;
-		Some(match self.format {
-			PixelFormat::Gray => vec![luma],
-			PixelFormat::NV12 => vec![luma, chroma.checked_mul(2)?],
-			PixelFormat::YUVA444 => vec![luma, chroma, chroma, luma],
-			_ => vec![luma, chroma, chroma],
-		})
+		self.plane_dims(width, height)?.into_iter().map(|(w, h)| w.checked_mul(h)).collect()
 	}
 
 	/// Total bytes of one packed-planar picture.

@@ -4,25 +4,35 @@ use crate::{
 	message::Result,
 };
 
-pub struct StepOutput<O, S> {
+/// What one decode or encode call produced.
+///
+/// The codec state stays in the caller's `&mut State`; it is not cloned
+/// into the result (that cost a deep copy of the decoder state, with its
+/// tables and buffers, on every packet).
+pub struct StepOutput<O> {
 	pub value: O,
+}
+
+pub type DecodeOut = StepOutput<Vec<Frame>>;
+pub type EncodeOut = StepOutput<Vec<Packet>>;
+
+pub struct FilterOut<S> {
+	pub value: Vec<Frame>,
 	pub state: S,
 }
 
-pub type DecodeOut<S> = StepOutput<Vec<Frame>, S>;
-pub type EncodeOut<S> = StepOutput<Vec<Packet>, S>;
-pub type FilterOut<S> = StepOutput<Vec<Frame>, S>;
-
-pub trait Decoder {
+/// `Send` so that a decoder can run on a pipeline thread.
+pub trait Decoder: Send {
 	fn create_state(&self, parameters: &Parameters) -> State;
-	fn decode(&self, state: &mut State, packet: Packet) -> Result<DecodeOut<State>>;
-	fn flush(&self, state: &mut State) -> Result<DecodeOut<State>>;
+	fn decode(&self, state: &mut State, packet: Packet) -> Result<DecodeOut>;
+	fn flush(&self, state: &mut State) -> Result<DecodeOut>;
 }
 
-pub trait Encoder {
+/// `Send` so that an encoder can run on a pipeline thread.
+pub trait Encoder: Send {
 	fn create_state(&self, parameters: &Parameters) -> State;
-	fn encode(&self, state: &mut State, frame: Frame) -> Result<EncodeOut<State>>;
-	fn flush(&self, state: &mut State) -> Result<EncodeOut<State>>;
+	fn encode(&self, state: &mut State, frame: Frame) -> Result<EncodeOut>;
+	fn flush(&self, state: &mut State) -> Result<EncodeOut>;
 }
 
 pub trait Filter {
@@ -39,7 +49,8 @@ pub trait Demuxer {
 	fn streams(&self) -> &StreamSet;
 }
 
-pub trait Muxer {
+/// `Send` so that muxing can run on a pipeline thread.
+pub trait Muxer: Send {
 	fn set_metadata(&mut self, metadata: Metadata) -> Result<()>;
 	fn metadata(&self) -> &Metadata;
 	fn add(&mut self, stream: &Stream) -> Result<usize>;

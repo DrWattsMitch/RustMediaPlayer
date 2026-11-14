@@ -44,7 +44,7 @@ use super::recon::Plane;
 use crate::codecs::bitstream::BitWriter;
 use crate::core::{
 	self, CodecPrivate, CodecState, EncodeOut, Frame, Packet, Parameters, Pixel, PixelFormat, State,
-	StreamId, TimeBase, VideoState,
+	StreamId, TimeBase, VideoFrame, VideoState,
 };
 use crate::message::{Message, Result};
 use macroblock::{PicEncoder, Reference, Source};
@@ -328,18 +328,22 @@ impl H264EncoderState {
 	}
 
 	/// Pads a planar 4:2:0 picture to whole macroblocks by edge
-	/// replication.
-	fn source(&self, data: &[u8]) -> Result<Source> {
+	/// replication. `planes` are (bytes, stride) of Y, Cb and Cr, each
+	/// starting at its first visible sample.
+	fn source(&self, planes: [(&[u8], usize); 3]) -> Result<Source> {
 		let (w, h) = (self.width as usize, self.height as usize);
 		let (cw, ch) = (w / 2, h / 2);
-		if data.len() < w * h + 2 * cw * ch {
+		let fits = |(data, stride): (&[u8], usize), pw: usize, ph: usize| {
+			stride >= pw && (ph == 0 || data.len() >= stride * (ph - 1) + pw)
+		};
+		if !(fits(planes[0], w, h) && fits(planes[1], cw, ch) && fits(planes[2], cw, ch)) {
 			return Err(Message::Codec("h264 encoder: frame data shorter than its yuv420p size"));
 		}
-		let pad = |plane: &[u8], pw: usize, ph: usize, ow: usize, oh: usize| -> Plane {
+		let pad = |(plane, stride): (&[u8], usize), pw: usize, ph: usize, ow: usize, oh: usize| {
 			let mut p = Plane::new(ow, oh, 0);
 			for y in 0..oh {
 				let sy = y.min(ph - 1);
-				let src = &plane[sy * pw..(sy + 1) * pw];
+				let src = &plane[sy * stride..sy * stride + pw];
 				let row = &mut p.data[y * ow..(y + 1) * ow];
 				row[..pw].copy_from_slice(src);
 				row[pw..].fill(src[pw - 1]);
@@ -347,19 +351,38 @@ impl H264EncoderState {
 			p
 		};
 		let (yw, yh) = (self.mb_w * 16, self.mb_h * 16);
-		let u0 = w * h;
-		let v0 = u0 + cw * ch;
 		Ok(Source {
-			y: pad(&data[..u0], w, h, yw, yh),
-			cb: pad(&data[u0..v0], cw, ch, yw / 2, yh / 2),
-			cr: pad(&data[v0..v0 + cw * ch], cw, ch, yw / 2, yh / 2),
+			y: pad(planes[0], w, h, yw, yh),
+			cb: pad(planes[1], cw, ch, yw / 2, yh / 2),
+			cr: pad(planes[2], cw, ch, yw / 2, yh / 2),
 		})
+	}
+
+	/// Like [`Self::encode_picture`], reading the planes of `frame` in
+	/// place (any stride, no packing copy).
+	pub fn encode_frame(&mut self, frame: &VideoFrame) -> Result<(Vec<u8>, bool)> {
+		let plane = |i: usize| frame.plane(i).map_or((&[][..], 0), |p| (p.bytes(), p.stride()));
+		let src = self.source([plane(0), plane(1), plane(2)])?;
+		self.encode_source(src)
 	}
 
 	/// Codes one picture; returns the access unit (length-prefixed NAL
 	/// units) and whether it is an IDR picture.
 	pub fn encode_picture(&mut self, data: &[u8]) -> Result<(Vec<u8>, bool)> {
-		let src = self.source(data)?;
+		let (w, h) = (self.width as usize, self.height as usize);
+		let (luma, chroma) = (w * h, (w / 2) * (h / 2));
+		if data.len() < luma + 2 * chroma {
+			return Err(Message::Codec("h264 encoder: frame data shorter than its yuv420p size"));
+		}
+		let src = self.source([
+			(&data[..luma], w),
+			(&data[luma..luma + chroma], w / 2),
+			(&data[luma + chroma..luma + 2 * chroma], w / 2),
+		])?;
+		self.encode_source(src)
+	}
+
+	fn encode_source(&mut self, src: Source) -> Result<(Vec<u8>, bool)> {
 		let idr = self.reference.is_none() || self.since_idr >= self.gop;
 		if idr {
 			self.since_idr = 0;
@@ -557,7 +580,7 @@ impl core::Encoder for H264Encoder {
 		})
 	}
 
-	fn encode(&self, state: &mut State, frame: Frame) -> Result<EncodeOut<State>> {
+	fn encode(&self, state: &mut State, frame: Frame) -> Result<EncodeOut> {
 		let Frame::Video(frame) = frame else {
 			return Err(Message::Codec("h264 encoder requires video frames"));
 		};
@@ -570,7 +593,7 @@ impl core::Encoder for H264Encoder {
 		if frame.width != enc.width || frame.height != enc.height {
 			return Err(Message::Codec("h264 encoder: frame size does not match the stream"));
 		}
-		let (data, idr) = enc.encode_picture(&frame.data)?;
+		let (data, idr) = enc.encode_frame(&frame)?;
 		let mut packet = Packet::new(self.stream_id, data);
 		packet.pts = frame.pts;
 		packet.dts = frame.pts;
@@ -578,11 +601,11 @@ impl core::Encoder for H264Encoder {
 		if let State::Video(v) = state {
 			v.has_keyframe |= idr;
 		}
-		Ok(EncodeOut { value: vec![packet], state: state.clone() })
+		Ok(EncodeOut { value: vec![packet] })
 	}
 
-	fn flush(&self, state: &mut State) -> Result<EncodeOut<State>> {
-		Ok(EncodeOut { value: Vec::new(), state: state.clone() })
+	fn flush(&self, _state: &mut State) -> Result<EncodeOut> {
+		Ok(EncodeOut { value: Vec::new() })
 	}
 }
 

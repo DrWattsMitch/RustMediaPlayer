@@ -2,7 +2,8 @@ use std::path::Path;
 
 use crate::message::Result;
 
-pub trait Io {
+/// `Send` so that an output can be written from a pipeline thread.
+pub trait Io: Send {
 	fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
 	fn write(&mut self, buf: &[u8]) -> Result<usize>;
 	// fn write_all(&mut self, buf: &[u8]) -> Result<()>;

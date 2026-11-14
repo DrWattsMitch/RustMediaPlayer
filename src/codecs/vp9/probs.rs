@@ -122,7 +122,82 @@ pub struct Counts {
 	pub mv: [MvComponentCounts; 2],
 }
 
+/// Element-wise sum of count arrays (tile threads count separately).
+trait AddCounts {
+	fn add_counts(&mut self, other: &Self);
+}
+
+impl AddCounts for u32 {
+	fn add_counts(&mut self, other: &Self) {
+		*self += *other;
+	}
+}
+
+impl<T: AddCounts, const N: usize> AddCounts for [T; N] {
+	fn add_counts(&mut self, other: &Self) {
+		for (a, b) in self.iter_mut().zip(other) {
+			a.add_counts(b);
+		}
+	}
+}
+
+impl AddCounts for MvComponentCounts {
+	fn add_counts(&mut self, o: &Self) {
+		self.sign.add_counts(&o.sign);
+		self.classes.add_counts(&o.classes);
+		self.class0.add_counts(&o.class0);
+		self.bits.add_counts(&o.bits);
+		self.class0_fp.add_counts(&o.class0_fp);
+		self.fp.add_counts(&o.fp);
+		self.class0_hp.add_counts(&o.class0_hp);
+		self.hp.add_counts(&o.hp);
+	}
+}
+
 impl Counts {
+	/// Adds another tile's counts (the frame's counts are the sum over its
+	/// tiles, whatever order they were decoded in).
+	pub fn add(&mut self, o: &Counts) {
+		// Destructuring makes a new field a compile error here, not a
+		// silently dropped count.
+		let Counts {
+			y_mode,
+			uv_mode,
+			partition,
+			coef,
+			eob_branch,
+			skip,
+			inter_mode,
+			interp_filter,
+			intra_inter,
+			comp_inter,
+			single_ref,
+			comp_ref,
+			tx8,
+			tx16,
+			tx32,
+			mv_joints,
+			mv,
+		} = self;
+		y_mode.add_counts(&o.y_mode);
+		uv_mode.add_counts(&o.uv_mode);
+		partition.add_counts(&o.partition);
+		coef.add_counts(&o.coef);
+		eob_branch.add_counts(&o.eob_branch);
+		skip.add_counts(&o.skip);
+		inter_mode.add_counts(&o.inter_mode);
+		interp_filter.add_counts(&o.interp_filter);
+		intra_inter.add_counts(&o.intra_inter);
+		comp_inter.add_counts(&o.comp_inter);
+		single_ref.add_counts(&o.single_ref);
+		comp_ref.add_counts(&o.comp_ref);
+		tx8.add_counts(&o.tx8);
+		tx16.add_counts(&o.tx16);
+		tx32.add_counts(&o.tx32);
+		mv_joints.add_counts(&o.mv_joints);
+		mv.add_counts(&o.mv);
+	}
+
 	/// Counts a decoded motion vector difference (libvpx `vp9_inc_mv`):
 	/// the high-precision bit is counted even when it was not coded (it
 	/// then reads as 1), as libvpx does.

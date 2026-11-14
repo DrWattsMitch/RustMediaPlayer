@@ -99,7 +99,8 @@ pub fn main() -> Result<()> {
 				Frame::Video(v) => {
 					*pictures += 1;
 					if let Some(w) = video_out.as_mut() {
-						w.write_all(&v.data)?;
+						// Straight from the decoder's planes, row by row.
+						v.write_packed(w)?;
 					}
 				}
 			}

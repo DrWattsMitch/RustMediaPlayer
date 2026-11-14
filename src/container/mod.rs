@@ -1,3 +1,5 @@
+pub mod ac3;
+pub mod adts;
 mod detect;
 pub mod flac;
 pub mod mkv;

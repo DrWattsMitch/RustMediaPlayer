@@ -1,4 +1,4 @@
-use crate::codecs::{aac, adpcm, flac, h264, mp3, opus, pcm, raw, vorbis, vp9};
+use crate::codecs::{aac, ac3, adpcm, flac, h264, mp3, opus, pcm, raw, vorbis, vp9};
 use crate::core::{CodecId, Decoder, Demuxer, Encoder, Muxer, Stream};
 
 #[derive(Debug, Clone, Default)]
@@ -32,8 +32,21 @@ impl Resolver {
 	pub fn has_decoder(&self, codec: &str) -> bool {
 		pcm::PcmCodec::from_id(codec).is_some()
 			|| adpcm::AdpcmDecoder::for_id(codec).is_some()
-			|| matches!(codec, "mp3" | "aac" | "h264" | "flac" | "opus" | "vorbis" | "vp9" | "rawvideo")
-			|| crate::core::Pixel::from_name(codec).is_some()
+			|| (cfg!(feature = "av1") && codec == "av1")
+			|| matches!(
+				codec,
+				"mp3"
+					| "aac"
+					| "ac3"
+					| "eac3"
+					| "h264"
+					| "hevc"
+					| "flac"
+					| "opus"
+					| "vorbis"
+					| "vp9"
+					| "rawvideo"
+			) || crate::core::Pixel::from_name(codec).is_some()
 	}
 
 	/// Picks a decoder by codec id. Codecs without a dedicated decoder fall
@@ -49,7 +62,11 @@ impl Resolver {
 		match id {
 			"mp3" => Some(Box::new(mp3::Mp3Decoder::new())),
 			"aac" => Some(Box::new(aac::AacDecoder::new())),
+			"ac3" | "eac3" => Some(Box::new(ac3::Ac3Decoder::new())),
+			#[cfg(feature = "av1")]
+			"av1" => Some(Box::new(crate::codecs::av1::Av1Decoder::new())),
 			"h264" => Some(Box::new(h264::H264Decoder::new())),
+			"hevc" => Some(Box::new(crate::codecs::hevc::HevcDecoder::new())),
 			"flac" => Some(Box::new(flac::FlacDecoder::new())),
 			"opus" => Some(Box::new(opus::OpusDecoder::new())),
 			"vorbis" => Some(Box::new(vorbis::VorbisDecoder::new())),

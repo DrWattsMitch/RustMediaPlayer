@@ -26,7 +26,7 @@ fn decode(path: &str, kind: StreamKind) -> (Vec<u8>, Vec<bool>, rmp::core::Strea
 		for f in frames {
 			match f {
 				Frame::Audio(a) => out.extend_from_slice(&a.data),
-				Frame::Video(v) => out.extend_from_slice(&v.data),
+				Frame::Video(v) => out.extend_from_slice(&v.data()),
 			}
 		}
 	};
@@ -145,13 +145,8 @@ fn encoders_reject_bad_input_without_panicking() {
 	let ok = Stream::video(StreamId(0), 32, 16, "yuv420p", CodecId::new("h264"));
 	let mut state = enc.create_state(&ok.parameters);
 	let yuv444 = Pixel::from_name("yuv444p").unwrap();
-	let frame = |pixel: Pixel, len: usize| VideoFrame {
-		data: vec![128; len],
-		width: 32,
-		height: 16,
-		pixel,
-		keyframe: rmp::core::Keyframe::Key,
-		pts: None,
+	let frame = |pixel: Pixel, len: usize| {
+		VideoFrame::from_packed(vec![128; len], 32, 16, pixel, rmp::core::Keyframe::Key, None)
 	};
 	assert!(enc.encode(&mut state, Frame::Video(frame(yuv444, 32 * 16 * 3))).is_err());
 	let yuv420 = Pixel::from_name("yuv420p").unwrap();

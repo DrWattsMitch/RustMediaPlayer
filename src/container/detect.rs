@@ -1,4 +1,6 @@
 use crate::Message;
+use crate::container::ac3;
+use crate::container::adts;
 use crate::container::flac;
 use crate::container::mkv;
 use crate::container::mp3;
@@ -35,6 +37,18 @@ pub fn detect(data: &[u8], io: Box<dyn Io>) -> Result<Box<dyn Demuxer>> {
 
 	if mp4::Mp4Probe::demuxer_matches(data) {
 		return mp4::Mp4Probe::create_demuxer(io);
+	}
+
+	// AC-3's 16-bit sync word is stronger than MPEG audio's, and the probe
+	// demands a run of consistent syncframes.
+	if ac3::Ac3Probe::demuxer_matches(data) {
+		return ac3::Ac3Probe::create_demuxer(io);
+	}
+
+	// ADTS shares MPEG audio's 0xFFF sync; its probe needs three
+	// consistent headers, and MP3 layer bits never match ADTS's layer 0.
+	if adts::AdtsProbe::demuxer_matches(data) {
+		return adts::AdtsProbe::create_demuxer(io);
 	}
 
 	// MPEG audio has no magic number (only an 11-bit sync word), so it is

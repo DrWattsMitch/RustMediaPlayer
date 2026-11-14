@@ -92,7 +92,7 @@ impl core::Decoder for PcmDecoder {
 		})
 	}
 
-	fn decode(&self, state: &mut State, packet: Packet) -> Result<DecodeOut<State>> {
+	fn decode(&self, state: &mut State, packet: Packet) -> Result<DecodeOut> {
 		let State::Audio(audio) = state else {
 			return Err(Message::Codec("pcm decoder requires an audio state"));
 		};
@@ -118,11 +118,11 @@ impl core::Decoder for PcmDecoder {
 			frames.push(Frame::Audio(frame));
 		}
 		audio.samples_consumed += packet.data.len() as u64;
-		Ok(DecodeOut { value: frames, state: state.clone() })
+		Ok(DecodeOut { value: frames })
 	}
 
-	fn flush(&self, state: &mut State) -> Result<DecodeOut<State>> {
-		Ok(DecodeOut { value: Vec::new(), state: state.clone() })
+	fn flush(&self, _state: &mut State) -> Result<DecodeOut> {
+		Ok(DecodeOut { value: Vec::new() })
 	}
 }
 

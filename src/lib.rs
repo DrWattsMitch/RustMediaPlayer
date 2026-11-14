@@ -1,5 +1,6 @@
 #![allow(clippy::module_inception, clippy::collapsible_if)]
-// `unsafe` lives only in the audited `simd` module (see its docs).
+// `unsafe` lives only in the audited `simd` module (see its docs) and in
+// `codecs::av1::dav1d`, the FFI boundary to rav1d.
 #![deny(unsafe_code)]
 pub mod codecs;
 pub mod container;

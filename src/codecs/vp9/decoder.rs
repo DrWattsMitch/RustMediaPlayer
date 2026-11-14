@@ -19,20 +19,26 @@ use super::tables::{AC_QLOOKUP, DC_QLOOKUP, KF_PARTITION_PROBS};
 use super::transform;
 use super::{Mv, PARTITION_CONTEXT, PARTITION_TREE, SS_SIZE, SUBSIZE, bs, uv_tx_size};
 use crate::core::{
-	self, CodecPrivate, CodecState, DecodeOut, Frame, Keyframe, Packet, Parameters, State,
-	VideoFrame, VideoState, video,
+	self, BufferPool, CodecPrivate, CodecState, DecodeOut, Frame, FrameBuffer, Keyframe, Packet,
+	Parameters, PlaneRef, Pooled, State, VideoFrame, VideoState, video,
 };
 use crate::message::{Message, Result};
+
+#[path = "tile_threads.rs"]
+mod tile_threads;
+use tile_threads::TilePool;
 
 fn corrupt(what: &'static str) -> Message {
 	Message::Codec(what)
 }
 
 /// One plane of a picture. The buffer covers whole superblocks, so blocks
-/// that cross the picture's edge can be written in full.
+/// that cross the picture's edge can be written in full. The samples come
+/// from the decoder's [`BufferPool`] and go back to it when the last
+/// reference to the picture (slot or output frame) is dropped.
 #[derive(Debug, Clone)]
 pub struct Plane {
-	pub data: Vec<u8>,
+	pub data: Pooled<u8>,
 	pub stride: usize,
 	/// Visible size.
 	pub width: usize,
@@ -56,14 +62,14 @@ pub struct Picture {
 }
 
 impl Picture {
-	fn new(width: u32, height: u32, ss_x: usize, ss_y: usize) -> Self {
+	fn new(pool: &BufferPool, width: u32, height: u32, ss_x: usize, ss_y: usize) -> Self {
 		let (w, h) = (width as usize, height as usize);
 		let (aw, ah) = (w.next_multiple_of(8), h.next_multiple_of(8));
 		let (sw, sh) = (w.next_multiple_of(64), h.next_multiple_of(64));
 		let plane = |sx: usize, sy: usize| {
 			let stride = sw >> sx;
 			Plane {
-				data: vec![0u8; stride * (sh >> sy)],
+				data: pool.take_filled(stride * (sh >> sy), 0),
 				stride,
 				width: (w + sx) >> sx,
 				height: (h + sy) >> sy,
@@ -80,6 +86,41 @@ impl Picture {
 			key_frame: false,
 			rgb: false,
 		}
+	}
+
+	/// The visible picture as an output frame. YUV planes are views into
+	/// this picture (no copy); sRGB pictures (planes G, B, R) are packed
+	/// into RGB24, which needs one pass over the samples.
+	pub fn to_frame(
+		self: &Arc<Self>,
+		pixel: video::Pixel,
+		pts: Option<crate::core::Time>,
+	) -> VideoFrame {
+		let keyframe = if self.key_frame { Keyframe::Key } else { Keyframe::NonKey };
+		if self.rgb {
+			return VideoFrame::from_packed(
+				self.to_bytes(),
+				self.width,
+				self.height,
+				pixel,
+				keyframe,
+				pts,
+			);
+		}
+		fn plane0(p: &Picture) -> &[u8] {
+			&p.planes[0].data
+		}
+		fn plane1(p: &Picture) -> &[u8] {
+			&p.planes[1].data
+		}
+		fn plane2(p: &Picture) -> &[u8] {
+			&p.planes[2].data
+		}
+		let project: [fn(&Picture) -> &[u8]; 3] = [plane0, plane1, plane2];
+		let planes = self.planes.iter().zip(project).filter_map(|(p, f)| {
+			PlaneRef::new(FrameBuffer::project(self.clone(), f), 0, p.stride, p.width, p.height)
+		});
+		VideoFrame::from_planes(planes, self.width, self.height, pixel, keyframe, pts)
 	}
 
 	/// The visible picture as planar 8-bit YUV, or packed RGB24 for sRGB
@@ -146,7 +187,8 @@ pub struct FrameDecoder {
 	pub mi_rows: usize,
 	pub mi_cols: usize,
 	pub mi: Vec<ModeInfo>,
-	lf_levels: Vec<u8>,
+	/// Loop filter inputs per 8x8 cell.
+	lf_cells: Vec<loopfilter::LfCell>,
 	pub cur_mvs: Vec<MvRef>,
 	pub prev_mvs: Option<Arc<Vec<MvRef>>>,
 	pub seg_map: Vec<u8>,
@@ -173,8 +215,8 @@ impl FrameDecoder {
 		if plane == 0 { (0, 0) } else { (self.pic.ss_x, self.pic.ss_y) }
 	}
 
-	/// Decodes every tile (`decode_tiles`); `data` follows the headers.
-	fn decode_tiles(&mut self, data: &[u8]) -> Result<()> {
+	/// Splits the tile data into one buffer per tile, in raster order.
+	fn split_tiles<'d>(&self, data: &'d [u8]) -> Result<Vec<&'d [u8]>> {
 		let tile_cols = 1usize << self.h.log2_tile_cols;
 		let tile_rows = 1usize << self.h.log2_tile_rows;
 		let mut buffers: Vec<&[u8]> = Vec::with_capacity(tile_cols * tile_rows);
@@ -191,6 +233,58 @@ impl FrameDecoder {
 			buffers.push(tile);
 			at += size;
 		}
+		Ok(buffers)
+	}
+
+	/// Mode-info rows of tile row `tile_row`.
+	fn tile_mi_rows(&self, tile_row: usize) -> (usize, usize) {
+		(
+			tile_offset(tile_row, self.mi_rows, self.h.log2_tile_rows),
+			tile_offset(tile_row + 1, self.mi_rows, self.h.log2_tile_rows),
+		)
+	}
+
+	/// Mode-info columns of tile column `tile_col`.
+	fn tile_mi_cols(&self, tile_col: usize) -> (usize, usize) {
+		(
+			tile_offset(tile_col, self.mi_cols, self.h.log2_tile_cols),
+			tile_offset(tile_col + 1, self.mi_cols, self.h.log2_tile_cols),
+		)
+	}
+
+	/// Decodes one superblock row of one tile.
+	fn decode_sb_row(
+		&mut self,
+		r: &mut BoolDecoder,
+		rows: (usize, usize),
+		tile_col: usize,
+		mi_row: usize,
+	) -> Result<()> {
+		let cols = self.tile_mi_cols(tile_col);
+		self.tile = TileBounds {
+			mi_row_start: rows.0,
+			mi_row_end: rows.1,
+			mi_col_start: cols.0,
+			mi_col_end: cols.1,
+		};
+		self.left_nz = [[0; 16]; 3];
+		self.left_partition = [0; 8];
+		let mut mi_col = self.tile.mi_col_start;
+		while mi_col < self.tile.mi_col_end {
+			self.decode_partition(r, mi_row, mi_col, bs::B64X64, 4)?;
+			mi_col += 8;
+		}
+		if r.overrun() {
+			return Err(corrupt("vp9: truncated tile data"));
+		}
+		Ok(())
+	}
+
+	/// Decodes every tile (`decode_tiles`); `data` follows the headers.
+	fn decode_tiles(&mut self, data: &[u8]) -> Result<()> {
+		let tile_cols = 1usize << self.h.log2_tile_cols;
+		let tile_rows = 1usize << self.h.log2_tile_rows;
+		let buffers = self.split_tiles(data)?;
 		for tile_row in 0..tile_rows {
 			let mut readers: Vec<BoolDecoder> = (0..tile_cols)
 				.map(|c| {
@@ -198,29 +292,11 @@ impl FrameDecoder {
 						.ok_or(corrupt("vp9: tile marker bit set"))
 				})
 				.collect::<Result<_>>()?;
-			let rows = (
-				tile_offset(tile_row, self.mi_rows, self.h.log2_tile_rows),
-				tile_offset(tile_row + 1, self.mi_rows, self.h.log2_tile_rows),
-			);
+			let rows = self.tile_mi_rows(tile_row);
 			let mut mi_row = rows.0;
 			while mi_row < rows.1 {
 				for (tile_col, r) in readers.iter_mut().enumerate() {
-					self.tile = TileBounds {
-						mi_row_start: rows.0,
-						mi_row_end: rows.1,
-						mi_col_start: tile_offset(tile_col, self.mi_cols, self.h.log2_tile_cols),
-						mi_col_end: tile_offset(tile_col + 1, self.mi_cols, self.h.log2_tile_cols),
-					};
-					self.left_nz = [[0; 16]; 3];
-					self.left_partition = [0; 8];
-					let mut mi_col = self.tile.mi_col_start;
-					while mi_col < self.tile.mi_col_end {
-						self.decode_partition(r, mi_row, mi_col, bs::B64X64, 4)?;
-						mi_col += 8;
-					}
-					if r.overrun() {
-						return Err(corrupt("vp9: truncated tile data"));
-					}
+					self.decode_sb_row(r, rows, tile_col, mi_row)?;
 				}
 				mi_row += 8;
 			}
@@ -366,11 +442,11 @@ impl FrameDecoder {
 			}
 		}
 
-		let level = loopfilter::level(&self.lf_table, &mi);
+		let cell = loopfilter::LfCell::new(&mi, loopfilter::level(&self.lf_table, &mi));
 		for y in 0..p.y_mis {
 			let at = (mi_row + y) * self.mi_cols + mi_col;
 			self.mi[at..at + p.x_mis].fill(mi);
-			self.lf_levels[at..at + p.x_mis].fill(level);
+			self.lf_cells[at..at + p.x_mis].fill(cell);
 		}
 		Ok(())
 	}
@@ -579,26 +655,31 @@ impl FrameDecoder {
 		let thr = loopfilter::thresholds(self.h.sharpness);
 		let mut mi_row = 0;
 		while mi_row < self.mi_rows {
-			let mut mi_col = 0;
-			while mi_col < self.mi_cols {
-				for plane in 0..3 {
-					let (sx, sy) = self.plane_ss(plane);
-					loopfilter::filter_superblock(
-						&mut self.pic.planes[plane],
-						&self.mi,
-						&self.lf_levels,
-						self.mi_rows,
-						self.mi_cols,
-						mi_row,
-						mi_col,
-						sx,
-						sy,
-						&thr,
-					);
-				}
-				mi_col += 8;
-			}
+			self.filter_sb_row(mi_row, &thr);
 			mi_row += 8;
+		}
+	}
+
+	/// Loop-filters one superblock row. Rows must be filtered top to
+	/// bottom; row `r` reads only rows `r - 1` (already filtered) and `r`.
+	fn filter_sb_row(&mut self, mi_row: usize, thr: &[loopfilter::Thresholds; 64]) {
+		let mut mi_col = 0;
+		while mi_col < self.mi_cols {
+			for plane in 0..3 {
+				let (sx, sy) = self.plane_ss(plane);
+				loopfilter::filter_superblock(
+					&mut self.pic.planes[plane],
+					&self.lf_cells,
+					self.mi_rows,
+					self.mi_cols,
+					mi_row,
+					mi_col,
+					sx,
+					sy,
+					thr,
+				);
+			}
+			mi_col += 8;
 		}
 	}
 }
@@ -639,6 +720,42 @@ pub struct Vp9DecoderState {
 	prev_mvs: Option<Arc<Vec<MvRef>>>,
 	seg_maps: [Arc<Vec<u8>>; 2],
 	frames_decoded: u64,
+	/// Tile / row threads (FFmpeg `thread_type=slice`); 0 or 1 decodes on
+	/// the calling thread.
+	threads: usize,
+	/// Per-tile-column buffers reused from frame to frame.
+	tile_pool: TilePool,
+	/// Picture planes, recycled once no slot or output frame uses them.
+	planes: BufferPool,
+	/// Per-frame arrays reused from frame to frame.
+	scratch: FrameScratch,
+	/// Also pipeline decode and loop filter for single-tile-column frames.
+	/// Off by default: the filter is only ~20% of the work and the row
+	/// hand-over costs about as much (see `docs/THREADING.md`).
+	row_pipeline: bool,
+}
+
+/// Per-frame arrays kept between frames so decoding a frame doesn't
+/// allocate them. Cloning a decoder state gives the clone empty ones.
+#[derive(Debug, Default)]
+struct FrameScratch {
+	mi: Vec<ModeInfo>,
+	lf_cells: Vec<loopfilter::LfCell>,
+	mvs: Vec<MvRef>,
+}
+
+impl Clone for FrameScratch {
+	fn clone(&self) -> Self {
+		Self::default()
+	}
+}
+
+/// `v` emptied and refilled with `len` copies of `value`, keeping its
+/// allocation.
+fn refill<T: Clone>(mut v: Vec<T>, len: usize, value: T) -> Vec<T> {
+	v.clear();
+	v.resize(len, value);
+	v
 }
 
 impl RefInfo for Vp9DecoderState {
@@ -652,10 +769,34 @@ impl Vp9DecoderState {
 		Self::default()
 	}
 
+	/// Like [`Self::new`], decoding tile columns on up to `threads` threads
+	/// while the loop filter follows row by row. Output is identical for
+	/// every thread count.
+	pub fn with_threads(threads: usize) -> Self {
+		Self { threads: threads.clamp(1, crate::codecs::threading::MAX_THREADS), ..Self::default() }
+	}
+
+	pub fn threads(&self) -> usize {
+		self.threads.max(1)
+	}
+
+	/// Allocation counters of the picture-plane pool (see
+	/// [`crate::codecs::h264::H264DecoderState::pool_stats`]).
+	pub fn pool_stats(&self) -> crate::core::PoolStats {
+		self.planes.stats()
+	}
+
+	/// Runs the loop filter on its own thread, one superblock row behind
+	/// decoding, even when a frame has a single tile column.
+	pub fn with_row_pipeline(mut self, on: bool) -> Self {
+		self.row_pipeline = on;
+		self
+	}
+
 	/// Forgets every reference (after a seek, decoding restarts at the next
 	/// key frame).
 	pub fn reset(&mut self) {
-		*self = Self::default();
+		*self = Self::with_threads(self.threads).with_row_pipeline(self.row_pipeline);
 	}
 
 	/// Decodes one packet (a frame or a superframe); returns the pictures
@@ -742,9 +883,11 @@ impl Vp9DecoderState {
 			fc,
 			mi_rows,
 			mi_cols,
-			mi: vec![ModeInfo::default(); cells],
-			lf_levels: vec![0; cells],
-			cur_mvs: vec![MvRef::default(); cells],
+			// Allocated by whichever path decodes the tiles (the threaded one
+			// keeps mode info in its tile workspaces only).
+			mi: Vec::new(),
+			lf_cells: refill(std::mem::take(&mut self.scratch.lf_cells), cells, Default::default()),
+			cur_mvs: refill(std::mem::take(&mut self.scratch.mvs), cells, MvRef::default()),
 			prev_mvs: if use_prev { self.prev_mvs.clone().filter(|m| m.len() == cells) } else { None },
 			seg_map: (*self.seg_maps[0]).clone(),
 			last_seg_map: self.seg_maps[1].clone(),
@@ -758,7 +901,7 @@ impl Vp9DecoderState {
 			left_nz: [[0; 16]; 3],
 			above_partition: vec![0; mi_cols.next_multiple_of(8) + 8],
 			left_partition: [0; 8],
-			pic: Picture::new(h.width, h.height, ss_x, ss_y),
+			pic: Picture::new(&self.planes, h.width, h.height, ss_x, ss_y),
 			refs,
 			dequant: [[[0; 2]; 2]; 8],
 			lf_table: [[[0; 2]; 4]; 8],
@@ -768,9 +911,16 @@ impl Vp9DecoderState {
 			h,
 		};
 		fd.setup_segment_tables(&self.persistent);
-		fd.decode_tiles(&data[end..])?;
-		if fd.h.filter_level != 0 {
-			fd.loop_filter();
+		let threads = self.threads.max(1);
+		if threads > 1 && (fd.h.log2_tile_cols > 0 || (self.row_pipeline && fd.h.filter_level != 0)) {
+			// Tile columns on worker threads, loop filter here, row by row.
+			fd.decode_tiles_threaded(&data[end..], threads, &mut self.tile_pool)?;
+		} else {
+			fd.mi = refill(std::mem::take(&mut self.scratch.mi), cells, ModeInfo::default());
+			fd.decode_tiles(&data[end..])?;
+			if fd.h.filter_level != 0 {
+				fd.loop_filter();
+			}
 		}
 
 		// Backward adaptation, then save the context.
@@ -789,7 +939,9 @@ impl Vp9DecoderState {
 			self.persistent.contexts[h.context_idx] = fd.fc.clone();
 		}
 
-		let mut pic = fd.pic;
+		let FrameDecoder { mut pic, mi, lf_cells, cur_mvs, seg_map, seg, h, .. } = fd;
+		self.scratch.mi = mi;
+		self.scratch.lf_cells = lf_cells;
 		pic.key_frame = h.key_frame;
 		pic.rgb = h.color.color_space == 7;
 		let pic = Arc::new(pic);
@@ -798,10 +950,16 @@ impl Vp9DecoderState {
 				*slot = Some(pic.clone());
 			}
 		}
-		if fd.seg.enabled {
-			self.seg_maps = [self.seg_maps[1].clone(), Arc::new(fd.seg_map)];
+		if seg.enabled {
+			self.seg_maps = [self.seg_maps[1].clone(), Arc::new(seg_map)];
 		}
-		self.prev_mvs = Some(Arc::new(fd.cur_mvs));
+		// The motion vectors two frames back are no longer needed: reuse
+		// their array if nothing else holds it.
+		if let Some(old) = self.prev_mvs.replace(Arc::new(cur_mvs)) {
+			if let Ok(v) = Arc::try_unwrap(old) {
+				self.scratch.mvs = v;
+			}
+		}
 		self.last_show_frame = h.show_frame;
 		self.last_size = (h.width, h.height);
 		self.last_key_frame = h.key_frame;
@@ -894,16 +1052,20 @@ impl core::Decoder for Vp9Decoder {
 				dts: None,
 				last_pts: None,
 			},
-			private: CodecPrivate::Vp9(Box::default()),
+			private: CodecPrivate::Vp9(Box::new(Vp9DecoderState::with_threads(
+				crate::codecs::threading::default_threads(),
+			))),
 		})
 	}
 
-	fn decode(&self, state: &mut State, packet: Packet) -> Result<DecodeOut<State>> {
+	fn decode(&self, state: &mut State, packet: Packet) -> Result<DecodeOut> {
 		let State::Video(video) = state else {
 			return Err(Message::Codec("vp9 decoder requires a video state"));
 		};
 		if !matches!(video.private, CodecPrivate::Vp9(_)) {
-			video.private = CodecPrivate::Vp9(Box::default());
+			video.private = CodecPrivate::Vp9(Box::new(Vp9DecoderState::with_threads(
+				crate::codecs::threading::default_threads(),
+			)));
 		}
 		let CodecPrivate::Vp9(dec) = &mut video.private else {
 			return Err(Message::Codec("vp9 decoder state missing"));
@@ -916,19 +1078,12 @@ impl core::Decoder for Vp9Decoder {
 			video.height = pic.height;
 			video.pixel = pixel.clone();
 			video.has_keyframe |= pic.key_frame;
-			frames.push(Frame::Video(VideoFrame {
-				data: pic.to_bytes(),
-				width: pic.width,
-				height: pic.height,
-				pixel,
-				keyframe: if pic.key_frame { Keyframe::Key } else { Keyframe::NonKey },
-				pts: packet.pts,
-			}));
+			frames.push(Frame::Video(pic.to_frame(pixel, packet.pts)));
 		}
-		Ok(DecodeOut { value: frames, state: state.clone() })
+		Ok(DecodeOut { value: frames })
 	}
 
-	fn flush(&self, state: &mut State) -> Result<DecodeOut<State>> {
-		Ok(DecodeOut { value: Vec::new(), state: state.clone() })
+	fn flush(&self, _state: &mut State) -> Result<DecodeOut> {
+		Ok(DecodeOut { value: Vec::new() })
 	}
 }

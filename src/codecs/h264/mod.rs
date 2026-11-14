@@ -42,7 +42,7 @@ pub mod params;
 mod recon;
 mod simd;
 pub mod slice;
-mod tables;
+pub(crate) mod tables;
 
 pub use decoder::{DecodedPicture, H264Decoder, H264DecoderState};
 pub use encoder::{H264Encoder, H264EncoderState};

@@ -65,9 +65,9 @@ fn run(w: usize, h: usize, frames: usize, mode: RateMode, gop: u32) -> (usize, f
 		let out = dec.decode_packet(&au, None).expect("decodes");
 		assert_eq!(out.len(), 1, "frame {t}: decoder output count");
 		assert_eq!(dec.damaged_slices, 0, "frame {t}");
-		assert_eq!(out[0].data.len(), mine.len());
-		if out[0].data != mine {
-			let first = out[0].data.iter().zip(&mine).position(|(a, b)| a != b).unwrap_or(0);
+		assert_eq!(out[0].data().len(), mine.len());
+		if out[0].data() != mine {
+			let first = out[0].data().iter().zip(&mine).position(|(a, b)| a != b).unwrap_or(0);
 			panic!(
 				"frame {t} ({w}x{h}): decoder differs from encoder reconstruction at byte {first} (x {}, y {})",
 				first % w,

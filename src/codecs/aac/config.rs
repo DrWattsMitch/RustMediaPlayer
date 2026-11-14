@@ -61,9 +61,13 @@ pub struct AacConfig {
 	/// Channel layout in bitstream element order.
 	pub layout: Vec<ElementSlot>,
 	pub channels: u8,
-	/// `true` when the stream signals SBR/PS (HE-AAC). Only the AAC-LC core
-	/// is decoded, at the core sample rate.
-	pub sbr: bool,
+	/// SBR signalling as FFmpeg tracks it: 1 explicit (HE-AAC), 0 absent,
+	/// -1 unknown (implicit signalling: SBR may appear in the first frame).
+	pub sbr: i8,
+	/// Parametric stereo signalling, same convention as [`Self::sbr`].
+	pub ps: i8,
+	/// Output rate of explicit SBR (0 when not signalled).
+	pub ext_sample_rate: u32,
 }
 
 impl AacConfig {
@@ -106,7 +110,19 @@ impl AacConfig {
 		if channels == 0 || channels > 8 {
 			return None;
 		}
-		Some(Self { object_type, sample_rate_index, sample_rate, layout, channels, sbr: false })
+		// Implicit SBR/PS stays possible until the first frame says otherwise
+		// (FFmpeg sets both to -1 for ADTS and for AAC-LC configs).
+		let ps = if channels == 1 && object_type == AOT_AAC_LC { -1 } else { 0 };
+		Some(Self {
+			object_type,
+			sample_rate_index,
+			sample_rate,
+			layout,
+			channels,
+			sbr: -1,
+			ps,
+			ext_sample_rate: 0,
+		})
 	}
 
 	/// Finds the layout slot for the `nth` element of `kind` with `tag`.
@@ -148,11 +164,14 @@ pub fn parse_audio_specific_config(data: &[u8]) -> Option<AacConfig> {
 	let mut aot = object_type(&mut bs);
 	let mut rate_index = sample_rate_index(&mut bs)?;
 	let channel_config = bs.bits(4) as u8;
-	let mut sbr = false;
+	let (mut sbr, mut ps, mut ext_rate) = (-1i8, -1i8, 0u32);
 	if aot == AOT_SBR || aot == AOT_PS {
-		sbr = true;
+		if aot == AOT_PS {
+			ps = 1;
+		}
+		sbr = 1;
 		// Extension (output) rate, then the core object type.
-		sample_rate_index(&mut bs)?;
+		ext_rate = explicit_rate(&mut bs)?;
 		aot = object_type(&mut bs);
 	}
 	if !matches!(aot, AOT_AAC_MAIN | AOT_AAC_LC | 3 | 4) {
@@ -179,8 +198,52 @@ pub fn parse_audio_specific_config(data: &[u8]) -> Option<AacConfig> {
 	if bs.overrun() {
 		return None;
 	}
+	// Backward-compatible explicit signalling: a sync extension after the
+	// GASpecificConfig (ISO/IEC 14496-3 §1.6.5.2; FFmpeg `mpeg4audio.c`).
+	if sbr != 1 {
+		while bs.bits_left() > 15 {
+			if bs.peek(11) == 0x2b7 {
+				bs.skip(11);
+				let ext_aot = object_type(&mut bs);
+				if ext_aot == AOT_SBR {
+					sbr = i8::from(bs.bit());
+					if sbr == 1 {
+						ext_rate = explicit_rate(&mut bs)?;
+						if ext_rate == config.sample_rate {
+							sbr = -1;
+						}
+					}
+				}
+				if bs.bits_left() > 11 && bs.bits(11) == 0x548 {
+					ps = i8::from(bs.bit());
+				}
+				break;
+			}
+			bs.skip(1);
+		}
+	}
+	if sbr == 0 {
+		ps = 0;
+	}
+	if (ps == -1 && aot != AOT_AAC_LC) || config.channels > 1 {
+		ps = 0;
+	}
+	if config.channels == 1 && sbr == 1 && ps == -1 {
+		ps = 1;
+	}
 	config.sbr = sbr;
+	config.ps = ps;
+	config.ext_sample_rate = if sbr == 1 { ext_rate } else { 0 };
 	Some(config)
+}
+
+/// A sampling rate written as an index (or a 24-bit escape) in Hz.
+fn explicit_rate(bs: &mut BitReader) -> Option<u32> {
+	let index = bs.bits(4) as usize;
+	if index == 15 {
+		return Some(bs.bits(24));
+	}
+	SAMPLE_RATES.get(index).copied()
 }
 
 /// Parses a program_config_element (Table 4.2) into an element layout.
@@ -289,14 +352,14 @@ mod tests {
 		// AAC-LC, 44.1 kHz, stereo: 00010 0100 0010 000
 		let c = parse_audio_specific_config(&[0x12, 0x10]).unwrap();
 		assert_eq!((c.object_type, c.sample_rate, c.channels), (2, 44100, 2));
-		assert!(!c.sbr);
+		assert_eq!(c.sbr, -1);
 	}
 
 	#[test]
 	fn parses_he_aac_asc() {
 		// AOT 5, 24 kHz core, stereo, 48 kHz extension, AOT 2.
 		let c = parse_audio_specific_config(&[0x2B, 0x11, 0x88, 0x00]).unwrap();
-		assert!(c.sbr);
+		assert_eq!((c.sbr, c.ext_sample_rate), (1, 48000));
 		assert_eq!((c.sample_rate, c.channels), (24000, 2));
 	}
 

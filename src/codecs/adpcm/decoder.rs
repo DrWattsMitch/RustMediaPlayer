@@ -57,7 +57,7 @@ impl core::Decoder for AdpcmDecoder {
 
 	/// Damaged blocks are an error for that packet only: every block starts
 	/// from its own header, so the next packet decodes normally.
-	fn decode(&self, state: &mut State, packet: Packet) -> Result<DecodeOut<State>> {
+	fn decode(&self, state: &mut State, packet: Packet) -> Result<DecodeOut> {
 		let State::Audio(audio) = state else {
 			return Err(Message::Codec("adpcm decoder requires an audio state"));
 		};
@@ -74,10 +74,10 @@ impl core::Decoder for AdpcmDecoder {
 		frame.pts = packet.pts;
 		audio.samples_consumed += packet.data.len() as u64;
 		audio.samples_produced += frame.nb_samples as u64;
-		Ok(DecodeOut { value: vec![Frame::Audio(frame)], state: state.clone() })
+		Ok(DecodeOut { value: vec![Frame::Audio(frame)] })
 	}
 
-	fn flush(&self, state: &mut State) -> Result<DecodeOut<State>> {
-		Ok(DecodeOut { value: Vec::new(), state: state.clone() })
+	fn flush(&self, _state: &mut State) -> Result<DecodeOut> {
+		Ok(DecodeOut { value: Vec::new() })
 	}
 }

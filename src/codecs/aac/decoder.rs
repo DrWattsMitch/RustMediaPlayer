@@ -16,6 +16,7 @@ use super::ics::{
 	self, Channel, FRAME_LEN, INTENSITY_BT, INTENSITY_BT2, IcsResult, Invalid, NOISE_BT, SHORT_LEN,
 	WindowSequence,
 };
+use super::sbr::Sbr;
 use crate::codecs::bitstream::BitReader;
 use crate::codecs::dsp::{Complex, Imdct};
 use crate::core::{
@@ -129,8 +130,24 @@ pub struct AacDecoderState {
 	history: Vec<History>,
 	random: u32,
 	work: Box<[Channel; 2]>,
+	/// SBR context per element of the layout (created on first use).
+	sbr: Vec<Option<Box<Sbr>>>,
+	/// Whether SBR/PS were found in the stream (implicit signalling).
+	sbr_mode: i8,
+	ps_mode: i8,
+	/// Set once a frame has been decoded: implicit SBR can no longer start.
+	locked: bool,
 	/// Frames that failed to decode and were replaced by silence.
 	pub concealed_frames: u64,
+}
+
+/// One decoded audio element of a raw_data_block: layout slot index, kind
+/// and its output channel(s).
+#[derive(Debug, Clone, Copy)]
+struct DecodedElement {
+	slot: usize,
+	kind: ElementKind,
+	out: [u8; 2],
 }
 
 impl Default for AacDecoderState {
@@ -153,12 +170,17 @@ impl AacDecoderState {
 	pub fn new(config: Option<AacConfig>) -> Self {
 		let from_extradata = config.is_some();
 		let channels = config.as_ref().map_or(0, |c| usize::from(c.channels));
+		let (sbr_mode, ps_mode) = config.as_ref().map_or((-1, -1), |c| (c.sbr, c.ps));
 		Self {
 			config,
 			from_extradata,
 			history: vec![History::default(); channels],
 			random: RANDOM_SEED,
 			work: Box::default(),
+			sbr: Vec::new(),
+			sbr_mode,
+			ps_mode,
+			locked: false,
 			concealed_frames: 0,
 		}
 	}
@@ -178,11 +200,37 @@ impl AacDecoderState {
 			*h = History::default();
 		}
 		self.random = RANDOM_SEED;
+		self.sbr.clear();
+	}
+
+	/// Output sample rate (twice the core rate with SBR).
+	pub fn output_rate(&self) -> Option<u32> {
+		let c = self.config.as_ref()?;
+		Some(c.sample_rate << self.sbr_multiplier(c))
+	}
+
+	/// Output channels (mono HE-AAC with PS decodes to stereo).
+	pub fn output_channels(&self) -> Option<u8> {
+		let c = self.config.as_ref()?;
+		Some(if self.ps_mode == 1 && c.channels == 1 { 2 } else { c.channels })
+	}
+
+	fn sbr_multiplier(&self, c: &AacConfig) -> u32 {
+		if self.sbr_mode != 1 {
+			return 0;
+		}
+		let ext = if c.ext_sample_rate != 0 { c.ext_sample_rate } else { 2 * c.sample_rate };
+		u32::from(ext > c.sample_rate)
 	}
 
 	fn set_config(&mut self, config: AacConfig) {
 		if self.config.as_ref() != Some(&config) {
 			self.history = vec![History::default(); usize::from(config.channels)];
+			if !self.locked {
+				self.sbr_mode = config.sbr;
+				self.ps_mode = config.ps;
+			}
+			self.sbr.clear();
 			self.config = Some(config);
 		}
 	}
@@ -221,22 +269,119 @@ impl AacDecoderState {
 		let config = self.config.clone().ok_or(Message::Codec("aac decoder has no configuration"))?;
 		let channels = usize::from(config.channels);
 		let mut planar = vec![0.0f32; channels * FRAME_LEN];
-		let complete = match self.decode_elements(bs, &config, &mut planar) {
+		let mut elements = Vec::with_capacity(config.layout.len());
+		let complete = match self.decode_elements(bs, &config, &mut planar, &mut elements) {
 			Ok(()) => true,
 			Err(_) => {
 				planar.fill(0.0);
+				elements.clear();
 				self.reset();
 				self.concealed_frames += 1;
 				false
 			}
 		};
-		let mut pcm = vec![0i16; channels * FRAME_LEN];
-		for (c, plane) in planar.chunks_exact(FRAME_LEN).enumerate() {
+		self.locked = true;
+		let (planar, out_channels, frame_len) = if self.sbr_mode == 1 {
+			self.apply_sbr(&config, &planar, &elements)
+		} else {
+			(planar, channels, FRAME_LEN)
+		};
+		let mut pcm = vec![0i16; out_channels * frame_len];
+		for (c, plane) in planar.chunks_exact(frame_len).enumerate() {
 			for (i, &x) in plane.iter().enumerate() {
-				pcm[i * channels + c] = x.round().clamp(-32768.0, 32767.0) as i16;
+				pcm[i * out_channels + c] = x.round().clamp(-32768.0, 32767.0) as i16;
 			}
 		}
-		Ok(DecodedFrame { sample_rate: config.sample_rate, channels: config.channels, pcm, complete })
+		let sample_rate = config.sample_rate << self.sbr_multiplier(&config);
+		Ok(DecodedFrame { sample_rate, channels: out_channels as u8, pcm, complete })
+	}
+
+	/// Runs SBR (and PS) over every element; returns the upsampled planes.
+	fn apply_sbr(
+		&mut self,
+		config: &AacConfig,
+		core: &[f32],
+		elements: &[DecodedElement],
+	) -> (Vec<f32>, usize, usize) {
+		let mult = self.sbr_multiplier(config);
+		let downsampled = mult == 0;
+		let frame_len = FRAME_LEN << mult;
+		let ps = self.ps_mode == 1 && config.channels == 1;
+		let out_channels = if ps { 2 } else { usize::from(config.channels) };
+		let mut out = vec![0.0f32; out_channels * frame_len];
+		if self.sbr.len() < config.layout.len() {
+			self.sbr.resize_with(config.layout.len(), || None);
+		}
+		let core_rate = config.sample_rate;
+		for e in elements {
+			let is_cpe = e.kind == ElementKind::Cpe;
+			let ctx = self.sbr[e.slot].get_or_insert_with(|| {
+				let mut s = Box::new(Sbr::new(is_cpe));
+				s.sample_rate = 2 * core_rate;
+				s
+			});
+			let (a, b) = (usize::from(e.out[0]), usize::from(e.out[1]));
+			let left = &core[a * FRAME_LEN..(a + 1) * FRAME_LEN];
+			let right = is_cpe.then(|| &core[b * FRAME_LEN..(b + 1) * FRAME_LEN]);
+			let (lo, hi) = if is_cpe || ps { (a, if ps { 1 } else { b }) } else { (a, a) };
+			if lo != hi {
+				let (first, second) = out.split_at_mut(lo.max(hi) * frame_len);
+				let (pl, pr) = if lo < hi {
+					(&mut first[lo * frame_len..(lo + 1) * frame_len], &mut second[..frame_len])
+				} else {
+					(&mut second[..frame_len], &mut first[hi * frame_len..(hi + 1) * frame_len])
+				};
+				ctx.apply(is_cpe, left, right, pl, Some(pr), ps && !is_cpe, downsampled);
+			} else {
+				let pl = &mut out[a * frame_len..(a + 1) * frame_len];
+				ctx.apply(false, left, None, pl, None, false, downsampled);
+			}
+		}
+		(out, out_channels, frame_len)
+	}
+
+	/// `extension_payload()` (Table 4.57) inside a FIL element: SBR data is
+	/// decoded, everything else skipped. Returns the bytes consumed.
+	fn decode_extension(
+		&mut self,
+		bs: &mut BitReader,
+		count: usize,
+		config: &AacConfig,
+		last: Option<DecodedElement>,
+	) -> usize {
+		const EXT_SBR_DATA: u32 = 13;
+		const EXT_SBR_DATA_CRC: u32 = 14;
+		let kind = bs.bits(4);
+		let rest = (8 * count).saturating_sub(4);
+		if kind != EXT_SBR_DATA && kind != EXT_SBR_DATA_CRC {
+			bs.skip(rest);
+			return count;
+		}
+		let Some(elem) = last else {
+			bs.skip(rest);
+			return count;
+		};
+		if self.sbr_mode == 0 || (self.sbr_mode == -1 && self.locked) {
+			bs.skip(rest);
+			return count;
+		}
+		if self.ps_mode == -1 && !self.locked && config.channels == 1 {
+			self.ps_mode = 1;
+		}
+		self.sbr_mode = 1;
+		if self.sbr.len() < config.layout.len() {
+			self.sbr.resize_with(config.layout.len(), || None);
+		}
+		let is_cpe = elem.kind == ElementKind::Cpe;
+		let core_rate = config.sample_rate;
+		let ctx = self.sbr[elem.slot].get_or_insert_with(|| {
+			let mut s = Box::new(Sbr::new(is_cpe));
+			s.sample_rate = 2 * core_rate;
+			s
+		});
+		let ps_allowed = self.ps_mode == 1;
+		ctx.decode_extension(bs, kind == EXT_SBR_DATA_CRC, count, is_cpe, core_rate, ps_allowed);
+		count
 	}
 
 	fn decode_elements(
@@ -244,8 +389,13 @@ impl AacDecoderState {
 		bs: &mut BitReader,
 		config: &AacConfig,
 		out: &mut [f32],
+		elements: &mut Vec<DecodedElement>,
 	) -> IcsResult<()> {
 		let mut seen = [0usize; 4];
+		let mut last: Option<DecodedElement> = None;
+		let slot_index = |kind: ElementKind, nth: usize| {
+			config.layout.iter().enumerate().filter(|(_, s)| s.kind == kind).nth(nth).map(|(i, _)| i)
+		};
 		let rate = config.sample_rate_index;
 		let aot = config.object_type;
 		loop {
@@ -259,7 +409,13 @@ impl AacDecoderState {
 					bs.skip(4);
 					let nth = &mut seen[if kind == ElementKind::Sce { 0 } else { 2 }];
 					let slot = config.slot(kind, *nth);
+					let index = slot_index(kind, *nth);
 					*nth += 1;
+					if let (Some(s), Some(i)) = (slot, index) {
+						let e = DecodedElement { slot: i, kind, out: s.out };
+						elements.push(e);
+						last = Some(e);
+					}
 					let ch = &mut self.work[0];
 					ics::decode_ics(bs, ch, rate, aot, false, &mut self.random)?;
 					ics::apply_tns(ch);
@@ -275,6 +431,11 @@ impl AacDecoderState {
 				ElementKind::Cpe => {
 					bs.skip(4);
 					let slot = config.slot(kind, seen[1]);
+					if let (Some(s), Some(i)) = (slot, slot_index(kind, seen[1])) {
+						let e = DecodedElement { slot: i, kind, out: s.out };
+						elements.push(e);
+						last = Some(e);
+					}
 					seen[1] += 1;
 					self.decode_cpe(bs, rate, aot)?;
 					if let Some(s) = slot {
@@ -310,8 +471,10 @@ impl AacDecoderState {
 						count += bs.bits(8) as usize;
 						count -= 1;
 					}
-					// Extension payloads (SBR, DRC) are skipped.
-					bs.skip(8 * count);
+					while count > 0 {
+						let used = self.decode_extension(bs, count, config, last);
+						count = count.saturating_sub(used.max(1));
+					}
 				}
 			}
 		}
@@ -489,11 +652,10 @@ impl AacDecoder {
 impl core::Decoder for AacDecoder {
 	fn create_state(&self, parameters: &Parameters) -> State {
 		let dec = AacDecoderState::from_extradata(&parameters.extradata).unwrap_or_default();
-		let (rate, channels) = dec
-			.config()
-			.map_or((parameters.sample_rate.unwrap_or(44_100), parameters.channels.unwrap_or(2)), |c| {
-				(c.sample_rate, c.channels)
-			});
+		let (rate, channels) = match (dec.output_rate(), dec.output_channels()) {
+			(Some(r), Some(c)) => (r, c),
+			_ => (parameters.sample_rate.unwrap_or(44_100), parameters.channels.unwrap_or(2)),
+		};
 		State::Audio(AudioState {
 			sample_rate: rate,
 			channels: Channels::from_count(channels),
@@ -513,7 +675,7 @@ impl core::Decoder for AacDecoder {
 		})
 	}
 
-	fn decode(&self, state: &mut State, packet: Packet) -> Result<DecodeOut<State>> {
+	fn decode(&self, state: &mut State, packet: Packet) -> Result<DecodeOut> {
 		let frames = {
 			let State::Audio(audio) = state else {
 				return Err(Message::Codec("aac decoder requires an audio state"));
@@ -540,29 +702,30 @@ impl core::Decoder for AacDecoder {
 					SampleFormat::S16,
 					SampleLayout::Interleaved,
 				);
+				let samples = frame.pcm.len() / usize::from(frame.channels.max(1));
 				out.pts = pts;
 				pts = pts.and_then(|t| {
-					let step = core::Time::new(FRAME_LEN as u64, core::TimeBase::new(1, frame.sample_rate));
+					let step = core::Time::new(samples as u64, core::TimeBase::new(1, frame.sample_rate));
 					step.rescale(t.base()).and_then(|s| t.checked_add(s))
 				});
 				audio.sample_rate = frame.sample_rate;
 				audio.channels = Channels::from_count(frame.channels);
-				audio.samples_produced += FRAME_LEN as u64;
+				audio.samples_produced += samples as u64;
 				frames.push(Frame::Audio(out));
 			}
 			audio.samples_consumed += packet.data.len() as u64;
 			frames
 		};
-		Ok(DecodeOut { value: frames, state: state.clone() })
+		Ok(DecodeOut { value: frames })
 	}
 
-	fn flush(&self, state: &mut State) -> Result<DecodeOut<State>> {
+	fn flush(&self, state: &mut State) -> Result<DecodeOut> {
 		if let State::Audio(audio) = state {
 			if let CodecPrivate::Aac(dec) = &mut audio.private {
 				dec.reset();
 			}
 		}
-		Ok(DecodeOut { value: Vec::new(), state: state.clone() })
+		Ok(DecodeOut { value: Vec::new() })
 	}
 }
 

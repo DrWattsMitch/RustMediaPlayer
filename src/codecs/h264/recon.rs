@@ -4,17 +4,32 @@
 //! `h264pred_template.c`, `h264qpel_template.c`, `h264chroma_template.c`,
 //! `h264dsp_template.c`.
 
-/// One 8-bit sample plane.
-#[derive(Debug, Clone)]
+use crate::core::{BufferPool, Pooled};
+
+/// One 8-bit sample plane. The samples may come from a [`BufferPool`], to
+/// which they return when the plane is dropped.
+#[derive(Debug, Clone, Default)]
 pub struct Plane {
-	pub data: Vec<u8>,
+	pub data: Pooled<u8>,
 	pub width: usize,
 	pub height: usize,
 }
 
 impl Plane {
 	pub fn new(width: usize, height: usize, fill: u8) -> Self {
-		Self { data: vec![fill; width * height], width, height }
+		Self { data: Pooled::detached(vec![fill; width * height]), width, height }
+	}
+
+	/// Like [`Self::new`], with the samples taken from `pool`.
+	pub fn pooled(pool: &BufferPool, width: usize, height: usize, fill: u8) -> Self {
+		Self { data: pool.take_filled(width * height, fill), width, height }
+	}
+
+	/// A plane from `pool` whose samples are left over from its previous
+	/// use: only for planes every sample of which is written before it is
+	/// read.
+	pub fn recycled(pool: &BufferPool, width: usize, height: usize) -> Self {
+		Self { data: pool.take_recycled(width * height), width, height }
 	}
 
 	#[inline]
@@ -498,7 +513,9 @@ pub fn pred_block(p: &mut Plane, x: usize, y: usize, n: usize, mode: u8, a: Avai
 	let w = p.width;
 	let top = |i: usize| i32::from(p.data[(y - 1) * w + x + i]);
 	let left = |i: usize| i32::from(p.data[(y + i) * w + x - 1]);
-	let mut out = vec![0i32; n * n];
+	// n is 16 or 8: a stack buffer, not a heap allocation per block.
+	let mut buf = [0i32; 256];
+	let out = &mut buf[..n * n];
 	match mode {
 		0 => {
 			for r in 0..n {

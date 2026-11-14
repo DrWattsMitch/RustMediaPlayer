@@ -35,6 +35,7 @@ use crate::codecs::aac::{self, AacEncoder};
 use crate::codecs::flac::FlacEncoder;
 use crate::codecs::h264::H264Encoder;
 use crate::codecs::pcm::PcmCodec;
+use crate::codecs::threading;
 use crate::container::mkv::tracks::mux_codec;
 use crate::container::mp4::codec::muxer_supports;
 use crate::core::traits::*;
@@ -91,6 +92,11 @@ pub struct Options {
 	/// `-movflags`, `-frag_duration`, `-min_frag_duration`: MP4 layout
 	/// (`+faststart`, fragmented MP4), as `(name, value)` without the dash.
 	pub container_options: Vec<(String, String)>,
+	/// `-threads`: threads per codec, and whether demux, decode and encode
+	/// run on threads of their own (any value above 1). `None` or `0`:
+	/// automatic ([`threading::default_threads`]); `1`: everything on the
+	/// calling thread.
+	pub threads: Option<usize>,
 }
 
 /// What a finished transcode did.
@@ -163,6 +169,7 @@ impl Options {
 					| "-movflags"
 					| "-frag_duration"
 					| "-min_frag_duration"
+					| "-threads"
 			)
 	}
 
@@ -185,6 +192,11 @@ impl Options {
 				self.audio_codec = Some(v.into());
 				self.video_codec = Some(v.into());
 				self.subtitle_codec = Some(v.into());
+			}
+			"-threads" => {
+				let v = need()?;
+				// FFmpeg's `auto` is the default.
+				self.threads = if v == "auto" { None } else { Some(number(v)? as usize) };
 			}
 			"-ar" => self.sample_rate = Some(number(need()?)?),
 			"-ac" => {
@@ -387,8 +399,6 @@ enum Route {
 
 struct AudioRoute {
 	out: StreamId,
-	decoder: Box<dyn Decoder>,
-	dec_state: State,
 	encoder: Box<dyn Encoder>,
 	enc_state: State,
 	target: AudioSpec,
@@ -403,8 +413,6 @@ struct AudioRoute {
 
 struct VideoRoute {
 	out: StreamId,
-	decoder: Box<dyn Decoder>,
-	dec_state: State,
 	encoder: Box<dyn Encoder>,
 	enc_state: State,
 	target: (Option<(u32, u32)>, Option<Pixel>),
@@ -545,6 +553,16 @@ fn keeps_subtitles(ext: &str, stream: &Stream) -> bool {
 
 /// Runs a transcode from `input` to `output`.
 pub fn transcode(input: &str, output: &str, options: &Options) -> Result<Summary> {
+	// `-threads` applies to this transcode's decoders, not process-wide.
+	threading::with_default_threads(options.threads.unwrap_or(0), || {
+		let threads = threading::default_threads();
+		transcode_with(input, output, options, threads)
+	})
+}
+
+/// [`transcode`] with `threads` > 1 running demux, decode and encode on
+/// separate threads (the codecs use [`threading::default_threads`]).
+fn transcode_with(input: &str, output: &str, options: &Options, threads: usize) -> Result<Summary> {
 	let ext = container_of(output, options);
 	let resolver = Resolver::new();
 	let mut summary = Summary::default();
@@ -574,6 +592,8 @@ pub fn transcode(input: &str, output: &str, options: &Options) -> Result<Summary
 
 	let streams: Vec<Stream> = demuxer.streams().iter().cloned().collect();
 	let mut routes: HashMap<StreamId, Route> = HashMap::new();
+	// Decoders apart from the routes, so decoding can run on its own thread.
+	let mut decoders: HashMap<StreamId, (Box<dyn Decoder>, State)> = HashMap::new();
 	let mut pending: Vec<Packet> = Vec::new();
 	let mut next_out = 0usize;
 
@@ -618,6 +638,7 @@ pub fn transcode(input: &str, output: &str, options: &Options) -> Result<Summary
 					muxer.add(&out)?;
 					let decoder = resolver.decoder_for(stream).ok_or("no decoder")?;
 					let dec_state = decoder.create_state(&stream.parameters);
+					decoders.insert(stream.id, (decoder, dec_state));
 					let encoder: Box<dyn Encoder> = if codec == "flac" {
 						Box::new(FlacEncoder::new(out_id).with_level(options.level.unwrap_or(5)))
 					} else if codec == "aac" {
@@ -634,8 +655,6 @@ pub fn transcode(input: &str, output: &str, options: &Options) -> Result<Summary
 						stream.id,
 						Route::Audio(Box::new(AudioRoute {
 							out: out_id,
-							decoder,
-							dec_state,
 							encoder,
 							enc_state,
 							target,
@@ -713,6 +732,7 @@ pub fn transcode(input: &str, output: &str, options: &Options) -> Result<Summary
 					out.time_base = frame_time_base(stream, first);
 					let decoder = resolver.decoder_for(stream).ok_or("no decoder")?;
 					let dec_state = decoder.create_state(&stream.parameters);
+					decoders.insert(stream.id, (decoder, dec_state));
 					let encoder: Box<dyn Encoder> = if codec == "h264" {
 						let h264 = H264Encoder::new(out_id)
 							.with_rate(options.qp, options.video_bitrate)
@@ -735,8 +755,6 @@ pub fn transcode(input: &str, output: &str, options: &Options) -> Result<Summary
 						stream.id,
 						Route::Video(Box::new(VideoRoute {
 							out: out_id,
-							decoder,
-							dec_state,
 							encoder,
 							enc_state,
 							target: (options.size, Some(pixel)),
@@ -765,74 +783,244 @@ pub fn transcode(input: &str, output: &str, options: &Options) -> Result<Summary
 		return Err("no stream to write (check -an/-vn/-sn and the output format)".into());
 	}
 
-	let mut frames_out = 0u64;
-	let mut packets_out = 0u64;
-	let mut handle =
-		|packet: Packet, routes: &mut HashMap<StreamId, Route>, muxer: &mut Output| -> Result<()> {
-			let Some(route) = routes.get_mut(&packet.stream_id) else { return Ok(()) };
-			match route {
-				Route::Copy { out } => {
-					let mut p = packet;
-					p.stream_id = *out;
-					packets_out += 1;
-					muxer.write(p)
-				}
-				Route::Audio(r) => {
-					let frames = r.decoder.decode(&mut r.dec_state, packet)?.value;
-					packets_out += audio_frames(r, frames, muxer, &mut frames_out)?;
-					Ok(())
-				}
-				Route::Video(r) => {
-					let frames = r.decoder.decode(&mut r.dec_state, packet)?.value;
-					packets_out += video_frames(r, frames, muxer, &mut frames_out)?;
-					Ok(())
-				}
+	let decode = DecodeStage::new(&routes, decoders);
+	let encode = EncodeStage { routes, muxer, frames_out: 0, packets_out: 0 };
+	let (frames, packets) = if threads > 1 {
+		run_pipelined(demuxer, pending, decode, encode)?
+	} else {
+		run_serial(demuxer, pending, decode, encode)?
+	};
+	summary.frames = frames;
+	summary.packets = packets;
+	Ok(summary)
+}
+
+/// What the decode stage hands to the encode stage, in input order.
+enum Item {
+	/// A packet of a copied stream.
+	Copy(Packet),
+	/// Frames decoded from one packet.
+	Frames(StreamId, Vec<Frame>),
+	/// End of input for one decoded stream: its last frames (flush order is
+	/// output stream order, as before).
+	Flushed(StreamId, Vec<Frame>),
+	/// Every stream flushed: finish the output.
+	End,
+	/// Demuxing or decoding failed here; nothing after it is processed.
+	Error(Message),
+}
+
+/// Demux -> decode. Owns the decoders.
+struct DecodeStage {
+	decoders: HashMap<StreamId, (Box<dyn Decoder>, State)>,
+	copied: std::collections::HashSet<StreamId>,
+}
+
+impl DecodeStage {
+	fn new(
+		routes: &HashMap<StreamId, Route>,
+		decoders: HashMap<StreamId, (Box<dyn Decoder>, State)>,
+	) -> Self {
+		let copied =
+			routes.iter().filter(|(_, r)| matches!(r, Route::Copy { .. })).map(|(id, _)| *id).collect();
+		Self { decoders, copied }
+	}
+
+	fn packet(&mut self, packet: Packet) -> Option<Item> {
+		if self.copied.contains(&packet.stream_id) {
+			return Some(Item::Copy(packet));
+		}
+		let id = packet.stream_id;
+		let (decoder, state) = self.decoders.get_mut(&id)?;
+		Some(match decoder.decode(state, packet) {
+			Ok(out) => Item::Frames(id, out.value),
+			Err(e) => Item::Error(e),
+		})
+	}
+
+	/// Flushes every decoder, in output stream order (the input ids sort
+	/// the same way) so the result doesn't depend on hash order.
+	fn finish(&mut self, mut emit: impl FnMut(Item) -> bool) {
+		let mut ids: Vec<StreamId> = self.decoders.keys().copied().collect();
+		ids.sort_by_key(|id| id.0);
+		for id in ids {
+			let Some((decoder, state)) = self.decoders.get_mut(&id) else { continue };
+			let item = match decoder.flush(state) {
+				Ok(out) => Item::Flushed(id, out.value),
+				Err(e) => Item::Error(e),
+			};
+			let stop = matches!(item, Item::Error(_));
+			if !emit(item) || stop {
+				return;
 			}
-		};
-	for packet in std::mem::take(&mut pending) {
-		handle(packet, &mut routes, &mut muxer)?;
+		}
+		emit(Item::End);
 	}
-	while let Some(packet) = demuxer.read()? {
-		handle(packet, &mut routes, &mut muxer)?;
-	}
-	// Drain decoders, converters and encoders, in output stream order so
-	// the result doesn't depend on hash order.
-	let mut ids: Vec<StreamId> = routes.keys().copied().collect();
-	ids.sort_by_key(|id| id.0);
-	for id in ids {
-		let Some(route) = routes.get_mut(&id) else { continue };
-		match route {
-			Route::Copy { .. } => {}
-			Route::Audio(r) => {
-				let frames = r.decoder.flush(&mut r.dec_state)?.value;
-				packets_out += audio_frames(r, frames, &mut muxer, &mut frames_out)?;
-				for frame in r.gapless.finish() {
-					packets_out += encode_audio(r, frame, &mut muxer, &mut frames_out)?;
-				}
-				if let Some(frame) = r.converter.as_mut().map(AudioConverter::flush).transpose()?.flatten()
-				{
-					for mut p in r.encoder.encode(&mut r.enc_state, Frame::Audio(frame))?.value {
+}
+
+/// Convert -> encode -> mux. Owns the encoders and the muxer.
+struct EncodeStage {
+	routes: HashMap<StreamId, Route>,
+	muxer: Output,
+	frames_out: u64,
+	packets_out: u64,
+}
+
+impl EncodeStage {
+	/// Processes one item; `Ok(true)` once the output is finished.
+	fn item(&mut self, item: Item) -> Result<bool> {
+		match item {
+			Item::Copy(packet) => {
+				let Some(Route::Copy { out }) = self.routes.get(&packet.stream_id) else {
+					return Ok(false);
+				};
+				let mut p = packet;
+				p.stream_id = *out;
+				self.packets_out += 1;
+				self.muxer.write(p)?;
+			}
+			Item::Frames(id, frames) => self.frames(id, frames)?,
+			Item::Flushed(id, frames) => {
+				self.frames(id, frames)?;
+				if let Some(Route::Audio(r)) = self.routes.get_mut(&id) {
+					let (muxer, count) = (&mut self.muxer, &mut self.frames_out);
+					for frame in r.gapless.finish() {
+						self.packets_out += encode_audio(r, frame, muxer, count)?;
+					}
+					if let Some(frame) =
+						r.converter.as_mut().map(AudioConverter::flush).transpose()?.flatten()
+					{
+						for mut p in r.encoder.encode(&mut r.enc_state, Frame::Audio(frame))?.value {
+							p.stream_id = r.out;
+							self.packets_out += 1;
+							muxer.write(p)?;
+						}
+					}
+					for mut p in r.encoder.flush(&mut r.enc_state)?.value {
 						p.stream_id = r.out;
-						packets_out += 1;
+						self.packets_out += 1;
 						muxer.write(p)?;
 					}
 				}
-				for mut p in r.encoder.flush(&mut r.enc_state)?.value {
-					p.stream_id = r.out;
-					packets_out += 1;
-					muxer.write(p)?;
-				}
 			}
-			Route::Video(r) => {
-				let frames = r.decoder.flush(&mut r.dec_state)?.value;
-				packets_out += video_frames(r, frames, &mut muxer, &mut frames_out)?;
+			Item::End => {
+				self.muxer.finish()?;
+				return Ok(true);
 			}
+			Item::Error(e) => return Err(e),
+		}
+		Ok(false)
+	}
+
+	fn frames(&mut self, id: StreamId, frames: Vec<Frame>) -> Result<()> {
+		let (muxer, count) = (&mut self.muxer, &mut self.frames_out);
+		match self.routes.get_mut(&id) {
+			Some(Route::Audio(r)) => self.packets_out += audio_frames(r, frames, muxer, count)?,
+			Some(Route::Video(r)) => self.packets_out += video_frames(r, frames, muxer, count)?,
+			_ => {}
+		}
+		Ok(())
+	}
+}
+
+/// Every stage on the calling thread.
+fn run_serial(
+	mut demuxer: Input,
+	pending: Vec<Packet>,
+	mut decode: DecodeStage,
+	mut encode: EncodeStage,
+) -> Result<(u64, u64)> {
+	for packet in pending {
+		if let Some(item) = decode.packet(packet) {
+			encode.item(item)?;
 		}
 	}
-	muxer.finish()?;
-	summary.frames = frames_out;
-	summary.packets = packets_out;
-	Ok(summary)
+	while let Some(packet) = demuxer.read()? {
+		if let Some(item) = decode.packet(packet) {
+			encode.item(item)?;
+		}
+	}
+	let mut result = Ok(false);
+	decode.finish(|item| {
+		result = encode.item(item);
+		result.is_ok()
+	});
+	match result? {
+		true => Ok((encode.frames_out, encode.packets_out)),
+		false => Err(Message::Other("transcode: the pipeline stopped before the end")),
+	}
+}
+
+/// Packets in flight between demuxing and decoding.
+const PACKET_QUEUE: usize = 64;
+/// Decoded items in flight between decoding and encoding (a few frames:
+/// they can be large).
+const FRAME_QUEUE: usize = 8;
+
+/// Demuxing on the calling thread, decoding and encoding (with muxing) on
+/// one thread each, joined by bounded channels (FFmpeg 7's threaded
+/// `ffmpeg` pipeline). Everything flows in input order, so the output is
+/// byte-identical to [`run_serial`], and so is the first error reported:
+/// a stage that fails passes the error down the line in order, and a
+/// stage whose consumer has gone stops at its next send.
+fn run_pipelined(
+	mut demuxer: Input,
+	pending: Vec<Packet>,
+	mut decode: DecodeStage,
+	mut encode: EncodeStage,
+) -> Result<(u64, u64)> {
+	use std::sync::mpsc::sync_channel;
+	let (packet_tx, packet_rx) = sync_channel::<std::result::Result<Packet, Message>>(PACKET_QUEUE);
+	let (item_tx, item_rx) = sync_channel::<Item>(FRAME_QUEUE);
+	std::thread::scope(|scope| {
+		let decoder =
+			std::thread::Builder::new().name("rmp-decode".into()).spawn_scoped(scope, move || {
+				for msg in packet_rx {
+					let item = match msg {
+						Ok(packet) => match decode.packet(packet) {
+							Some(item) => item,
+							None => continue,
+						},
+						Err(e) => Item::Error(e),
+					};
+					let stop = matches!(item, Item::Error(_));
+					if item_tx.send(item).is_err() || stop {
+						return;
+					}
+				}
+				decode.finish(|item| item_tx.send(item).is_ok());
+			});
+		let encoder =
+			std::thread::Builder::new().name("rmp-encode".into()).spawn_scoped(scope, move || {
+				for item in item_rx {
+					if encode.item(item)? {
+						return Ok((encode.frames_out, encode.packets_out));
+					}
+				}
+				Err(Message::Other("transcode: the pipeline stopped before the end"))
+			});
+		let (decoder, encoder) = match (decoder, encoder) {
+			(Ok(d), Ok(e)) => (d, e),
+			_ => return Err(Message::Other("transcode: could not start the pipeline threads")),
+		};
+		// Demux here. A failed send means a later stage has stopped (with
+		// an error that it reports).
+		let send = |m| packet_tx.send(m).is_ok();
+		let mut open = pending.into_iter().all(|p| send(Ok(p)));
+		while open {
+			match demuxer.read() {
+				Ok(Some(p)) => open = send(Ok(p)),
+				Ok(None) => break,
+				Err(e) => {
+					send(Err(e));
+					break;
+				}
+			}
+		}
+		drop(packet_tx);
+		let _ = decoder.join();
+		encoder.join().unwrap_or(Err(Message::Other("transcode: the encode thread panicked")))
+	})
 }
 
 fn audio_frames(
@@ -906,4 +1094,65 @@ fn video_frames(
 		}
 	}
 	Ok(written)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn fixture(path: &str) -> String {
+		format!("{}/tests/fixtures/{path}", env!("CARGO_MANIFEST_DIR"))
+	}
+
+	/// The pipelined transcode writes exactly the bytes of the serial one
+	/// (with the codecs' own thread count held fixed).
+	#[test]
+	fn pipelined_transcode_is_byte_identical() {
+		let dir = tempfile::tempdir().unwrap();
+		let cases: [(&str, &str, &[&str]); 4] = [
+			("mp4/h264_bframes_aac.mp4", "mkv", &["-c:v", "h264", "-c:a", "flac"]),
+			("mp4/h264_bframes_aac.mp4", "mp4", &["-c:v", "h264", "-c:a", "aac"]),
+			("vp9/tiles_512x128.webm", "y4m", &[]),
+			("mp4/h264_high_tools.mp4", "mkv", &["-c", "copy"]),
+		];
+		for (i, (input, ext, args)) in cases.iter().enumerate() {
+			let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+			let options = Options::parse(&args).unwrap();
+			for codec_threads in [1, 3] {
+				let out = |pipeline: usize| {
+					let path = dir.path().join(format!("{i}_{codec_threads}_{pipeline}.{ext}"));
+					let path = path.to_str().unwrap().to_string();
+					threading::with_default_threads(codec_threads, || {
+						transcode_with(&fixture(input), &path, &options, pipeline).unwrap()
+					});
+					std::fs::read(&path).unwrap()
+				};
+				let serial = out(1);
+				assert!(!serial.is_empty());
+				assert!(out(2) == serial, "{input} -> {ext}, codec threads {codec_threads}");
+			}
+		}
+	}
+
+	#[test]
+	fn pipelined_transcode_reports_decode_errors() {
+		// A truncated input fails the same way with and without the pipeline.
+		let dir = tempfile::tempdir().unwrap();
+		let mut data = std::fs::read(fixture("mp4/h264_bframes_aac.mp4")).unwrap();
+		data.truncate(data.len() * 2 / 3);
+		let input = dir.path().join("cut.mp4");
+		std::fs::write(&input, &data).unwrap();
+		let input = input.to_str().unwrap();
+		let options = Options::parse(&["-c:a".into(), "flac".into()]).unwrap();
+		let run = |pipeline: usize| {
+			let out = dir.path().join(format!("cut_{pipeline}.mkv"));
+			transcode_with(input, out.to_str().unwrap(), &options, pipeline)
+				.map(|s| (s.frames, s.packets))
+		};
+		let (a, b) = (run(1), run(2));
+		assert_eq!(a.is_ok(), b.is_ok());
+		if let (Ok(a), Ok(b)) = (a, b) {
+			assert_eq!(a, b);
+		}
+	}
 }

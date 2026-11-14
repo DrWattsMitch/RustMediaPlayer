@@ -620,7 +620,7 @@ impl core::Encoder for FlacEncoder {
 		})
 	}
 
-	fn encode(&self, state: &mut State, frame: Frame) -> Result<EncodeOut<State>> {
+	fn encode(&self, state: &mut State, frame: Frame) -> Result<EncodeOut> {
 		let Frame::Audio(frame) = frame else {
 			return Err(Message::Codec("flac encoder requires audio frames"));
 		};
@@ -659,10 +659,10 @@ impl core::Encoder for FlacEncoder {
 		if let State::Audio(audio) = state {
 			audio.samples_consumed += frame.nb_samples as u64;
 		}
-		Ok(EncodeOut { value: packets, state: state.clone() })
+		Ok(EncodeOut { value: packets })
 	}
 
-	fn flush(&self, state: &mut State) -> Result<EncodeOut<State>> {
+	fn flush(&self, state: &mut State) -> Result<EncodeOut> {
 		let enc = self.state(state)?;
 		let mut packets = Vec::new();
 		let rest = enc.pending[0].len();
@@ -672,7 +672,7 @@ impl core::Encoder for FlacEncoder {
 			let data = enc.encode_frame(rest);
 			packets.push(self.packet(data, first, rest, rate));
 		}
-		Ok(EncodeOut { value: packets, state: state.clone() })
+		Ok(EncodeOut { value: packets })
 	}
 }
 

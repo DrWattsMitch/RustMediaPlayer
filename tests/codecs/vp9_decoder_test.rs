@@ -56,9 +56,10 @@ fn decode(name: &str) -> Vec<VideoFrame> {
 /// RGB24; FFmpeg's `gbrp` stores G, B, R planes).
 fn planar(frame: &VideoFrame) -> Vec<u8> {
 	if frame.pixel.format != PixelFormat::RGB24 {
-		return frame.data.clone();
+		return frame.data().into_owned();
 	}
-	let px = frame.data.chunks_exact(3);
+	let data = frame.data();
+	let px = data.chunks_exact(3);
 	let mut out: Vec<u8> = px.clone().map(|p| p[1]).collect();
 	out.extend(px.clone().map(|p| p[2]));
 	out.extend(px.map(|p| p[0]));
@@ -131,4 +132,100 @@ fn webm_fixture_matches_ffmpeg_and_needs_a_key_frame() {
 	let mut dec = Vp9DecoderState::new();
 	let shown: usize = packets.iter().map(|p| dec.decode_packet(&p.data).unwrap().len()).sum();
 	assert_eq!(shown, packets.len());
+}
+
+/// Every shown picture of a fixture, decoded by `dec`.
+fn decode_with(name: &str, mut dec: Vp9DecoderState) -> Vec<Vec<u8>> {
+	let mut demuxer = MkvDemuxer::new(memory(fixture(&format!("vp9/{name}.webm")))).unwrap();
+	let stream = demuxer.streams().by_kind(StreamKind::Video)[0].clone();
+	let mut out = Vec::new();
+	while let Some(packet) = demuxer.read().unwrap() {
+		if packet.stream_id == stream.id {
+			out.extend(dec.decode_packet(&packet.data).unwrap().iter().map(|p| p.to_bytes()));
+		}
+	}
+	out
+}
+
+#[test]
+fn tile_and_row_threading_are_bit_exact() {
+	for name in [
+		"tiles_512x128",
+		"altref_176x144",
+		"frame_parallel_128x72",
+		"lossless_64x48",
+		"odd_444_99x61",
+		"p1_422_96x64",
+		"rt_aq_errres_160x96",
+	] {
+		let serial = decode_with(name, Vp9DecoderState::new());
+		assert_eq!(serial.len(), reference(name).len(), "{name}");
+		for threads in [2, 3, 8] {
+			for pipeline in [false, true] {
+				let dec = Vp9DecoderState::with_threads(threads).with_row_pipeline(pipeline);
+				assert_eq!(dec.threads(), threads);
+				let threaded = decode_with(name, dec);
+				assert!(threaded == serial, "{name}: {threads} threads, row pipeline {pipeline}");
+			}
+		}
+	}
+}
+
+#[test]
+fn tile_threading_fails_like_single_threaded_decoding_on_damage() {
+	let mut demuxer = MkvDemuxer::new(memory(fixture("vp9/tiles_512x128.webm"))).unwrap();
+	let stream = demuxer.streams().by_kind(StreamKind::Video)[0].clone();
+	let packets: Vec<_> = crate::common::read_all(&mut demuxer)
+		.into_iter()
+		.filter(|p| p.stream_id == stream.id)
+		.collect();
+	for cut in [3, 2] {
+		let mut serial = Vp9DecoderState::new();
+		let mut threaded = Vp9DecoderState::with_threads(4).with_row_pipeline(true);
+		for (i, p) in packets.iter().enumerate() {
+			let data = if i % 2 == 1 { &p.data[..p.data.len() * (cut - 1) / cut] } else { &p.data[..] };
+			let a = serial.decode_packet(data);
+			let b = threaded.decode_packet(data);
+			assert_eq!(a.is_ok(), b.is_ok(), "packet {i}");
+			if let (Ok(a), Ok(b)) = (a, b) {
+				let a: Vec<_> = a.iter().map(|p| p.to_bytes()).collect();
+				let b: Vec<_> = b.iter().map(|p| p.to_bytes()).collect();
+				assert!(a == b, "packet {i}");
+			}
+		}
+	}
+}
+
+/// Shown frames are views into the decoder's reference pictures (no copy)
+/// and the planes are recycled once no slot or frame holds them.
+#[test]
+fn output_frames_share_and_recycle_decoder_buffers() {
+	let mut demuxer = MkvDemuxer::new(memory(fixture("vp9/altref_176x144.webm"))).unwrap();
+	let stream = demuxer.streams().by_kind(StreamKind::Video)[0].clone();
+	let mut packets = Vec::new();
+	while let Some(p) = demuxer.read().unwrap() {
+		if p.stream_id == stream.id {
+			packets.push(p);
+		}
+	}
+	let want: Vec<(usize, u32)> = reference("altref_176x144");
+	let mut dec = Vp9DecoderState::new();
+	let mut shown = 0;
+	for p in &packets {
+		for pic in dec.decode_packet(&p.data).unwrap() {
+			let pixel = rmp::core::Pixel { depth: 8, format: PixelFormat::YUV420 };
+			let frame = pic.to_frame(pixel, None);
+			let data = frame.data();
+			assert_eq!((data.len(), adler32(&data)), want[shown], "frame {shown}");
+			// Superblock-aligned stride, visible width.
+			let y = frame.plane(0).unwrap();
+			assert_eq!((y.row_bytes(), y.stride() % 64), (176, 0));
+			shown += 1;
+		}
+	}
+	assert_eq!(shown, want.len());
+	let stats = dec.pool_stats();
+	// 8 reference slots + the frame being decoded, 3 planes each.
+	assert!(stats.allocated <= 3 * 9, "{stats:?}");
+	assert!(stats.reused > 0, "{stats:?}");
 }

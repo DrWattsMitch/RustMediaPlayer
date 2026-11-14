@@ -209,9 +209,16 @@ pub(super) fn filter_edge_scalar(
 
 /// Deblocks the whole frame in macroblock raster order.
 pub fn deblock_frame(f: &mut Frame) {
+	let rows = 0..f.mb_h;
+	deblock_rows(f, rows);
+}
+
+/// Deblocks the macroblock rows in `rows` (in raster order, as
+/// [`deblock_frame`] does; rows must be deblocked top to bottom).
+pub fn deblock_rows(f: &mut Frame, rows: std::ops::Range<usize>) {
 	let Frame { y, cb, cr, mbs, mb_w, mb_h, slices } = f;
 	let mut planes = Planes { y, cb, cr };
-	for mby in 0..*mb_h {
+	for mby in rows.start..rows.end.min(*mb_h) {
 		for mbx in 0..*mb_w {
 			deblock_mb(mbs, slices, *mb_w, &mut planes, mbx, mby);
 		}

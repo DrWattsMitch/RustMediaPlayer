@@ -918,7 +918,7 @@ impl core::Decoder for OpusDecoder {
 		})
 	}
 
-	fn decode(&self, state: &mut State, packet: Packet) -> Result<DecodeOut<State>> {
+	fn decode(&self, state: &mut State, packet: Packet) -> Result<DecodeOut> {
 		let State::Audio(audio) = state else {
 			return Err(Message::Codec("opus decoder requires an audio state"));
 		};
@@ -946,11 +946,11 @@ impl core::Decoder for OpusDecoder {
 		frame.pts = start.map(|t| Time::new(t, rate));
 		audio.samples_produced += frame.nb_samples as u64;
 		audio.samples_consumed += packet.data.len() as u64;
-		Ok(DecodeOut { value: vec![Frame::Audio(frame)], state: state.clone() })
+		Ok(DecodeOut { value: vec![Frame::Audio(frame)] })
 	}
 
-	fn flush(&self, state: &mut State) -> Result<DecodeOut<State>> {
-		Ok(DecodeOut { value: Vec::new(), state: state.clone() })
+	fn flush(&self, _state: &mut State) -> Result<DecodeOut> {
+		Ok(DecodeOut { value: Vec::new() })
 	}
 }
 

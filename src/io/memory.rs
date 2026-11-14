@@ -4,15 +4,16 @@
 //! underlying bytes (but keep independent cursors), so a caller can hand one
 //! clone to a muxer and read the result back through another.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::io::Io;
 use crate::message::{Message, Result};
 
 #[derive(Debug, Clone, Default)]
 pub struct MemoryIo {
-	data: Rc<RefCell<Vec<u8>>>,
+	// `Arc<Mutex>` rather than `Rc<RefCell>` so an output can be written
+	// from a pipeline thread (`Io: Send`).
+	data: Arc<Mutex<Vec<u8>>>,
 	pos: usize,
 }
 
@@ -22,18 +23,26 @@ impl MemoryIo {
 	}
 
 	pub fn from_vec(data: Vec<u8>) -> Self {
-		Self { data: Rc::new(RefCell::new(data)), pos: 0 }
+		Self { data: Arc::new(Mutex::new(data)), pos: 0 }
 	}
 
 	/// Copy of the current contents.
 	pub fn contents(&self) -> Vec<u8> {
-		self.data.borrow().clone()
+		self.bytes().clone()
 	}
+
+	fn bytes(&self) -> MutexGuard<'_, Vec<u8>> {
+		lock(&self.data)
+	}
+}
+
+fn lock(data: &Mutex<Vec<u8>>) -> MutexGuard<'_, Vec<u8>> {
+	data.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl Io for MemoryIo {
 	fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-		let data = self.data.borrow();
+		let data = lock(&self.data);
 		let available = data.get(self.pos..).unwrap_or(&[]);
 		let n = available.len().min(buf.len());
 		buf[..n].copy_from_slice(&available[..n]);
@@ -42,7 +51,7 @@ impl Io for MemoryIo {
 	}
 
 	fn write(&mut self, buf: &[u8]) -> Result<usize> {
-		let mut data = self.data.borrow_mut();
+		let mut data = lock(&self.data);
 		let end = self.pos.checked_add(buf.len()).ok_or(Message::Other("write overflow"))?;
 		if end > data.len() {
 			data.resize(end, 0);
@@ -58,6 +67,6 @@ impl Io for MemoryIo {
 	}
 
 	fn size(&self) -> Result<u64> {
-		Ok(self.data.borrow().len() as u64)
+		Ok(self.bytes().len() as u64)
 	}
 }

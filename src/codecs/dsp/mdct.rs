@@ -114,6 +114,28 @@ impl Imdct {
 	}
 }
 
+impl Imdct {
+	/// FFmpeg's half IMDCT (`imdct_half`, the default `av_tx` inverse
+	/// MDCT): `N/2` coefficients in, the `N/2` samples `-y[N/4 .. 3N/4]`
+	/// out, i.e. the negated middle half of [`Self::inverse`]. Codecs that
+	/// window with the TDAC symmetry rebuild the outer quarters from these. `scratch` must hold at least
+	/// `N/2` floats and `buf` `N/4` complex values.
+	pub fn inverse_half(
+		&self,
+		input: &[f32],
+		output: &mut [f32],
+		scratch: &mut [f32],
+		buf: &mut [Complex],
+	) {
+		let h = self.n / 2;
+		let u = &mut scratch[..h];
+		self.dct4(&input[..h], u, buf);
+		for (o, &v) in output[..h].iter_mut().zip(u.iter().rev()) {
+			*o = v;
+		}
+	}
+}
+
 /// Forward MDCT: `N` windowed samples to `N/2` coefficients,
 ///
 /// ```text

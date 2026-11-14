@@ -3,12 +3,13 @@
 //! output ordering (C.4). FFmpeg: `h264_picture.c`, `h264_refs.c`,
 //! `h2645_parse`/`h264_poc.c`.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use super::params::Sps;
 use super::recon::Plane;
 use super::slice::{Mmco, RefModification, SliceHeader, SliceType};
-use crate::core::Time;
+use crate::core::{Pooled, Time};
 
 /// Motion of one macroblock, kept with its picture for direct prediction
 /// in later B pictures and for deblocking.
@@ -23,20 +24,189 @@ pub struct MbMotion {
 	pub intra: bool,
 }
 
-/// A decoded frame.
+/// A decoded frame (its bookkeeping; the samples and motion live in
+/// [`PicData`], which may still be being decoded by another thread).
 #[derive(Debug, Clone)]
 pub struct Picture {
 	/// Unique, non-zero identity (decode counter).
 	pub id: u32,
-	pub y: Plane,
-	pub cb: Plane,
-	pub cr: Plane,
+	pub data: Arc<PicData>,
 	pub poc: i32,
-	pub motion: Vec<MbMotion>,
 	pub pts: Option<Time>,
 	pub keyframe: bool,
 	/// Frames inserted for a frame_num gap; never output.
 	pub non_existing: bool,
+}
+
+/// Borrowed view of a picture being decoded, for [`PicData::publish`].
+#[derive(Clone, Copy)]
+pub struct PlanesRef<'a> {
+	pub y: &'a Plane,
+	pub cb: &'a Plane,
+	pub cr: &'a Plane,
+	pub motion: &'a [MbMotion],
+}
+
+/// The samples and motion of one picture.
+#[derive(Debug, Clone, Default)]
+pub struct PicPlanes {
+	pub y: Plane,
+	pub cb: Plane,
+	pub cr: Plane,
+	pub motion: Pooled<MbMotion>,
+}
+
+/// A picture's content, shared between the thread decoding it and the
+/// threads predicting from it (FFmpeg's `ThreadFrame`).
+///
+/// Progress counts *deblocked macroblock rows* `d`: once it is `d`, luma
+/// rows below `16d - 3` and chroma rows below `8d - 2` are final (deblocking
+/// row `d` may still change the 3 luma / 1 chroma rows above its top edge),
+/// and so is the motion of macroblock rows below `d`. `mb_h + 1` means
+/// complete. Until then, finished rows are copied into `live` as they are
+/// reported; afterwards everything is read lock-free from `done`.
+#[derive(Debug)]
+pub struct PicData {
+	mb_h: u32,
+	progress: crate::codecs::threading::Progress,
+	live: RwLock<PicPlanes>,
+	done: OnceLock<PicPlanes>,
+	/// Slices of this picture that failed to decode.
+	pub damaged: AtomicU32,
+	/// Set if the decoding thread died: readers then fail loudly instead of
+	/// waiting forever.
+	poisoned: AtomicBool,
+}
+
+impl PicData {
+	/// A picture that is already complete.
+	pub fn complete(planes: PicPlanes) -> Arc<Self> {
+		let mb_h = (planes.y.height / 16) as u32;
+		let data = Self::pending(mb_h, PicPlanes::default());
+		let _ = data.done.set(planes);
+		data.progress.report(mb_h + 1);
+		Arc::new(data)
+	}
+
+	/// A picture to be decoded. `live` holds the buffers rows are published
+	/// into (empty when nobody reads the picture before it is complete).
+	pub fn pending(mb_h: u32, live: PicPlanes) -> Self {
+		Self {
+			mb_h,
+			progress: crate::codecs::threading::Progress::new(0),
+			live: RwLock::new(live),
+			done: OnceLock::new(),
+			damaged: AtomicU32::new(0),
+			poisoned: AtomicBool::new(false),
+		}
+	}
+
+	pub fn is_done(&self) -> bool {
+		self.done.get().is_some()
+	}
+
+	/// The finished picture, without waiting (`None` while it is decoded).
+	pub fn done(&self) -> Option<&PicPlanes> {
+		self.done.get()
+	}
+
+	/// Progress needed before luma row `y` can be read.
+	pub fn need_luma(&self, y: usize) -> u32 {
+		((y as u32 + 3) / 16 + 1).min(self.mb_h + 1)
+	}
+
+	/// Progress needed before chroma row `y` can be read.
+	pub fn need_chroma(&self, y: usize) -> u32 {
+		((y as u32 + 2) / 8 + 1).min(self.mb_h + 1)
+	}
+
+	/// Progress needed before the motion of macroblock row `row` can be read.
+	pub fn need_motion(&self, row: usize) -> u32 {
+		(row as u32 + 1).min(self.mb_h + 1)
+	}
+
+	pub fn progress(&self) -> u32 {
+		self.progress.get()
+	}
+
+	/// Runs `f` on the picture once progress has reached `need`.
+	#[inline]
+	pub fn with<R>(&self, need: u32, f: impl FnOnce(&PicPlanes) -> R) -> R {
+		if let Some(done) = self.done.get() {
+			return f(done);
+		}
+		self.progress.wait_for(need);
+		if let Some(done) = self.done.get() {
+			return f(done);
+		}
+		self.check_poison();
+		let live = self.live.read().unwrap_or_else(|e| e.into_inner());
+		if live.y.data.is_empty() {
+			// Completed (and `live` released) between the two checks.
+			drop(live);
+			return f(self.wait_done());
+		}
+		f(&live)
+	}
+
+	/// The complete picture, waiting for it if necessary.
+	pub fn wait_done(&self) -> &PicPlanes {
+		self.progress.wait_for(self.mb_h + 1);
+		self.check_poison();
+		match self.done.get() {
+			Some(d) => d,
+			None => panic!("h264: picture reported complete without data"),
+		}
+	}
+
+	fn check_poison(&self) {
+		if self.poisoned.load(Ordering::Acquire) {
+			panic!("h264: the thread decoding a reference picture panicked");
+		}
+	}
+
+	/// Copies rows that became final into `live` and raises progress to
+	/// `rows` deblocked macroblock rows.
+	pub fn publish(&self, src: PlanesRef<'_>, from: u32, rows: u32) {
+		if rows <= from {
+			return;
+		}
+		{
+			let mut live = self.live.write().unwrap_or_else(|e| e.into_inner());
+			let luma = |d: u32| (16 * d as usize).saturating_sub(3);
+			let chroma = |d: u32| (8 * d as usize).saturating_sub(2);
+			let copy = |dst: &mut Plane, s: &Plane, a: usize, b: usize| {
+				let (a, b) = (a * s.width, (b * s.width).min(s.data.len()));
+				if a < b && dst.data.len() >= b {
+					dst.data[a..b].copy_from_slice(&s.data[a..b]);
+				}
+			};
+			copy(&mut live.y, src.y, luma(from), luma(rows));
+			copy(&mut live.cb, src.cb, chroma(from), chroma(rows));
+			copy(&mut live.cr, src.cr, chroma(from), chroma(rows));
+			let mb_w = src.y.width / 16;
+			let (a, b) = (from as usize * mb_w, (rows as usize * mb_w).min(src.motion.len()));
+			if a < b && live.motion.len() >= b {
+				live.motion[a..b].copy_from_slice(&src.motion[a..b]);
+			}
+		}
+		self.progress.report(rows);
+	}
+
+	/// Stores the final picture and wakes every reader.
+	pub fn finish(&self, planes: PicPlanes) {
+		let _ = self.done.set(planes);
+		// `live` is no longer needed: readers go to `done` from now on.
+		*self.live.write().unwrap_or_else(|e| e.into_inner()) = PicPlanes::default();
+		self.progress.report(self.mb_h + 1);
+	}
+
+	/// Marks the picture as failed (its decoder panicked) and releases the
+	/// waiters, which then panic too rather than hang.
+	pub fn poison(&self) {
+		self.poisoned.store(true, Ordering::Release);
+		self.progress.report(self.mb_h + 1);
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

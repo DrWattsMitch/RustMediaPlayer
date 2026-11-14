@@ -20,7 +20,7 @@ impl core::Decoder for Decoder {
 		}
 	}
 
-	fn decode(&self, state: &mut State, packet: Packet) -> Result<DecodeOut<State>> {
+	fn decode(&self, state: &mut State, packet: Packet) -> Result<DecodeOut> {
 		let frame = match self.kind {
 			StreamKind::Audio => {
 				let (sample_rate, channels, format, layout) = match state {
@@ -29,7 +29,7 @@ impl core::Decoder for Decoder {
 						(48_000, Channels::Stereo, SampleFormat::S16, SampleLayout::Interleaved)
 					}
 				};
-				let mut frame = AudioFrame::new(packet.data.clone(), sample_rate, channels, format, layout);
+				let mut frame = AudioFrame::new(packet.data, sample_rate, channels, format, layout);
 				frame.pts = packet.pts;
 				Frame::Audio(frame)
 			}
@@ -38,21 +38,22 @@ impl core::Decoder for Decoder {
 					State::Video(video) => (video.width, video.height, video.pixel.clone()),
 					State::Audio(_) => (0, 0, video::Pixel { depth: 8, format: video::PixelFormat::YUV420 }),
 				};
-				Frame::Video(VideoFrame {
-					data: packet.data.clone(),
+				// The packet's bytes become the frame's planes: no copy.
+				Frame::Video(VideoFrame::from_packed(
+					packet.data,
 					width,
 					height,
 					pixel,
-					keyframe: Keyframe::Key,
-					pts: packet.pts,
-				})
+					Keyframe::Key,
+					packet.pts,
+				))
 			}
 		};
 
-		Ok(DecodeOut { value: vec![frame], state: state.clone() })
+		Ok(DecodeOut { value: vec![frame] })
 	}
 
-	fn flush(&self, state: &mut State) -> Result<DecodeOut<State>> {
-		Ok(DecodeOut { value: Vec::new(), state: state.clone() })
+	fn flush(&self, _state: &mut State) -> Result<DecodeOut> {
+		Ok(DecodeOut { value: Vec::new() })
 	}
 }

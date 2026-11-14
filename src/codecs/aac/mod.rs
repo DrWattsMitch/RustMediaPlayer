@@ -23,6 +23,9 @@ pub mod config;
 pub mod decoder;
 pub mod encoder;
 pub mod ics;
+mod ps;
+mod sbr;
+mod sbr_tables;
 mod tables;
 
 pub use config::{AacConfig, AdtsHeader};

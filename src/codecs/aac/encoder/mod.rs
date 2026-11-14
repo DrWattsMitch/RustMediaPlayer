@@ -949,7 +949,7 @@ impl core::Encoder for AacEncoder {
 		})
 	}
 
-	fn encode(&self, state: &mut State, frame: Frame) -> Result<EncodeOut<State>> {
+	fn encode(&self, state: &mut State, frame: Frame) -> Result<EncodeOut> {
 		let Frame::Audio(frame) = frame else {
 			return Err(Message::Codec("aac encoder requires audio frames"));
 		};
@@ -983,10 +983,10 @@ impl core::Encoder for AacEncoder {
 		if let State::Audio(audio) = state {
 			audio.samples_consumed += count;
 		}
-		Ok(EncodeOut { value: packets, state: state.clone() })
+		Ok(EncodeOut { value: packets })
 	}
 
-	fn flush(&self, state: &mut State) -> Result<EncodeOut<State>> {
+	fn flush(&self, state: &mut State) -> Result<EncodeOut> {
 		let enc = self.state(state)?;
 		let mut packets = Vec::new();
 		while enc.frames_out < enc.frames_needed() {
@@ -997,7 +997,7 @@ impl core::Encoder for AacEncoder {
 			let data = enc.encode_frame();
 			packets.push(self.packet(data, index, enc));
 		}
-		Ok(EncodeOut { value: packets, state: state.clone() })
+		Ok(EncodeOut { value: packets })
 	}
 }
 

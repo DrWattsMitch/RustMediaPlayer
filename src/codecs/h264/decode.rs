@@ -3,13 +3,14 @@
 
 use super::cabac::Cabac;
 use super::consts::BLK_XY;
-use super::dpb::RefPic;
+use super::dpb::{MbMotion, RefPic};
 use super::mb::{BadMb, Entropy, MbInfo, MbKind, MbResult, MbType, Pred, Residual, SubType};
 use super::nal::more_rbsp_data;
 use super::params::{Pps, Sps};
 use super::recon::{self, Avail, Plane};
 use super::slice::{SliceHeader, SliceType};
 use crate::codecs::bitstream::BitReader;
+use crate::core::{BufferPool, Pooled, VecPool};
 
 /// Per-slice deblocking parameters.
 #[derive(Debug, Clone, Copy, Default)]
@@ -25,7 +26,7 @@ pub struct Frame {
 	pub y: Plane,
 	pub cb: Plane,
 	pub cr: Plane,
-	pub mbs: Vec<MbInfo>,
+	pub mbs: Pooled<MbInfo>,
 	pub mb_w: usize,
 	pub mb_h: usize,
 	/// Deblocking parameters by slice number - 1.
@@ -38,12 +39,35 @@ impl Frame {
 			y: Plane::new(mb_w * 16, mb_h * 16, 0),
 			cb: Plane::new(mb_w * 8, mb_h * 8, 128),
 			cr: Plane::new(mb_w * 8, mb_h * 8, 128),
-			mbs: vec![MbInfo::default(); mb_w * mb_h],
+			mbs: Pooled::detached(vec![MbInfo::default(); mb_w * mb_h]),
 			mb_w,
 			mb_h,
 			slices: Vec::new(),
 		}
 	}
+
+	/// Like [`Self::new`], with every buffer taken from `pools` (so that
+	/// decoding a picture allocates nothing once the pools are warm).
+	pub fn pooled(pools: &DecodePools, mb_w: usize, mb_h: usize) -> Self {
+		Self {
+			y: Plane::pooled(&pools.planes, mb_w * 16, mb_h * 16, 0),
+			cb: Plane::pooled(&pools.planes, mb_w * 8, mb_h * 8, 128),
+			cr: Plane::pooled(&pools.planes, mb_w * 8, mb_h * 8, 128),
+			mbs: pools.mbs.take_filled(mb_w * mb_h, MbInfo::default()),
+			mb_w,
+			mb_h,
+			slices: Vec::new(),
+		}
+	}
+}
+
+/// Buffer pools shared by the pictures of one decoder (and its frame
+/// threads): samples, macroblock info and stored motion.
+#[derive(Debug, Clone, Default)]
+pub struct DecodePools {
+	pub planes: BufferPool,
+	pub mbs: VecPool<MbInfo>,
+	pub motion: VecPool<MbMotion>,
 }
 
 pub struct SliceDecoder<'a> {
@@ -61,6 +85,9 @@ pub struct SliceDecoder<'a> {
 	pub res: Option<Box<Residual>>,
 	pub sub_types: [SubType; 4],
 	pub entropy: Entropy<'a>,
+	/// Called each time decoding crosses into a new macroblock row, so the
+	/// frame-threaded decoder can deblock and publish finished rows.
+	pub row_hook: Option<&'a mut dyn FnMut(&mut Frame)>,
 }
 
 impl<'a> SliceDecoder<'a> {
@@ -103,6 +130,22 @@ impl<'a> SliceDecoder<'a> {
 			res: Some(Box::default()),
 			sub_types: [SubType { pred: Pred::L0, parts: 1, w: 2, h: 2 }; 4],
 			entropy,
+			row_hook: None,
+		}
+	}
+
+	/// Runs `hook` whenever a macroblock row has been finished.
+	pub fn with_row_hook(mut self, hook: &'a mut dyn FnMut(&mut Frame)) -> Self {
+		self.row_hook = Some(hook);
+		self
+	}
+
+	#[inline]
+	fn row_check(&mut self, next_addr: usize) {
+		if next_addr.is_multiple_of(self.f.mb_w) {
+			if let Some(hook) = self.row_hook.as_mut() {
+				hook(self.f);
+			}
 		}
 	}
 
@@ -141,6 +184,7 @@ impl<'a> SliceDecoder<'a> {
 						}
 						self.skip_mb(addr)?;
 						addr += 1;
+						self.row_check(addr);
 					}
 					if run > 0 {
 						more = self.cavlc_more(rbsp);
@@ -169,6 +213,7 @@ impl<'a> SliceDecoder<'a> {
 				}
 			};
 			addr += 1;
+			self.row_check(addr);
 			if !more {
 				return Ok(());
 			}

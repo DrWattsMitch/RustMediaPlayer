@@ -219,7 +219,7 @@ impl core::Decoder for Mp3Decoder {
 		})
 	}
 
-	fn decode(&self, state: &mut State, packet: Packet) -> Result<DecodeOut<State>> {
+	fn decode(&self, state: &mut State, packet: Packet) -> Result<DecodeOut> {
 		let frames = {
 			let State::Audio(audio) = state else {
 				return Err(Message::Codec("mp3 decoder requires an audio state"));
@@ -262,16 +262,16 @@ impl core::Decoder for Mp3Decoder {
 			audio.samples_consumed += packet.data.len() as u64;
 			frames
 		};
-		Ok(DecodeOut { value: frames, state: state.clone() })
+		Ok(DecodeOut { value: frames })
 	}
 
-	fn flush(&self, state: &mut State) -> Result<DecodeOut<State>> {
+	fn flush(&self, state: &mut State) -> Result<DecodeOut> {
 		if let State::Audio(audio) = state {
 			if let CodecPrivate::Mp3(dec) = &mut audio.private {
 				dec.reset();
 			}
 		}
-		Ok(DecodeOut { value: Vec::new(), state: state.clone() })
+		Ok(DecodeOut { value: Vec::new() })
 	}
 }
 

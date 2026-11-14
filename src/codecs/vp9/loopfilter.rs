@@ -37,6 +37,23 @@ pub fn thresholds(sharpness: u8) -> [Thresholds; 64] {
 /// Mode delta index of each mode: 0 for intra and ZEROMV, 1 otherwise.
 const MODE_LF_LUT: [usize; 14] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1];
 
+/// What the loop filter needs to know about one 8x8 cell (a small copy of
+/// the cell's [`ModeInfo`], so the filter never needs the full mode info).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LfCell {
+	pub level: u8,
+	pub sb_type: u8,
+	pub tx_size: u8,
+	/// Skipped *and* inter: such blocks have no inner edges to filter.
+	pub skip_inter: bool,
+}
+
+impl LfCell {
+	pub fn new(mi: &ModeInfo, level: u8) -> Self {
+		Self { level, sb_type: mi.sb_type, tx_size: mi.tx_size, skip_inter: mi.skip && mi.is_inter() }
+	}
+}
+
 /// Filter level of a block from the frame's `[segment][ref][mode]` table.
 pub fn level(levels: &[[[u8; 2]; 4]; 8], mi: &ModeInfo) -> u8 {
 	levels[usize::from(mi.segment_id)][mi.ref_frame[0].max(0) as usize]
@@ -178,8 +195,7 @@ pub(super) fn horizontal_scalar(plane: &mut Plane, x: usize, y: usize, t: &Thres
 #[allow(clippy::too_many_arguments)]
 pub fn filter_superblock(
 	plane: &mut Plane,
-	mi: &[ModeInfo],
-	levels: &[u8],
+	cells: &[LfCell],
 	mi_rows: usize,
 	mi_cols: usize,
 	mi_row: usize,
@@ -204,9 +220,9 @@ pub fn filter_superblock(
 		let mut c = 0;
 		while c < 8 && mi_col + c < mi_cols {
 			let at = (mi_row + r) * mi_cols + mi_col + c;
-			let m = &mi[at];
+			let m = &cells[at];
 			let bt = usize::from(m.sb_type);
-			let skip_this = m.skip && m.is_inter();
+			let skip_this = m.skip_inter;
 			let edge_left =
 				if NUM_4X4_WIDE[bt] > 1 { c & (usize::from(NUM_8X8_WIDE[bt]) - 1) == 0 } else { true };
 			let skip_c = skip_this && !edge_left;
@@ -222,7 +238,7 @@ pub fn filter_superblock(
 			let border_r = ss_y == 1 && mi_row + r == mi_rows - 1;
 			let k = c >> ss_x;
 			let bit = 1u32 << k;
-			let level = levels[at];
+			let level = m.level;
 			lfl[(r << 3) + k] = level;
 			if level != 0 {
 				match tx {

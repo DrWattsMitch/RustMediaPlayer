@@ -24,7 +24,7 @@
 //! ("TV") range YUV, full-range RGB. Output samples are rounded to nearest
 //! and clamped.
 
-use crate::core::{Pixel, PixelFormat, VideoFrame};
+use crate::core::{BufferPool, Pixel, PixelFormat, PlaneRef, VideoFrame};
 use crate::message::{Message, Result};
 
 /// Largest picture accepted (as the H.264 decoder's cap, in both axes).
@@ -275,30 +275,34 @@ fn chroma_dims(width: u32, height: u32, format: PixelFormat) -> (usize, usize) {
 	((width as usize).div_ceil(1 << sx), (height as usize).div_ceil(1 << sy))
 }
 
-fn read_plane(data: &[u8], width: usize, height: usize, depth: u8) -> Plane {
-	let n = width * height;
-	let values: Vec<f32> = if depth > 8 {
-		let scale = 1.0 / f32::from(1u16 << (depth - 8));
-		data
-			.chunks_exact(2)
-			.take(n)
-			.map(|c| f32::from(u16::from_le_bytes([c[0], c[1]])) * scale)
-			.collect()
-	} else {
-		data.iter().take(n).map(|&b| f32::from(b)).collect()
-	};
+/// Reads `width` x `height` samples of a (possibly strided) plane.
+fn read_plane(src: &PlaneRef, width: usize, height: usize, depth: u8) -> Plane {
+	let mut values: Vec<f32> = Vec::with_capacity(width * height);
+	for row in src.rows_iter().take(height) {
+		if depth > 8 {
+			let scale = 1.0 / f32::from(1u16 << (depth - 8));
+			values.extend(
+				row
+					.chunks_exact(2)
+					.take(width)
+					.map(|c| f32::from(u16::from_le_bytes([c[0], c[1]])) * scale),
+			);
+		} else {
+			values.extend(row.iter().take(width).map(|&b| f32::from(b)));
+		}
+	}
 	Plane { width, height, data: values }
 }
 
 fn unpack(frame: &VideoFrame) -> Result<Unpacked> {
 	let pixel = &frame.pixel;
 	let (w, h) = (frame.width as usize, frame.height as usize);
-	let sizes =
-		pixel.plane_sizes(frame.width, frame.height).ok_or(Message::Other("picture too large"))?;
-	let total: usize = sizes.iter().sum();
-	if frame.data.len() < total {
+	pixel.plane_sizes(frame.width, frame.height).ok_or(Message::Other("picture too large"))?;
+	if !frame.is_complete() {
 		return Err(Message::Other("video frame is smaller than its format requires"));
 	}
+	// `is_complete` guarantees every plane the format has.
+	let plane = |i: usize| frame.plane(i).ok_or(Message::Other("video frame is missing a plane"));
 	let format = pixel.format;
 	if format.is_rgb() {
 		let bpp = format.packed_bytes();
@@ -309,7 +313,9 @@ fn unpack(frame: &VideoFrame) -> Result<Unpacked> {
 		let mut planes =
 			vec![Plane::filled(w, h, 0.0), Plane::filled(w, h, 0.0), Plane::filled(w, h, 0.0)];
 		let mut alpha = format.has_alpha().then(|| Plane::filled(w, h, 0.0));
-		for (i, px) in frame.data[..w * h * bpp].chunks_exact(bpp).enumerate() {
+		let packed = plane(0)?;
+		let pixels = packed.rows_iter().flat_map(|row| row[..w * bpp].chunks_exact(bpp));
+		for (i, px) in pixels.enumerate() {
 			planes[0].data[i] = f32::from(px[ri]);
 			planes[1].data[i] = f32::from(px[gi]);
 			planes[2].data[i] = f32::from(px[bi]);
@@ -320,32 +326,25 @@ fn unpack(frame: &VideoFrame) -> Result<Unpacked> {
 		return Ok(Unpacked { rgb: true, planes, alpha });
 	}
 	let (cw, ch) = chroma_dims(frame.width, frame.height, format);
-	let mut at = 0usize;
-	let mut take = |len: usize| {
-		let slice = &frame.data[at..at + len];
-		at += len;
-		slice
-	};
-	let y = read_plane(take(sizes[0]), w, h, pixel.depth);
+	let y = read_plane(plane(0)?, w, h, pixel.depth);
 	let (u, v) = match format {
 		PixelFormat::Gray => (Plane::filled(w, h, 128.0), Plane::filled(w, h, 128.0)),
 		PixelFormat::NV12 => {
-			let uv = take(sizes[1]);
+			let uv = plane(1)?;
 			let mut u = Plane::filled(cw, ch, 0.0);
 			let mut v = Plane::filled(cw, ch, 0.0);
-			for (i, pair) in uv.chunks_exact(2).take(cw * ch).enumerate() {
+			let pairs = uv.rows_iter().take(ch).flat_map(|row| row[..cw * 2].chunks_exact(2));
+			for (i, pair) in pairs.enumerate() {
 				u.data[i] = f32::from(pair[0]);
 				v.data[i] = f32::from(pair[1]);
 			}
 			(u, v)
 		}
-		_ => (
-			read_plane(take(sizes[1]), cw, ch, pixel.depth),
-			read_plane(take(sizes[2]), cw, ch, pixel.depth),
-		),
+		_ => (read_plane(plane(1)?, cw, ch, pixel.depth), read_plane(plane(2)?, cw, ch, pixel.depth)),
 	};
-	let alpha = (format == PixelFormat::YUVA444).then(|| {
-		let mut a = read_plane(take(sizes[3]), w, h, pixel.depth);
+	let alpha_plane = if format == PixelFormat::YUVA444 { Some(plane(3)?) } else { None };
+	let alpha = alpha_plane.map(|src| {
+		let mut a = read_plane(src, w, h, pixel.depth);
 		// Alpha is full range: rescale codes to 0-255.
 		let max = f32::from(((1u32 << pixel.depth) - 1) as u16) / f32::from(1u16 << (pixel.depth - 8));
 		a.data.iter_mut().for_each(|v| *v *= 255.0 / max);
@@ -432,6 +431,9 @@ pub struct VideoConverter {
 	input: VideoSpec,
 	output: VideoSpec,
 	options: VideoOptions,
+	/// Output pictures; recycled once the encoder (or whoever holds the
+	/// frame) drops them.
+	pool: BufferPool,
 }
 
 impl VideoConverter {
@@ -448,7 +450,7 @@ impl VideoConverter {
 				return Err(Message::Other("video converter: picture too large"));
 			}
 		}
-		Ok(Self { input, output, options })
+		Ok(Self { input, output, options, pool: BufferPool::default() })
 	}
 
 	pub fn input(&self) -> &VideoSpec {
@@ -468,6 +470,7 @@ impl VideoConverter {
 			return Err(Message::Other("video converter: frame does not match the input spec"));
 		}
 		if self.is_identity() {
+			// A new reference to the same planes, not a copy.
 			return Ok(frame.clone());
 		}
 		let o = &self.options;
@@ -504,7 +507,8 @@ impl VideoConverter {
 		});
 
 		let size = self.output.pixel.frame_size(self.output.width, self.output.height).unwrap_or(0);
-		let mut data = Vec::with_capacity(size);
+		let mut buffer = self.pool.take_empty(size);
+		let data = buffer.vec_mut();
 		let depth = self.output.pixel.depth;
 		match out_format {
 			f if f.is_rgb() => {
@@ -519,9 +523,9 @@ impl VideoConverter {
 					}
 				}
 			}
-			PixelFormat::Gray => write_plane(&mut data, &planes[0], depth),
+			PixelFormat::Gray => write_plane(data, &planes[0], depth),
 			PixelFormat::NV12 => {
-				write_plane(&mut data, &planes[0], 8);
+				write_plane(data, &planes[0], 8);
 				for (u, v) in planes[1].data.iter().zip(&planes[2].data) {
 					data.push(u.round().clamp(0.0, 255.0) as u8);
 					data.push(v.round().clamp(0.0, 255.0) as u8);
@@ -529,23 +533,23 @@ impl VideoConverter {
 			}
 			_ => {
 				for p in &planes {
-					write_plane(&mut data, p, depth);
+					write_plane(data, p, depth);
 				}
 				if let Some(mut a) = alpha {
 					let max = f32::from(((1u32 << depth) - 1) as u16) / f32::from(1u16 << (depth - 8));
 					a.data.iter_mut().for_each(|v| *v *= max / 255.0);
-					write_plane(&mut data, &a, depth);
+					write_plane(data, &a, depth);
 				}
 			}
 		}
-		Ok(VideoFrame {
-			data,
-			width: self.output.width,
-			height: self.output.height,
-			pixel: self.output.pixel.clone(),
-			keyframe: frame.keyframe,
-			pts: frame.pts,
-		})
+		Ok(VideoFrame::from_packed(
+			buffer.freeze(),
+			self.output.width,
+			self.output.height,
+			self.output.pixel.clone(),
+			frame.keyframe,
+			frame.pts,
+		))
 	}
 }
 
@@ -555,14 +559,7 @@ mod tests {
 	use crate::core::Keyframe;
 
 	fn frame(w: u32, h: u32, pixel: &str, data: Vec<u8>) -> VideoFrame {
-		VideoFrame {
-			data,
-			width: w,
-			height: h,
-			pixel: Pixel::from_name(pixel).unwrap(),
-			keyframe: Keyframe::Key,
-			pts: None,
-		}
+		VideoFrame::from_packed(data, w, h, Pixel::from_name(pixel).unwrap(), Keyframe::Key, None)
 	}
 
 	fn convert(f: &VideoFrame, w: u32, h: u32, pixel: &str) -> VideoFrame {
@@ -576,9 +573,9 @@ mod tests {
 		let rgb = vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 128, 128, 128];
 		let f = frame(6, 1, "rgb24", rgb.clone());
 		let yuv = convert(&f, 6, 1, "yuv444p");
-		assert_eq!(&yuv.data[..6], &[81, 145, 41, 235, 16, 126]);
+		assert_eq!(&yuv.data()[..6], &[81, 145, 41, 235, 16, 126]);
 		let back = convert(&yuv, 6, 1, "rgb24");
-		for (a, b) in back.data.iter().zip(&rgb) {
+		for (a, b) in back.data().iter().zip(&rgb) {
 			assert!((i16::from(*a) - i16::from(*b)).abs() <= 2, "{back:?}");
 		}
 	}
@@ -587,15 +584,15 @@ mod tests {
 	fn depth_and_layout_changes() {
 		let f = frame(2, 2, "yuv420p", vec![16, 235, 128, 64, 100, 200]);
 		let ten = convert(&f, 2, 2, "yuv420p10le");
-		let words: Vec<u16> = ten.data.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+		let words: Vec<u16> = ten.data().chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
 		assert_eq!(words, vec![64, 940, 512, 256, 400, 800]);
-		assert_eq!(convert(&ten, 2, 2, "yuv420p").data, f.data);
+		assert_eq!(convert(&ten, 2, 2, "yuv420p").data(), f.data());
 		let nv12 = convert(&f, 2, 2, "nv12");
-		assert_eq!(nv12.data, vec![16, 235, 128, 64, 100, 200]);
+		assert_eq!(nv12.data(), vec![16, 235, 128, 64, 100, 200]);
 		let gray = convert(&f, 2, 2, "gray");
-		assert_eq!(gray.data, vec![16, 235, 128, 64]);
+		assert_eq!(gray.data(), vec![16, 235, 128, 64]);
 		let yuv444 = convert(&f, 2, 2, "yuv444p");
-		assert_eq!(&yuv444.data[4..], &[100, 100, 100, 100, 200, 200, 200, 200]);
+		assert_eq!(&yuv444.data()[4..], &[100, 100, 100, 100, 200, 200, 200, 200]);
 	}
 
 	#[test]
@@ -614,15 +611,15 @@ mod tests {
 			let big = up.convert(&g).unwrap();
 			assert_eq!(big.pts, g.pts);
 			// Rows are identical (no vertical variation in the source).
-			assert_eq!(&big.data[..32], &big.data[32 * 10..32 * 11]);
+			assert_eq!(&big.data()[..32], &big.data()[32 * 10..32 * 11]);
 			let down =
 				VideoConverter::new(VideoSpec::of(&big), VideoSpec::new(16, 16, g.pixel.clone()), options)
 					.unwrap();
 			let small = down.convert(&big).unwrap();
 			let err: i32 = small
-				.data
+				.data()
 				.iter()
-				.zip(&g.data)
+				.zip(g.data().iter())
 				.map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs())
 				.max()
 				.unwrap();
