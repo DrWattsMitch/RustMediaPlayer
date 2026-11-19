@@ -740,7 +740,7 @@ impl core::Decoder for H264Decoder {
 				};
 				to_frames(video, pics)
 			}
-			State::Audio(_) => Vec::new(),
+			State::Audio(_) | State::Subtitle(_) => Vec::new(),
 		};
 		Ok(DecodeOut { value: frames })
 	}

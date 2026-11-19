@@ -76,7 +76,8 @@ rmp -i input.mkv -c copy out.webm  # WebM takes only VP8/VP9/AV1, Opus/Vorbis, W
 
 ### Decoding and re-encoding
 
-RMP decodes PCM, ADPCM, MP3, AAC, H.264, VP9, FLAC, Opus and Vorbis, and encodes AAC-LC,
+RMP decodes PCM, ADPCM, MP3, AAC, ALAC, H.264, VP8, VP9, FLAC, Opus, Vorbis and text
+subtitles (SRT, WebVTT, ASS/SSA, MP4 timed text), and encodes AAC-LC,
 H.264, FLAC, PCM and raw video. Without `-c:a`/`-c:v`, each container gets a
 sensible default (WAV → `pcm_s16le`, MP4/M4A/MOV → AAC and FLAC/Ogg/Matroska
 → FLAC when the source can't be copied, Y4M → `rawvideo`):
@@ -140,8 +141,34 @@ rmp -i movie.mp4 -c copy -frag_duration 2000000 frag.mp4   # a fragment every 2 
 ```
 
 Fragmented output never seeks, so it also works when writing to a pipe.
+
+HLS playlists and DASH manifests are inputs like any file:
+
+```bash
+rmp -i https://example.com/live/master.m3u8              # the chosen variant's streams
+rmp -i https://example.com/vod/master.m3u8 -c copy vod.mp4
+rmp -i manifest.mpd -c copy out.mkv
+rmp -i broadcast.ts -c copy out.mp4                       # TS → MP4 stream copy
+```
+
+RMP plays one variant (the highest bandwidth), its audio rendition and
+its WebVTT subtitle renditions, as a player does; `rmp::container::segment::StreamingOptions` with
+`Input::open_with` chooses by bandwidth, height, index or audio language.
 Fragmented MP4 files (RMP's, FFmpeg's, DASH/CMAF segments joined into one
 file) are read like any other MP4.
+
+MPEG-TS and HLS are outputs too, with FFmpeg's option names:
+
+```bash
+rmp -i movie.mkv out.ts                                   # H.264/HEVC + AAC/AC-3/Opus as TS
+rmp -i movie.mkv -hls_time 4 -hls_playlist_type vod hls/out.m3u8   # TS segments (+ WebVTT subtitles)
+rmp -i movie.mp4 -hls_segment_type fmp4 hls/out.m3u8      # fMP4 segments + init.mp4
+rmp -i movie.mp4 -hls_enc 1 hls/out.m3u8                  # AES-128, key in hls/out.key
+rmp -i movie.mp4 -hls_enc 1 -hls_enc_method sample-aes hls/out.m3u8   # SAMPLE-AES
+```
+
+Subtitles go to `out_vtt.m3u8`, with `out_master.m3u8` tying them to the
+media playlist. See [docs/TS_HLS_OUTPUT.md](docs/TS_HLS_OUTPUT.md).
 
 ### Bit depth and dithering
 
@@ -298,6 +325,24 @@ Containers:
 - **Ogg** (`.ogg`, `.opus`, `.oga`): demux and mux of Opus, FLAC and Vorbis
   streams, with Vorbis comments and `METADATA_BLOCK_PICTURE` cover art. The
   muxer writes exact granule positions and FFmpeg's page layout.
+- **MPEG-TS** (`.ts`, `.m2ts`, `.mts`): demux of 188/192/204-byte streams
+  with H.264, HEVC, MPEG-2 video, AAC, MP1/2/3, AC-3, E-AC-3 and DVB/Blu-ray
+  subtitles; packets, timestamps and keyframes identical to `ffprobe`;
+  keyframe seeking. Stream copy into MP4 and Matroska converts Annex B and
+  ADTS automatically. Opus (with its control headers) and SAMPLE-AES
+  stream types are read too. The muxer follows FFmpeg's layout (PIDs,
+  PAT/PMT/SDT periods, PCR, 1.4 s start): TS → TS copies come back packet
+  for packet, and MP4/Matroska input gets FFmpeg's exact Annex B and ADTS
+  payloads.
+- **HLS** (`.m3u8`) and **DASH** (`.mpd`) input, local or over HTTP(S):
+  variant/representation choice, TS, fragmented MP4, WebM and packed-audio
+  segments, byte ranges, AES-128 and SAMPLE-AES (HLS), WebVTT subtitle
+  renditions, SegmentTemplate/Timeline/List/Base (DASH), multi-period and
+  live presentations. **HLS output**: TS or fMP4 segments, AES-128 or
+  SAMPLE-AES, WebVTT renditions, master playlist, sliding windows.
+- **WebVTT** (`.vtt`): demux and mux; HLS `X-TIMESTAMP-MAP` mapping.
+- **SubRip** (`.srt`) and **ASS/SSA** (`.ass`, `.ssa`): demux and mux (UTF-8,
+  UTF-16 and Latin-1 files; ASS keeps its script header as extradata).
 
 Codecs:
 
@@ -330,6 +375,16 @@ Codecs:
   `show_existing_frame`, tiles, segmentation, compound prediction,
   lossless frames and backward probability adaptation. Bit-exact with
   libvpx / FFmpeg.
+- **VP8**: decoder for every VP8 stream (WebM's original codec): golden
+  and alt-ref references with sign bias, hidden alt-ref frames, B_PRED and
+  split motion vectors, token partitions, segmentation, the normal and
+  simple loop filters, bilinear profiles 1-3. Bit-exact with libvpx / FFmpeg.
+- **ALAC**: decoder for 16/20/24/32-bit Apple Lossless, mono to 7.1, from
+  MP4/M4A and Matroska. Bit-exact with FFmpeg.
+- **Text subtitles**: SubRip, WebVTT (plain and MP4 `wvtt`), ASS/SSA and MP4
+  timed text decode to timed cues (`Frame::Subtitle`) with the original
+  markup, a plain-text rendering and the ASS event fields; `AssScript`
+  parses an ASS header's styles for the player's renderer.
 
 Processing (`rmp::process`), so files can be transcoded and not only
 remuxed: sample-format conversion, resampling (polyphase windowed sinc),
@@ -342,8 +397,11 @@ See [docs/WAV_Y4M.md](docs/WAV_Y4M.md), [docs/MP3_MP4.md](docs/MP3_MP4.md),
 [docs/AAC_H264_ENCODING.md](docs/AAC_H264_ENCODING.md),
 [docs/MKV_FLAC_OPUS_PROCESSING.md](docs/MKV_FLAC_OPUS_PROCESSING.md) and
 [docs/MKV_OGG_MUXING_CLI.md](docs/MKV_OGG_MUXING_CLI.md),
+[docs/MPEGTS_HLS_DASH.md](docs/MPEGTS_HLS_DASH.md),
+[docs/TS_HLS_OUTPUT.md](docs/TS_HLS_OUTPUT.md),
 [docs/OPUS_PLC.md](docs/OPUS_PLC.md),
-[docs/VORBIS_VP9.md](docs/VORBIS_VP9.md) and
+[docs/VORBIS_VP9.md](docs/VORBIS_VP9.md),
+[docs/SUBTITLES_VP8_ALAC.md](docs/SUBTITLES_VP8_ALAC.md) and
 [docs/THREADING.md](docs/THREADING.md) (H.264 frame threads, VP9 tile
 threads, the transcode pipeline and how they compare with FFmpeg) and
 [docs/ZERO_COPY.md](docs/ZERO_COPY.md) (reference-counted frames and buffer
@@ -361,6 +419,7 @@ cargo run --release --example transcode   -- input.mkv output.flac -ar 48000
 cargo run --release --example transcode   -- input.opus output.wav -c:a pcm_f32le
 cargo run --release --example framecrc    -- input.mkv   # like ffmpeg -f framecrc
 cargo run --release --example zero_copy   -- input.mp4   # frames to a "render" thread, no copies
+cargo run --release --example subtitles   -- movie.mkv 61.5 # the cues on screen at 61.5 s
 ```
 
 Raw video is the `rawvideo` codec with its layout in `pixel_format`, and

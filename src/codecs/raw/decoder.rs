@@ -25,7 +25,7 @@ impl core::Decoder for Decoder {
 			StreamKind::Audio => {
 				let (sample_rate, channels, format, layout) = match state {
 					State::Audio(audio) => (audio.sample_rate, audio.channels, audio.format, audio.layout),
-					State::Video(_) => {
+					State::Video(_) | State::Subtitle(_) => {
 						(48_000, Channels::Stereo, SampleFormat::S16, SampleLayout::Interleaved)
 					}
 				};
@@ -36,7 +36,9 @@ impl core::Decoder for Decoder {
 			_ => {
 				let (width, height, pixel) = match state {
 					State::Video(video) => (video.width, video.height, video.pixel.clone()),
-					State::Audio(_) => (0, 0, video::Pixel { depth: 8, format: video::PixelFormat::YUV420 }),
+					State::Audio(_) | State::Subtitle(_) => {
+						(0, 0, video::Pixel { depth: 8, format: video::PixelFormat::YUV420 })
+					}
 				};
 				// The packet's bytes become the frame's planes: no copy.
 				Frame::Video(VideoFrame::from_packed(

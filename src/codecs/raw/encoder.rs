@@ -40,6 +40,15 @@ impl core::Encoder for Encoder {
 				// visible rows are packed once (`av_image_copy_to_buffer`).
 				data: frame.into_packed(),
 			},
+			// Text subtitles re-encode to their own markup.
+			Frame::Subtitle(cue) => Packet {
+				stream_id: self.stream_id,
+				pts: cue.pts,
+				dts: cue.pts,
+				duration: cue.duration,
+				keyframe: true,
+				data: cue.markup.into_bytes(),
+			},
 		};
 
 		Ok(EncodeOut { value: vec![packet] })

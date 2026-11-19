@@ -1382,8 +1382,11 @@ impl<'a, 'b> SliceDecoder<'a, 'b> {
 					signs <<= 1;
 				}
 				let (xc, yc) = ((xs << 2) + usize::from(sub[p].0), (ys << 2) + usize::from(sub[p].1));
+				// TransCoeffLevel must fit in 16 bits (§7.4.9.11); damaged
+				// streams can exceed that, so clip on the lossless path too
+				// (FFmpeg gets this implicitly from int16_t coefficients).
 				let v = if cu.bypass {
-					level
+					level.clamp(-32768, 32767)
 				} else {
 					let m_scale = match matrix {
 						Some((mat, dc)) => {

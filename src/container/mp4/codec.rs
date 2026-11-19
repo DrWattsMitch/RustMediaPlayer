@@ -23,6 +23,8 @@ pub struct CodecInfo {
 	pub channels: Option<u8>,
 	pub extradata: Vec<u8>,
 	pub bitrate: Option<u32>,
+	/// Bits per decoded sample when the codec configuration says (ALAC).
+	pub bits_per_sample: Option<u8>,
 }
 
 /// MPEG-4 Systems object type indications (ISO/IEC 14496-1, Table 5).
@@ -163,6 +165,15 @@ fn parse_audio_entry(format: &FourCC, entry: &[u8]) -> Result<CodecInfo> {
 					info.extradata = si.to_bytes().to_vec();
 					info.sample_rate = Some(si.sample_rate);
 					info.channels = Some(si.channels);
+				}
+			}
+			// FFmpeg keeps the whole 36-byte `alac` atom (mov.c).
+			b"alac" => {
+				if let Some(c) = crate::codecs::alac::AlacConfig::from_extradata(&info.extradata) {
+					info.extradata = c.to_atom();
+					info.sample_rate = Some(c.sample_rate);
+					info.channels = Some(c.channels);
+					info.bits_per_sample = Some(c.bit_depth);
 				}
 			}
 			b"Opus" => {
@@ -438,7 +449,8 @@ fn write_audio_entry(out: &mut Vec<u8>, p: &EntryParams) -> Result<()> {
 						.or_else(|| OpusHead::from_dops(extradata))
 						.ok_or(Message::Container("mp4 muxer: invalid opus extradata"))?
 						.to_dops(),
-					_ => extradata.to_vec(),
+					_ => crate::codecs::alac::AlacConfig::box_body(extradata)
+						.ok_or(Message::Container("mp4 muxer: invalid alac extradata"))?,
 				};
 				write_box(out, config, |out| {
 					out.put(&body);

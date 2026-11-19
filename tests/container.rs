@@ -47,3 +47,15 @@ mod mkv_muxer_test;
 
 #[path = "container/ogg/muxer_test.rs"]
 mod ogg_muxer_test;
+
+#[path = "container/mpegts/demuxer_test.rs"]
+mod mpegts_demuxer_test;
+
+#[path = "container/streaming/streaming_test.rs"]
+mod streaming_test;
+
+#[path = "container/mpegts/muxer_test.rs"]
+mod mpegts_muxer_test;
+
+#[path = "container/streaming/hls_output_test.rs"]
+mod hls_output_test;

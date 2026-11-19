@@ -1,9 +1,11 @@
 pub mod audio;
 pub mod buffer;
+pub mod subtitle;
 pub mod video;
 
 pub use audio::{AudioFrame, AudioParams, Channels, SampleFormat, SampleLayout};
 pub use buffer::{BufferPool, BufferSource, FrameBuffer, PoolStats, Pooled, VecPool};
+pub use subtitle::{AssEvent, SubtitleFormat, SubtitleFrame};
 pub use video::{Keyframe, MAX_PLANES, Pixel, PixelFormat, PlaneRef, VideoFrame};
 
 // A video frame is a few plane references (~250 bytes), not its samples:
@@ -13,4 +15,6 @@ pub use video::{Keyframe, MAX_PLANES, Pixel, PixelFormat, PlaneRef, VideoFrame};
 pub enum Frame {
 	Audio(AudioFrame),
 	Video(VideoFrame),
+	/// A timed text cue (see [`subtitle`]).
+	Subtitle(SubtitleFrame),
 }

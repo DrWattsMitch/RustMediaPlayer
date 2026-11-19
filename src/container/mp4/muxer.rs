@@ -40,8 +40,10 @@ use super::fragment::{self, FragmentSample, RandomAccess, TrackFragment};
 use super::metadata;
 use super::options::Mp4Options;
 use crate::codecs::mp3::FrameHeader;
+use crate::container::bsf::Converter;
 use crate::core::{
-	Metadata, Muxer, Packet, RawValue, Stream, StreamId, StreamKind, Time, TimeBase, rescale_ticks,
+	Metadata, Muxer, Packet, Parameters, RawValue, Stream, StreamId, StreamKind, Time, TimeBase,
+	rescale_ticks,
 };
 use crate::io::Io;
 use crate::message::{Message, Result};
@@ -127,6 +129,12 @@ struct MuxTrack {
 	cts_shift: i64,
 	/// Fragmented: fragments starting with a sync sample, for `tfra`.
 	random_access: Vec<RandomAccess>,
+	/// Annex B / ADTS input is converted to the MP4 layout.
+	bsf: Converter,
+	/// The stream's parameters, updated by `bsf` (config from ADTS).
+	parameters: Parameters,
+	/// `mdhd` language: ISO 639-2/T packed as three 5-bit letters.
+	language: u16,
 }
 
 impl MuxTrack {
@@ -343,6 +351,21 @@ impl Mp4Muxer {
 
 	pub fn options(&self) -> &Mp4Options {
 		&self.options
+	}
+
+	/// Fragmented output: ends the current fragment now, writing it (and,
+	/// before the first one, the init segment). Segmenters (HLS) call it at
+	/// each segment boundary, as FFmpeg's `hls` muxer flushes its `mov`
+	/// muxer with `frag_custom`. Nothing is written when no sample is
+	/// buffered.
+	pub fn cut_fragment(&mut self) -> Result<()> {
+		if !self.fragmented() {
+			return Err(Message::Container("mp4 muxer: cut_fragment needs fragmented output"));
+		}
+		if !self.started {
+			self.start()?;
+		}
+		self.flush_fragment()
 	}
 
 	fn fragmented(&self) -> bool {
@@ -710,6 +733,23 @@ fn read_exact(io: &mut dyn Io, mut buf: &mut [u8]) -> Result<()> {
 }
 
 /// Writes version 0 when every value fits 32 bits, version 1 otherwise.
+/// Packed `und`.
+const LANGUAGE_UNDETERMINED: u16 = 0x55C4;
+
+/// The `mdhd` language field (ISO/IEC 14496-12 §8.4.2.3): three lowercase
+/// ISO 639-2/T letters, 5 bits each (`letter - 0x60`). Like FFmpeg's
+/// `ff_mov_iso639_to_lang` in MP4 mode, anything that isn't three letters
+/// is `und`; case is folded (`ENG` → `eng`).
+fn pack_language(value: Option<&RawValue>) -> u16 {
+	let Some(RawValue::String(lang)) = value else { return LANGUAGE_UNDETERMINED };
+	let lang = lang.trim().to_ascii_lowercase();
+	let bytes = lang.as_bytes();
+	if bytes.len() != 3 || !bytes.iter().all(u8::is_ascii_lowercase) {
+		return LANGUAGE_UNDETERMINED;
+	}
+	bytes.iter().fold(0u16, |code, &c| (code << 5) | u16::from(c - 0x60))
+}
+
 fn version_for(values: &[u64]) -> u8 {
 	u8::from(values.iter().any(|&v| v > u64::from(u32::MAX)))
 }
@@ -789,7 +829,7 @@ fn write_trak(out: &mut Vec<u8>, track: &MuxTrack, layout: Layout) -> Result<()>
 				put_time(out, version, 0);
 				out.put_u32(track.timescale);
 				put_time(out, version, media_duration);
-				out.put_u16(0x55C4); // "und"
+				out.put_u16(track.language);
 				out.put_u16(0);
 				Ok(())
 			})?;
@@ -980,7 +1020,9 @@ impl Muxer for Mp4Muxer {
 		if !matches!(stream.kind, StreamKind::Audio | StreamKind::Video) {
 			return Err(Message::Container("mp4 muxer supports only audio and video streams"));
 		}
-		let p = &stream.parameters;
+		let mut parameters = stream.parameters.clone();
+		let bsf = Converter::for_iso(&mut parameters)?;
+		let p = &parameters;
 		if !codec::muxer_supports(&p.codec.id) {
 			return Err(Message::Container("mp4 muxer: unsupported codec"));
 		}
@@ -1023,16 +1065,23 @@ impl Muxer for Mp4Muxer {
 			edit: None,
 			cts_shift: 0,
 			random_access: Vec::new(),
+			bsf,
+			parameters: parameters.clone(),
+			language: pack_language(stream.metadata.raw.get("language")),
 		});
 		Ok(self.tracks.len() - 1)
 	}
 
-	fn write(&mut self, packet: Packet) -> Result<()> {
+	fn write(&mut self, mut packet: Packet) -> Result<()> {
 		let index = self
 			.tracks
 			.iter()
 			.position(|t| t.stream_id == packet.stream_id)
 			.ok_or(Message::Container("mp4 muxer: packet for unknown stream"))?;
+		let track = &mut self.tracks[index];
+		if track.bsf.apply(&mut packet, &mut track.parameters)? && !self.moov_written {
+			track.extradata = track.parameters.extradata.clone();
+		}
 		if !self.started {
 			self.start()?;
 		}

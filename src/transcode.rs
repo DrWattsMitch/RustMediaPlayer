@@ -22,6 +22,11 @@
 //! | `.webm` | copy (Opus/Vorbis only) | copy (VP8/VP9/AV1 only) | copy (WebVTT only) |
 //! | `.ogg`, `.oga` | copy for Opus/FLAC/Vorbis, else `flac` | dropped | dropped |
 //! | `.opus` | copy (Opus only) | dropped | dropped |
+//! | `.ts`, `.m2ts` | copy when MPEG-TS holds the codec (AAC, MP2/MP3, AC-3, E-AC-3, Opus), else `aac` | copy when it holds it (H.264, HEVC, MPEG-2, MPEG-4), else `h264` | dropped |
+//! | `.m3u8` (HLS) | as `.ts` (as `.mp4` with `-hls_segment_type fmp4`) | as `.ts` | WebVTT / SubRip as WebVTT renditions |
+//! | `.vtt` | dropped | dropped | WebVTT / SubRip |
+//! | `.srt` | dropped | dropped | SubRip / WebVTT |
+//! | `.ass` / `.ssa` | dropped | dropped | ASS / SSA |
 //!
 //! RMP's encoders are AAC-LC, FLAC, PCM, H.264 (Constrained Baseline) and
 //! raw video, so a transcode can produce those codecs; anything else is a
@@ -170,7 +175,14 @@ impl Options {
 					| "-frag_duration"
 					| "-min_frag_duration"
 					| "-threads"
-			)
+			) || Self::is_container_option(option)
+	}
+
+	/// HLS and MPEG-TS muxer options (`-hls_time`, `-mpegts_service_id`, ...).
+	pub fn is_container_option(option: &str) -> bool {
+		let Some(name) = option.strip_prefix('-') else { return false };
+		crate::container::hls::muxer::HLS_OPTIONS.contains(&name)
+			|| crate::container::mpegts::muxer::TS_OPTIONS.contains(&name)
 	}
 
 	/// Applies one option (`value` is `None` for flags).
@@ -307,6 +319,17 @@ impl Options {
 				})?;
 				self.container_options.push((key.to_string(), v.to_string()));
 			}
+			other if Self::is_container_option(other) => {
+				let v = need()?;
+				let key = &other[1..];
+				// Check the value now, so a typo fails before any work.
+				let mut check = crate::container::hls::muxer::HlsOptions::default();
+				check.set(key, v).map_err(|e| match e {
+					Message::Container(s) | Message::Other(s) | Message::Codec(s) => format!("{s}: {v}"),
+					Message::Io(e) => e.to_string(),
+				})?;
+				self.container_options.push((key.to_string(), v.to_string()));
+			}
 			other => return Err(format!("unknown option {other}")),
 		}
 		Ok(())
@@ -405,6 +428,9 @@ struct AudioRoute {
 	/// Significant bits of an integer target (24 for `pcm_s24le` or 24-bit
 	/// FLAC held in `S32`), and how to round to them.
 	precision: u32,
+	/// Significant bits of the decoded samples, when the source declares
+	/// them (`u32::MAX` otherwise).
+	source_bits: u32,
 	dither: Dither,
 	converter: Option<AudioConverter>,
 	/// Source priming / padding to drop from the decoded audio.
@@ -515,15 +541,38 @@ fn frame_time_base(stream: &Stream, first_duration: Option<u64>) -> TimeBase {
 	}
 }
 
+fn is_ts(ext: &str) -> bool {
+	matches!(ext, "ts" | "m2t" | "mts" | "m2ts" | "mpegts" | "trp")
+}
+
+fn is_hls(ext: &str) -> bool {
+	matches!(ext, "m3u8" | "hls")
+}
+
+/// The container an HLS output's segments use.
+fn hls_segments_are_mp4(options: &Options) -> bool {
+	options.container_options.iter().any(|(k, v)| k == "hls_segment_type" && v == "fmp4")
+}
+
+/// Whether the output's media container holds a codec as it is.
+fn output_holds(ext: &str, options: &Options, codec: &str) -> bool {
+	if is_hls(ext) && hls_segments_are_mp4(options) {
+		return muxer_supports(codec);
+	}
+	crate::container::mpegts::muxer::supports(codec)
+}
+
 fn matroska_holds(stream: &Stream, webm: bool) -> bool {
 	mux_codec(&stream.parameters, webm).is_ok()
 }
 
 /// Default audio codec for a container (`None`: drop audio).
-fn default_audio(ext: &str, stream: &Stream) -> Option<&'static str> {
+fn default_audio(ext: &str, stream: &Stream, options: &Options) -> Option<&'static str> {
 	let codec = stream.parameters.codec.id.as_str();
 	Some(match ext {
-		"y4m" => return None,
+		"y4m" | "vtt" | "webvtt" | "srt" | "ass" | "ssa" => return None,
+		_ if (is_ts(ext) || is_hls(ext)) && output_holds(ext, options, codec) => "copy",
+		_ if is_ts(ext) || is_hls(ext) => "aac",
 		"wav" => "pcm_s16le",
 		"flac" => "flac",
 		"mp3" => "copy",
@@ -540,13 +589,18 @@ fn default_audio(ext: &str, stream: &Stream) -> Option<&'static str> {
 
 /// Whether a container takes video / subtitle streams by default.
 fn keeps_video(ext: &str) -> bool {
-	matches!(ext, "y4m" | "mp4" | "mov" | "mkv" | "webm")
+	matches!(ext, "y4m" | "mp4" | "mov" | "mkv" | "webm") || is_ts(ext) || is_hls(ext)
 }
 
 fn keeps_subtitles(ext: &str, stream: &Stream) -> bool {
 	match ext {
 		"mkv" | "mka" | "mks" => matroska_holds(stream, false),
 		"webm" => stream.parameters.codec.id == "webvtt",
+		// HLS carries text subtitles as WebVTT renditions.
+		"m3u8" | "hls" | "vtt" | "webvtt" | "srt" => {
+			crate::container::webvtt::holds(&stream.parameters.codec.id)
+		}
+		"ass" | "ssa" => matches!(stream.parameters.codec.id.as_str(), "ass" | "ssa"),
 		_ => false,
 	}
 }
@@ -579,12 +633,25 @@ fn transcode_with(input: &str, output: &str, options: &Options, threads: usize) 
 	};
 	apply_metadata(&mut metadata, &options.metadata);
 	muxer.set_metadata(metadata)?;
-	if !options.container_options.is_empty()
-		&& !matches!(ext.as_str(), "mp4" | "m4a" | "m4v" | "m4b" | "mov")
-	{
-		return Err(Message::Container(
-			"-movflags / -frag_duration apply only to MP4, M4A and MOV outputs",
-		));
+	let mp4_family = matches!(ext.as_str(), "mp4" | "m4a" | "m4v" | "m4b" | "mov");
+	for (key, _) in &options.container_options {
+		let mp4_key = matches!(key.as_str(), "movflags" | "frag_duration" | "min_frag_duration");
+		let fits = if mp4_key {
+			mp4_family
+		} else if key.starts_with("hls_") || matches!(key.as_str(), "master_pl_name" | "start_number") {
+			is_hls(&ext)
+		} else {
+			is_ts(&ext) || is_hls(&ext)
+		};
+		if !fits {
+			return Err(Message::Container(if mp4_key {
+				"-movflags / -frag_duration apply only to MP4, M4A and MOV outputs"
+			} else if key.starts_with("hls_") {
+				"-hls_* options apply only to HLS (.m3u8) outputs"
+			} else {
+				"MPEG-TS options apply only to .ts and HLS outputs"
+			}));
+		}
 	}
 	for (key, value) in &options.container_options {
 		muxer.set_option(key, value)?;
@@ -602,7 +669,7 @@ fn transcode_with(input: &str, output: &str, options: &Options, threads: usize) 
 		let codec_in = stream.parameters.codec.id.clone();
 		match stream.kind {
 			StreamKind::Audio if !options.no_audio => {
-				let Some(mut default) = default_audio(&ext, stream) else { continue };
+				let Some(mut default) = default_audio(&ext, stream, options) else { continue };
 				if default == "copy" && options.converts_audio() {
 					// Resampling or remixing means re-encoding (as in FFmpeg).
 					default = match ext.as_str() {
@@ -612,6 +679,7 @@ fn transcode_with(input: &str, output: &str, options: &Options, threads: usize) 
 							));
 						}
 						"mp4" | "m4a" | "mov" => "aac",
+						e if is_ts(e) || is_hls(e) => "aac",
 						_ => "flac",
 					};
 				}
@@ -659,6 +727,7 @@ fn transcode_with(input: &str, output: &str, options: &Options, threads: usize) 
 							enc_state,
 							target,
 							precision,
+							source_bits: stream.parameters.bits_per_sample.map_or(u32::MAX, u32::from),
 							dither,
 							converter: None,
 							gapless: gapless_of(stream),
@@ -678,6 +747,12 @@ fn transcode_with(input: &str, output: &str, options: &Options, threads: usize) 
 					// MP4 can't hold the codec (VP9 from WebM, say): decode and
 					// re-encode when RMP has a decoder.
 					"mp4" | "mov" if !muxer_supports(&codec_in) && resolver.has_decoder(&codec_in) => "h264",
+					e if (is_ts(e) || is_hls(e))
+						&& !output_holds(e, options, &codec_in)
+						&& resolver.has_decoder(&codec_in) =>
+					{
+						"h264"
+					}
 					_ if options.converts_video() => {
 						if yuv420 {
 							"h264"
@@ -730,6 +805,13 @@ fn transcode_with(input: &str, output: &str, options: &Options, threads: usize) 
 					};
 					let mut out = Stream::video(out_id, w, h, &pixel.name(), CodecId::new(&codec));
 					out.time_base = frame_time_base(stream, first);
+					// A re-encode keeps what describes the track, not the coding.
+					for key in ["language", "default"] {
+						if let Some(v) = stream.metadata.raw.get(key) {
+							out.metadata.raw.insert(key.into(), v.clone());
+						}
+					}
+					out.metadata.title = stream.metadata.title.clone();
 					let decoder = resolver.decoder_for(stream).ok_or("no decoder")?;
 					let dec_state = decoder.create_state(&stream.parameters);
 					decoders.insert(stream.id, (decoder, dec_state));
@@ -1051,9 +1133,11 @@ fn encode_audio(
 ) -> Result<u64> {
 	let converter = match &mut r.converter {
 		Some(c) => c,
-		None => r
-			.converter
-			.insert(AudioConverter::new(AudioSpec::of(&a), r.target)?.dithered(r.dither, r.precision)?),
+		None => r.converter.insert(AudioConverter::new(AudioSpec::of(&a), r.target)?.dithered_from(
+			r.dither,
+			r.precision,
+			r.source_bits,
+		)?),
 	};
 	let Some(converted) = converter.convert(&a)? else { return Ok(0) };
 	*count += 1;

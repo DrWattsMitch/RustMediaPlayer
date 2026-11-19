@@ -1,5 +1,5 @@
 use crate::Message;
-use crate::container::{flac, mkv, mp3, mp4, ogg, riff, y4m};
+use crate::container::{ass, flac, mkv, mp3, mp4, mpegts, ogg, riff, srt, webvtt, y4m};
 use crate::core::{Hint, Muxer, Probe};
 use crate::io::Io;
 use crate::message::Result;
@@ -39,6 +39,26 @@ pub fn select_muxer(hint: Hint, io: Box<dyn Io>) -> Result<Box<dyn Muxer>> {
 
 	if mp3::Mp3Probe::muxer_matches(&hint) {
 		return mp3::Mp3Probe::create_muxer(io);
+	}
+
+	if mpegts::TsProbe::muxer_matches(&hint) {
+		return mpegts::TsProbe::create_muxer(io);
+	}
+
+	if srt::SrtProbe::muxer_matches(&hint) {
+		return srt::SrtProbe::create_muxer(io);
+	}
+
+	if ass::AssProbe::muxer_matches(&hint) {
+		return ass::AssProbe::create_muxer(io);
+	}
+
+	if hint
+		.extension
+		.as_deref()
+		.is_some_and(|e| e.eq_ignore_ascii_case("vtt") || e.eq_ignore_ascii_case("webvtt"))
+	{
+		return Ok(Box::new(webvtt::WebVttMuxer::new(io)));
 	}
 
 	Err(Message::Container("unsupported container format"))

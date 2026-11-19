@@ -32,6 +32,19 @@ impl Output {
 		if self.muxer.is_some() {
 			return Ok(());
 		}
+		// HLS writes a playlist and segment files beside it, not one file.
+		if self
+			.extension()
+			.is_some_and(|e| e.eq_ignore_ascii_case("m3u8") || e.eq_ignore_ascii_case("hls"))
+		{
+			let mut muxer = container::hls::muxer::HlsMuxer::create(&self.path)?;
+			muxer.set_metadata(self.metadata.clone())?;
+			for (key, value) in &self.options {
+				muxer.set_option(key, value)?;
+			}
+			self.muxer = Some(Box::new(muxer));
+			return Ok(());
+		}
 		self.ensure_file()?;
 
 		// auto infer based of codec?

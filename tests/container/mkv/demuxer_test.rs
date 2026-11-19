@@ -149,6 +149,7 @@ fn decode_stream(demuxer: &mut dyn Demuxer, kind: StreamKind) -> Vec<u8> {
 			match frame {
 				Frame::Audio(a) => out.extend_from_slice(&a.data),
 				Frame::Video(v) => out.extend_from_slice(&v.data()),
+				Frame::Subtitle(_) => {}
 			}
 		}
 	};

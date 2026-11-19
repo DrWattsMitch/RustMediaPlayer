@@ -542,3 +542,138 @@ fn mkv_and_ogg_muxers_survive_corrupted_input() {
 		remux_everywhere(&data, &open_mp4, &mut rng);
 	}
 }
+
+#[test]
+fn mpegts_demuxer_survives_corruption() {
+	let mut rng = Rng::new(seed());
+	let inputs: Vec<Vec<u8>> = [
+		"mpegts/h264_aac_2audio.ts",
+		"mpegts/hevc_ac3.ts",
+		"mpegts/h264_mp3.m2ts",
+		"mpegts/mpeg2_mp2.ts",
+		"mpegts/opus_51.ts",
+	]
+	.iter()
+	.map(|f| fixture(f))
+	.collect();
+	for round in 0..rounds() {
+		let data = mutate(&inputs[round as usize % inputs.len()], &mut rng);
+		if let Ok(mut demuxer) = rmp::container::mpegts::TsDemuxer::new(memory(data)) {
+			drain(&mut demuxer);
+		}
+	}
+}
+
+/// Damaged samples through SAMPLE-AES decryption, damaged WebVTT through
+/// its parser, and damaged packets through the TS muxer (it must reject or
+/// write them, never panic).
+#[test]
+fn sample_aes_webvtt_and_ts_muxer_survive_corruption() {
+	use rmp::container::hls::sample_aes::{
+		SampleCipher, SampleCodec, decrypt_packet, encrypt_packet,
+	};
+	use rmp::container::mpegts::{TsDemuxer, TsMuxer};
+	use rmp::core::Muxer;
+	let mut rng = Rng::new(seed());
+	let cipher = SampleCipher::new(&[1; 16], &[2; 16]);
+	let mut source = TsDemuxer::new(memory(fixture("mpegts/h264_aac_2audio.ts"))).unwrap();
+	let streams = source.streams().clone();
+	let mut packets = Vec::new();
+	while let Ok(Some(p)) = source.read() {
+		packets.push(p);
+	}
+	let vtt = b"WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000\n\n1\n00:00:01.000 --> 00:00:02.000 line:0\nHi\n\nNOTE x\n\n00:03.000 --> 00:04.000\nBye\n".to_vec();
+	for round in 0..rounds() {
+		let p = &packets[round as usize % packets.len()];
+		let codec = if p.stream_id.0 == 0 { SampleCodec::H264 } else { SampleCodec::Aac };
+		let damaged = mutate(&p.data, &mut rng);
+		let _ = decrypt_packet(&cipher, codec, &damaged);
+		let _ = encrypt_packet(&cipher, SampleCodec::Ac3, &damaged);
+		let text = mutate(&vtt, &mut rng);
+		let _ = rmp::container::webvtt::timestamp_map(&text);
+		if let Ok(mut d) = rmp::container::webvtt::WebVttDemuxer::new(memory(text)) {
+			drain(&mut d);
+		}
+		if round % 10 == 0 {
+			let mut muxer = TsMuxer::new(Box::new(rmp::io::MemoryIo::new()));
+			for s in streams.iter() {
+				muxer.add(s).unwrap();
+			}
+			for q in packets.iter().take(40) {
+				let mut q = q.clone();
+				if rng.below(4) == 0 {
+					q.data = mutate(&q.data, &mut rng);
+				}
+				let _ = muxer.write(q);
+			}
+			let _ = muxer.finish();
+		}
+	}
+}
+
+#[test]
+fn playlist_and_mpd_parsers_survive_corruption() {
+	use rmp::container::dash::xml;
+	use rmp::container::hls::playlist;
+	let mut rng = Rng::new(seed());
+	let texts = [
+		fixture("hls/master/master.m3u8"),
+		fixture("hls/fmp4/index.m3u8"),
+		fixture("hls/aes/index.m3u8"),
+		fixture("dash/template/manifest.mpd"),
+		fixture("dash/list/manifest.mpd"),
+		fixture("dash/base/manifest.mpd"),
+	];
+	for round in 0..rounds() * 4 {
+		let data = mutate(&texts[round as usize % texts.len()], &mut rng);
+		let text = String::from_utf8_lossy(&data);
+		let _ = playlist::parse(&text, "http://example.com/a/b.m3u8");
+		let _ = xml::parse(&text);
+	}
+}
+
+#[test]
+fn hls_and_dash_survive_corrupted_segments() {
+	use rmp::container::segment::StreamingOptions;
+	let mut rng = Rng::new(seed());
+	let dir = tempfile::tempdir().unwrap();
+	let sets: [(&str, &[&str]); 3] = [
+		("hls/ts", &["index.m3u8", "s0.ts", "s1.ts", "s2.ts"]),
+		("hls/fmp4", &["index.m3u8", "init.mp4", "s0.m4s", "s1.m4s", "s2.m4s"]),
+		(
+			"dash/template",
+			&[
+				"manifest.mpd",
+				"init-stream0.m4s",
+				"init-stream1.m4s",
+				"chunk-stream0-00001.m4s",
+				"chunk-stream0-00002.m4s",
+				"chunk-stream0-00003.m4s",
+				"chunk-stream1-00001.m4s",
+				"chunk-stream1-00002.m4s",
+				"chunk-stream1-00003.m4s",
+				"chunk-stream1-00004.m4s",
+			],
+		),
+	];
+	for round in 0..rounds() / 3 {
+		let (set, files) = sets[round as usize % sets.len()];
+		// Damage one file of the presentation (the manifest included).
+		let victim = rng.below(files.len());
+		for (i, f) in files.iter().enumerate() {
+			let data = fixture(&format!("{set}/{f}"));
+			let data = if i == victim { mutate(&data, &mut rng) } else { data };
+			std::fs::write(dir.path().join(f), data).unwrap();
+		}
+		let manifest = dir.path().join(files[0]).to_string_lossy().into_owned();
+		let options = StreamingOptions::default();
+		let opened: Option<Box<dyn Demuxer>> = if set.starts_with("hls") {
+			rmp::container::hls::open(&manifest, &options).ok().map(|d| Box::new(d) as Box<dyn Demuxer>)
+		} else {
+			rmp::container::dash::open(&manifest, &options).ok().map(|d| Box::new(d) as Box<dyn Demuxer>)
+		};
+		if let Some(mut demuxer) = opened {
+			drain(demuxer.as_mut());
+		}
+	}
+}

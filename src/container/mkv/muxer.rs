@@ -31,6 +31,7 @@
 use super::ebml::{self, id};
 use super::tracks::{self, MuxCodec};
 use crate::codecs::duration::packet_samples;
+use crate::container::bsf::Converter;
 use crate::container::flac::stats::FlacStats;
 use crate::container::xiph;
 use crate::core::{
@@ -63,6 +64,8 @@ const TYPE_SUBTITLE: u64 = 17;
 
 struct Track {
 	stream: Stream,
+	/// Annex B / ADTS input is converted to Matroska's layout.
+	bsf: Converter,
 	number: u64,
 	uid: u64,
 	codec: MuxCodec,
@@ -588,6 +591,8 @@ impl Muxer for MkvMuxer {
 		if stream.kind == StreamKind::Other {
 			return Err(Message::Container("matroska muxer: unsupported stream type"));
 		}
+		let mut stream = stream.clone();
+		let bsf = Converter::for_iso(&mut stream.parameters)?;
 		let codec = tracks::mux_codec(&stream.parameters, self.webm).map_err(Message::Container)?;
 		let p = &stream.parameters;
 		let delay = string_value(&stream.metadata, "encoder_delay").and_then(|v| v.parse::<u64>().ok());
@@ -611,7 +616,8 @@ impl Muxer for MkvMuxer {
 		let index = self.tracks.len();
 		self.has_video |= stream.kind == StreamKind::Video;
 		self.tracks.push(Track {
-			stream: stream.clone(),
+			stream,
+			bsf,
 			number: index as u64 + 1,
 			uid: track_uid(index as u64),
 			codec,
@@ -625,8 +631,14 @@ impl Muxer for MkvMuxer {
 		Ok(index)
 	}
 
-	fn write(&mut self, packet: Packet) -> Result<()> {
+	fn write(&mut self, mut packet: Packet) -> Result<()> {
 		let index = self.track_index(packet.stream_id)?;
+		let header_written = self.header_written;
+		let track = &mut self.tracks[index];
+		if track.bsf.apply(&mut packet, &mut track.stream.parameters)? && !header_written {
+			track.codec =
+				tracks::mux_codec(&track.stream.parameters, self.webm).map_err(Message::Container)?;
+		}
 		let to_ms = |t: Option<crate::core::Time>| t.and_then(|t| t.rescale(MS)).map(|t| t.ticks());
 		let track = &mut self.tracks[index];
 		if let Some(stats) = track.flac.as_mut() {

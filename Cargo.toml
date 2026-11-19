@@ -77,3 +77,10 @@ lto = "thin"
 codegen-units = 16
 strip = false
 debug = true
+
+# rav1d 1.1.0 on crates.io is missing `src/arm/asm-offsets.h` (its `exclude`
+# list strips all `*.h`), so the aarch64 asm fails to build on Apple Silicon.
+# Fixed upstream in 0ce8cc12 (unreleased 1.1.1). The git tag has the same code
+# as the crates.io release, plus the header. Remove once 1.1.1+ is published.
+[patch.crates-io]
+rav1d = { git = "https://github.com/memorysafety/rav1d", tag = "v1.1.0" }

@@ -5,6 +5,7 @@ use crate::container::flac;
 use crate::container::mkv;
 use crate::container::mp3;
 use crate::container::mp4;
+use crate::container::mpegts;
 use crate::container::ogg;
 use crate::container::riff;
 use crate::container::y4m;
@@ -37,6 +38,27 @@ pub fn detect(data: &[u8], io: Box<dyn Io>) -> Result<Box<dyn Demuxer>> {
 
 	if mp4::Mp4Probe::demuxer_matches(data) {
 		return mp4::Mp4Probe::create_demuxer(io);
+	}
+
+	// A transport stream has no magic number, but sync bytes every 188
+	// (192, 204) bytes are distinctive; checked before the audio formats
+	// whose sync words a TS payload could contain.
+	if mpegts::TsProbe::demuxer_matches(data) {
+		return mpegts::TsProbe::create_demuxer(io);
+	}
+
+	if crate::container::webvtt::looks_like_webvtt(data) {
+		return Ok(Box::new(crate::container::webvtt::WebVttDemuxer::new(io)?));
+	}
+
+	// Text subtitles: a `[Script Info]` section, or SubRip's cue number and
+	// `-->` timing line (no binary format starts with either).
+	if crate::container::ass::AssProbe::demuxer_matches(data) {
+		return crate::container::ass::AssProbe::create_demuxer(io);
+	}
+
+	if crate::container::srt::SrtProbe::demuxer_matches(data) {
+		return crate::container::srt::SrtProbe::create_demuxer(io);
 	}
 
 	// AC-3's 16-bit sync word is stronger than MPEG audio's, and the probe

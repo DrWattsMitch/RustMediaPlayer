@@ -70,6 +70,7 @@ pub fn decode_all(demuxer: &mut dyn Demuxer) -> Vec<u8> {
 			match frame {
 				Frame::Audio(a) => out.extend_from_slice(&a.data),
 				Frame::Video(v) => out.extend_from_slice(&v.data()),
+				Frame::Subtitle(s) => out.extend_from_slice(s.text.as_bytes()),
 			}
 		}
 	}

@@ -286,10 +286,10 @@ pub fn parse(
 		{
 			weights = Some(pred_weight_table(&mut bs, sps, slice_type, &num_ref_idx)?);
 		}
-		max_num_merge_cand = 5 - bs.ue();
+		max_num_merge_cand = 5u32.saturating_sub(bs.ue());
 		check((1..=5).contains(&max_num_merge_cand), "hevc: invalid merge candidate count")?;
 	}
-	let slice_qp = pps.init_qp + bs.se();
+	let slice_qp = pps.init_qp.saturating_add(bs.se());
 	check(slice_qp >= -sps.qp_bd_offset && slice_qp <= 51, "hevc: invalid slice qp")?;
 	let (mut cb_qp_offset, mut cr_qp_offset) = (0, 0);
 	if pps.slice_chroma_qp_offsets_present {
@@ -306,8 +306,8 @@ pub fn parse(
 	if pps.deblocking_override_enabled && bs.bit() {
 		deblocking_disabled = bs.bit();
 		if !deblocking_disabled {
-			beta_offset = bs.se() * 2;
-			tc_offset = bs.se() * 2;
+			beta_offset = bs.se().saturating_mul(2);
+			tc_offset = bs.se().saturating_mul(2);
 			check(
 				(-12..=12).contains(&beta_offset) && (-12..=12).contains(&tc_offset),
 				"hevc: deblock offsets",
@@ -399,7 +399,7 @@ fn pred_weight_table(
 ) -> Result<PredWeights, SliceError> {
 	let luma_log2_denom = bs.ue();
 	check(luma_log2_denom <= 7, "hevc: invalid luma weight denominator")?;
-	let chroma_log2_denom = (luma_log2_denom as i32 + bs.se()) as u32;
+	let chroma_log2_denom = (luma_log2_denom as i32).saturating_add(bs.se()) as u32;
 	check(chroma_log2_denom <= 7, "hevc: invalid chroma weight denominator")?;
 	let mut l = [[Weight::default(); 16]; 2];
 	let lists = if slice_type == SliceType::B { 2 } else { 1 };

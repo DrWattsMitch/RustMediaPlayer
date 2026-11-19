@@ -41,3 +41,12 @@ mod av1_decoder_test;
 
 #[path = "codecs/hevc_decoder_test.rs"]
 mod hevc_decoder_test;
+
+#[path = "codecs/subtitle_decoder_test.rs"]
+mod subtitle_decoder_test;
+
+#[path = "codecs/alac_decoder_test.rs"]
+mod alac_decoder_test;
+
+#[path = "codecs/vp8_decoder_test.rs"]
+mod vp8_decoder_test;

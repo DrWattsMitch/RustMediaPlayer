@@ -45,7 +45,7 @@ Stream options:
   -an | -vn | -sn       drop audio / video / subtitles
   -c:a <codec|copy>     audio codec: aac, flac, pcm_s16le, pcm_s24le, pcm_f32le, ...
   -c:v <codec|copy>     video codec: h264, rawvideo or copy
-  -c:s copy             copy subtitles (Matroska, WebM)
+  -c:s copy             copy subtitles (Matroska, WebM, HLS/WebVTT, SRT, ASS)
   -c copy               copy every stream
   -ar <rate>            output sample rate (resampled)
   -ac <channels>        output channels (FFmpeg's default remix)
@@ -63,18 +63,33 @@ Stream options:
   -pix_fmt <name>       yuv420p, yuv422p, yuv444p, yuv420p10le, gray, rgb24, nv12, ...
   -sws_flags <filter>   point, bilinear, bicubic (default), lanczos
   -f <format>           output container: wav flac mp3 mp4 m4a mov mkv mka webm ogg oga opus y4m
+                        ts (MPEG-TS) hls (m3u8 playlist + segments) vtt srt ass
   -movflags <flags>     MP4 layout: +faststart (moov first, for progressive web
                         playback) or frag_keyframe+empty_moov+default_base_moof
                         (fragmented MP4 for MSE / HLS / DASH); also
                         frag_every_frame, separate_moof, skip_trailer
   -frag_duration <us>   fragmented MP4: cut a fragment every <us> microseconds
   -min_frag_duration <us>  fragmented MP4: never cut fragments shorter than this
+  -hls_time <s>         HLS: segment length (default 2), cut at keyframes
+  -hls_list_size <n>    HLS: segments kept in the playlist (default 0 = all)
+  -hls_segment_type t   HLS: mpegts (default) or fmp4
+  -hls_segment_filename <pattern>  HLS: segment names, %d = sequence number
+  -hls_playlist_type t  HLS: vod or event
+  -hls_flags <flags>    HLS: delete_segments, independent_segments, omit_endlist, split_by_time
+  -hls_enc 1            HLS: encrypt with a key written to <name>.key (-hls_enc_key <hex>,
+                        -hls_enc_key_url <prefix>, -hls_enc_iv <hex>)
+  -hls_enc_method m     HLS: aes-128 (default, whole segments) or sample-aes (TS samples)
+  -hls_key_info_file f  HLS: key URI, key file and optional IV, one per line
+  -master_pl_name <n>   HLS: also write a multivariant playlist (automatic with subtitles)
+  -mpegts_service_id n, -mpegts_start_pid n, -mpegts_pmt_start_pid n, -muxdelay s
+                        MPEG-TS program layout (FFmpeg's defaults)
   -metadata key=value   set a tag (title, artist, album, date, track, ...)
   -map_metadata -1      don't copy the input's tags
 
-Containers read: WAV, Y4M, MP3, MP4/M4A/MOV, Matroska/WebM, FLAC, Ogg (Opus/FLAC/Vorbis).
-Containers written: all of the above.
-Decoders: PCM, ADPCM, MP3, AAC-LC, H.264, VP9, FLAC, Opus, Vorbis. Encoders: PCM, FLAC, AAC-LC, H.264 (Constrained Baseline), raw video.";
+Containers read: WAV, Y4M, MP3, MP4/M4A/MOV, Matroska/WebM, FLAC, Ogg (Opus/FLAC/Vorbis),
+MPEG-TS, HLS (AES-128, SAMPLE-AES, WebVTT), DASH, WebVTT, SubRip, ASS/SSA, ADTS, AC-3.
+Containers written: WAV, Y4M, MP3, MP4/M4A/MOV, Matroska/WebM, FLAC, Ogg, MPEG-TS, HLS, WebVTT, SubRip, ASS.
+Decoders: PCM, ADPCM, MP3, AAC-LC, ALAC, H.264, VP8, VP9, FLAC, Opus, Vorbis, SRT/WebVTT/ASS text. Encoders: PCM, FLAC, AAC-LC, H.264 (Constrained Baseline), raw video.";
 
 /// Parsed command line.
 #[derive(Default)]

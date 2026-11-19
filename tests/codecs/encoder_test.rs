@@ -27,6 +27,7 @@ fn decode(path: &str, kind: StreamKind) -> (Vec<u8>, Vec<bool>, rmp::core::Strea
 			match f {
 				Frame::Audio(a) => out.extend_from_slice(&a.data),
 				Frame::Video(v) => out.extend_from_slice(&v.data()),
+				Frame::Subtitle(_) => {}
 			}
 		}
 	};

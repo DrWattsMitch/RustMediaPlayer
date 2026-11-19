@@ -109,7 +109,7 @@ impl ScalingList {
 					let mut next: i32 = 8;
 					let coefs = (1usize << (4 + (size << 1))).min(64);
 					if size >= 2 {
-						let dc = bs.se() + 8;
+						let dc = bs.se().saturating_add(8);
 						check((1..=255).contains(&dc), "hevc: invalid scaling list dc")?;
 						next = dc;
 						s.dc[size - 2][m] = dc as u8;
@@ -322,14 +322,21 @@ impl Sps {
 		let mut crop = [0u32; 4];
 		if bs.bit() {
 			for c in &mut crop {
-				*c = bs.ue() * 2;
+				*c = bs.ue().saturating_mul(2);
+			}
+			// As FFmpeg does: a conformance window that leaves no picture is
+			// invalid, so ignore it rather than reject the stream. Sums in u64
+			// because each offset can be near u32::MAX.
+			let [l, r, t, b] = crop.map(u64::from);
+			if l + r >= u64::from(width) || t + b >= u64::from(height) {
+				crop = [0; 4];
 			}
 		}
-		let bit_depth = bs.ue() + 8;
-		let bit_depth_chroma = bs.ue() + 8;
+		let bit_depth = bs.ue().saturating_add(8);
+		let bit_depth_chroma = bs.ue().saturating_add(8);
 		check(bit_depth <= 12 && bit_depth == bit_depth_chroma, "hevc: unsupported bit depth")?;
 		let _ = profile;
-		let log2_max_poc_lsb = bs.ue() + 4;
+		let log2_max_poc_lsb = bs.ue().saturating_add(4);
 		check(log2_max_poc_lsb <= 16, "hevc: invalid poc lsb size")?;
 		let sub_layer_ordering_info = bs.bit();
 		let first = if sub_layer_ordering_info { 0 } else { max_sub_layers_minus1 };
@@ -340,10 +347,10 @@ impl Sps {
 			latency = bs.ue();
 		}
 		check(dpb <= 16 && reorder < dpb, "hevc: invalid dpb size")?;
-		let log2_min_cb_size = bs.ue() + 3;
-		let log2_ctb_size = log2_min_cb_size + bs.ue();
-		let log2_min_tb_size = bs.ue() + 2;
-		let log2_max_tb_size = log2_min_tb_size + bs.ue();
+		let log2_min_cb_size = bs.ue().saturating_add(3);
+		let log2_ctb_size = log2_min_cb_size.saturating_add(bs.ue());
+		let log2_min_tb_size = bs.ue().saturating_add(2);
+		let log2_max_tb_size = log2_min_tb_size.saturating_add(bs.ue());
 		check(
 			(4..=6).contains(&log2_ctb_size) && log2_min_cb_size <= log2_ctb_size,
 			"hevc: invalid ctb size",
@@ -372,8 +379,8 @@ impl Sps {
 		if pcm_enabled {
 			pcm_bd = bs.bits(4) + 1;
 			pcm_bdc = bs.bits(4) + 1;
-			pcm_min = bs.ue() + 3;
-			pcm_max = pcm_min + bs.ue();
+			pcm_min = bs.ue().saturating_add(3);
+			pcm_max = pcm_min.saturating_add(bs.ue());
 			pcm_lf = bs.bit();
 			check(
 				pcm_bd <= bit_depth && pcm_max <= 5.min(log2_ctb_size),
@@ -525,7 +532,7 @@ impl Pps {
 		let num_ref_idx_l0_default = bs.ue() + 1;
 		let num_ref_idx_l1_default = bs.ue() + 1;
 		check(num_ref_idx_l0_default <= 15 && num_ref_idx_l1_default <= 15, "hevc: invalid ref count")?;
-		let init_qp = 26 + bs.se();
+		let init_qp = bs.se().saturating_add(26);
 		check(init_qp >= -sps.qp_bd_offset && init_qp <= 51, "hevc: invalid init qp")?;
 		let constrained_intra_pred = bs.bit();
 		let transform_skip_enabled = bs.bit();
@@ -576,8 +583,8 @@ impl Pps {
 			deblocking_override_enabled = bs.bit();
 			deblocking_disabled = bs.bit();
 			if !deblocking_disabled {
-				beta_offset = bs.se() * 2;
-				tc_offset = bs.se() * 2;
+				beta_offset = bs.se().saturating_mul(2);
+				tc_offset = bs.se().saturating_mul(2);
 				check(
 					(-12..=12).contains(&beta_offset) && (-12..=12).contains(&tc_offset),
 					"hevc: invalid offsets",
@@ -586,7 +593,7 @@ impl Pps {
 		}
 		let scaling_list = if bs.bit() { Some(ScalingList::parse(&mut bs)?) } else { None };
 		let lists_modification_present = bs.bit();
-		let log2_parallel_merge_level = bs.ue() + 2;
+		let log2_parallel_merge_level = bs.ue().saturating_add(2);
 		check(log2_parallel_merge_level <= sps.log2_ctb_size, "hevc: invalid merge level")?;
 		let slice_header_extension_present = bs.bit();
 		if bs.bit() {
@@ -597,7 +604,7 @@ impl Pps {
 			let _scc = bs.bit();
 			let _other = bs.bits(4);
 			if range {
-				let log2_max_ts = if transform_skip_enabled { bs.ue() + 2 } else { 2 };
+				let log2_max_ts = if transform_skip_enabled { bs.ue().saturating_add(2) } else { 2 };
 				let cross_component = bs.bit();
 				let chroma_qp_offset_list = bs.bit();
 				check(

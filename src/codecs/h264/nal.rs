@@ -164,3 +164,121 @@ mod tests {
 		assert!(!more_rbsp_data(&[0b1010_0000], 2));
 	}
 }
+
+/// What containers need from an SPS: picture size, chroma format, bit
+/// depth and the profile bytes. Unlike [`super::params::parse_sps`] this
+/// accepts every profile (10-bit, 4:2:2, ...), since it only reads the
+/// header fields (H.264 §7.3.2.1.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpsSummary {
+	pub profile_idc: u8,
+	pub constraint_flags: u8,
+	pub level_idc: u8,
+	pub chroma_format_idc: u32,
+	pub bit_depth_luma: u32,
+	pub bit_depth_chroma: u32,
+	pub width: u32,
+	pub height: u32,
+}
+
+/// Parses an SPS RBSP (after the NAL header byte). `None` if it is cut
+/// short or out of range.
+pub fn sps_summary(rbsp: &[u8]) -> Option<SpsSummary> {
+	use crate::codecs::bitstream::BitReader;
+	fn ue(bs: &mut BitReader) -> Option<u32> {
+		let mut zeros = 0;
+		while !bs.bit() {
+			zeros += 1;
+			if zeros > 31 || bs.overrun() {
+				return None;
+			}
+		}
+		Some(((1u64 << zeros) - 1 + u64::from(bs.bits(zeros))) as u32)
+	}
+	fn se(bs: &mut BitReader) -> Option<i32> {
+		let k = ue(bs)?;
+		Some(if k & 1 == 1 { (k / 2 + 1) as i32 } else { -((k / 2) as i32) })
+	}
+	let mut bs = BitReader::new(rbsp);
+	let profile_idc = bs.bits(8) as u8;
+	let constraint_flags = bs.bits(8) as u8;
+	let level_idc = bs.bits(8) as u8;
+	ue(&mut bs)?; // seq_parameter_set_id
+	let (mut chroma_format_idc, mut depth_luma, mut depth_chroma) = (1, 8, 8);
+	if matches!(profile_idc, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135)
+	{
+		chroma_format_idc = ue(&mut bs)?;
+		if chroma_format_idc == 3 {
+			bs.skip(1); // separate_colour_plane_flag
+		}
+		depth_luma = ue(&mut bs)? + 8;
+		depth_chroma = ue(&mut bs)? + 8;
+		bs.skip(1); // qpprime_y_zero_transform_bypass_flag
+		if bs.bit() {
+			let lists = if chroma_format_idc == 3 { 12 } else { 8 };
+			for i in 0..lists {
+				if !bs.bit() {
+					continue;
+				}
+				let size = if i < 6 { 16 } else { 64 };
+				let (mut last, mut next) = (8i32, 8i32);
+				for _ in 0..size {
+					if next != 0 {
+						next = (last + se(&mut bs)? + 256) % 256;
+					}
+					last = if next == 0 { last } else { next };
+				}
+			}
+		}
+	}
+	ue(&mut bs)?; // log2_max_frame_num_minus4
+	match ue(&mut bs)? {
+		0 => {
+			ue(&mut bs)?;
+		}
+		1 => {
+			bs.skip(1);
+			se(&mut bs)?;
+			se(&mut bs)?;
+			for _ in 0..ue(&mut bs)?.min(255) {
+				se(&mut bs)?;
+			}
+		}
+		_ => {}
+	}
+	ue(&mut bs)?; // max_num_ref_frames
+	bs.skip(1); // gaps_in_frame_num_value_allowed_flag
+	let mb_width = ue(&mut bs)?.checked_add(1)?;
+	let map_height = ue(&mut bs)?.checked_add(1)?;
+	let frame_mbs_only = bs.bit();
+	if !frame_mbs_only {
+		bs.skip(1); // mb_adaptive_frame_field_flag
+	}
+	bs.skip(1); // direct_8x8_inference_flag
+	let field_factor = if frame_mbs_only { 1 } else { 2 };
+	let mut width = mb_width.checked_mul(16)?;
+	let mut height = map_height.checked_mul(16 * field_factor)?;
+	if bs.bit() {
+		let (unit_x, unit_y) = match chroma_format_idc {
+			1 => (2, 2 * field_factor),
+			2 => (2, field_factor),
+			_ => (1, field_factor),
+		};
+		let (l, r, t, b) = (ue(&mut bs)?, ue(&mut bs)?, ue(&mut bs)?, ue(&mut bs)?);
+		width = width.checked_sub(l.checked_add(r)?.checked_mul(unit_x)?)?;
+		height = height.checked_sub(t.checked_add(b)?.checked_mul(unit_y)?)?;
+	}
+	if bs.overrun() || width == 0 || height == 0 || chroma_format_idc > 3 {
+		return None;
+	}
+	Some(SpsSummary {
+		profile_idc,
+		constraint_flags,
+		level_idc,
+		chroma_format_idc,
+		bit_depth_luma: depth_luma,
+		bit_depth_chroma: depth_chroma,
+		width,
+		height,
+	})
+}

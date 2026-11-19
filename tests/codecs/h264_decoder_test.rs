@@ -24,7 +24,7 @@ fn decode(path: &str) -> Vec<rmp::core::VideoFrame> {
 		.into_iter()
 		.map(|f| match f {
 			Frame::Video(v) => v,
-			Frame::Audio(_) => panic!("video expected"),
+			_ => panic!("video expected"),
 		})
 		.collect()
 }

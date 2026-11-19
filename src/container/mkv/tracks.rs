@@ -254,6 +254,16 @@ pub fn parse_entry(entry: &[u8], index: usize, time_base: TimeBase) -> Result<Tr
 				parameters.bits_per_sample = Some(info.bits_per_sample);
 			}
 		}
+		"alac" => {
+			// Matroska stores the bare ALACSpecificConfig; FFmpeg's ALAC
+			// extradata is the 36-byte `alac` atom.
+			if let Some(c) = crate::codecs::alac::AlacConfig::from_extradata(private) {
+				parameters.extradata = c.to_atom();
+				parameters.sample_rate = Some(c.sample_rate);
+				parameters.channels = Some(c.channels);
+				parameters.bits_per_sample = Some(c.bit_depth);
+			}
+		}
 		_ => {}
 	}
 	if output_rate > 0 && codec != "aac" {

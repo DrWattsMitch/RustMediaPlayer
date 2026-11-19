@@ -1,6 +1,7 @@
 pub mod aac;
 pub mod ac3;
 pub mod adpcm;
+pub mod alac;
 #[cfg(feature = "av1")]
 pub mod av1;
 pub mod bitstream;
@@ -13,6 +14,8 @@ pub mod mp3;
 pub mod opus;
 pub mod pcm;
 pub mod raw;
+pub mod subtitle;
 pub mod threading;
 pub mod vorbis;
+pub mod vp8;
 pub mod vp9;

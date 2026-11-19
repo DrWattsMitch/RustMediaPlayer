@@ -1,0 +1,11 @@
+WEBVTT
+
+00:00.500 --> 00:02.000
+<i>Hello</i>, world!
+
+00:02.500 --> 00:04.250
+Second line &amp; <b>bold</b>
+third line
+
+00:05.000 --> 00:06.000
+Top

@@ -1,5 +1,6 @@
 mod buffered;
 mod cursor;
+mod fetch;
 mod http;
 pub mod input;
 mod io;
@@ -8,6 +9,7 @@ pub mod output;
 pub mod source;
 pub use buffered::*;
 pub use cursor::*;
+pub use fetch::*;
 pub use http::*;
 pub use input::*;
 pub use io::*;

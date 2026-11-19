@@ -103,6 +103,8 @@ pub fn main() -> Result<()> {
 						v.write_packed(w)?;
 					}
 				}
+				// Not decoded here; see the `subtitles` example.
+				Frame::Subtitle(_) => {}
 			}
 		}
 		Ok(())

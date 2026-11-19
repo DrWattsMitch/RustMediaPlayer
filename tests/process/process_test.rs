@@ -17,7 +17,7 @@ fn source_picture() -> VideoFrame {
 	let packet = demuxer.read().unwrap().unwrap();
 	match decoder.decode(&mut state, packet).unwrap().value.remove(0) {
 		Frame::Video(v) => v,
-		Frame::Audio(_) => panic!("video expected"),
+		_ => panic!("video expected"),
 	}
 }
 

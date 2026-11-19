@@ -99,3 +99,53 @@ fn rejects_invalid_input() {
 	assert!(muxer.write(packet).is_err(), "non-monotonic dts");
 	assert!(muxer.write(Packet::new(StreamId(9), vec![0])).is_err(), "unknown stream");
 }
+
+#[test]
+fn stream_languages_are_written_to_mdhd() {
+	use rmp::container::mp4::options::Mp4Options;
+	use rmp::core::RawValue;
+	for fragmented in [false, true] {
+		let mut source = Mp4Demuxer::new(memory(fixture("mp4/h264_bframes_aac.mp4"))).unwrap();
+		let output = MemoryIo::new();
+		let mut options = Mp4Options::default();
+		if fragmented {
+			options.set("movflags", "frag_keyframe+empty_moov").unwrap();
+		}
+		let mut muxer = Mp4Muxer::with_options(Box::new(output.clone()), options);
+		// Upper case is folded; anything but three letters becomes "und".
+		for (stream, lang) in source.streams().iter().zip(["FRA", "deu"]) {
+			let mut s = stream.clone();
+			s.metadata.raw.insert("language".into(), RawValue::String(lang.into()));
+			muxer.add(&s).unwrap();
+		}
+		while let Some(packet) = source.read().unwrap() {
+			muxer.write(packet).unwrap();
+		}
+		muxer.finish().unwrap();
+		let copy = Mp4Demuxer::new(memory(output.contents())).unwrap();
+		let langs: Vec<Option<String>> = copy
+			.streams()
+			.iter()
+			.map(|s| match s.metadata.raw.get("language") {
+				Some(RawValue::String(l)) => Some(l.clone()),
+				_ => None,
+			})
+			.collect();
+		assert_eq!(langs, [Some("fra".to_string()), Some("deu".to_string())]);
+	}
+	// Not a language code: und, which the demuxer leaves out.
+	let mut source = Mp4Demuxer::new(memory(fixture("mp4/h264_bframes_aac.mp4"))).unwrap();
+	let output = MemoryIo::new();
+	let mut muxer = Mp4Muxer::new(Box::new(output.clone()));
+	for stream in source.streams().iter() {
+		let mut s = stream.clone();
+		s.metadata.raw.insert("language".into(), RawValue::String("english".into()));
+		muxer.add(&s).unwrap();
+	}
+	while let Some(packet) = source.read().unwrap() {
+		muxer.write(packet).unwrap();
+	}
+	muxer.finish().unwrap();
+	let copy = Mp4Demuxer::new(memory(output.contents())).unwrap();
+	assert!(copy.streams().iter().all(|s| !s.metadata.raw.contains_key("language")));
+}

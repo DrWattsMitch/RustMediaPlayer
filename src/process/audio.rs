@@ -271,15 +271,24 @@ impl AudioConverter {
 	/// significant bits (at most the output format's; a 24-bit target held
 	/// in `S32` is `bits = 24`, the low byte then stays zero). Conversions
 	/// that lose nothing, float outputs and `S64` are left as they are.
-	pub fn dithered(mut self, dither: Dither, bits: u32) -> Result<Self> {
+	pub fn dithered(self, dither: Dither, bits: u32) -> Result<Self> {
+		self.dithered_from(dither, bits, u32::MAX)
+	}
+
+	/// [`AudioConverter::dithered`] for input whose samples carry only
+	/// `source_bits` significant bits (24-bit FLAC or ALAC decoded to
+	/// `S32`): an exact conversion to at least that many bits is not
+	/// dithered.
+	pub fn dithered_from(mut self, dither: Dither, bits: u32, source_bits: u32) -> Result<Self> {
 		self.quantizer = None;
 		let format = self.output.format;
 		if dither.is_none() || format.is_float() || format == SampleFormat::S64 {
 			return Ok(self);
 		}
 		let bits = bits.clamp(2, format_bits(format));
-		let lossy =
-			!self.exact_path() || self.input.format.is_float() || format_bits(self.input.format) > bits;
+		let lossy = !self.exact_path()
+			|| self.input.format.is_float()
+			|| format_bits(self.input.format).min(source_bits) > bits;
 		if lossy {
 			let quantizer =
 				Quantizer::new(dither, bits, usize::from(self.output.channels), self.output.sample_rate)?;

@@ -201,3 +201,66 @@ ff -i process/tone_44k_stereo.wav -ar 8000 -ac 1 -f f32le process/tone_8k_mono.f
 # 	--debug /tmp/kv_rec.yuv
 # ff -fflags +genpts -r 25 -i /tmp/kv.hevc -c copy hevc/kvazaar_tiles_wpp.mp4
 # ff -f rawvideo -s 192x128 -pix_fmt yuv420p -r 25 -i /tmp/kv_rec.yuv -f framecrc hevc/kvazaar_tiles_wpp.framecrc
+
+# --- MPEG-TS, HLS and DASH -------------------------------------------------
+# Needs FFmpeg with libx264 and libx265. References are ffprobe dumps with
+# decode times (`*.packets.csv`: stream, pts, dts, duration, size, flags,
+# hash). The tests compare them field for field.
+cd "$(dirname "$0")/../tests/fixtures"
+mkdir -p mpegts hls/ts hls/fmp4 hls/aes hls/master hls/single dash/template dash/list dash/base
+ts_packets() { ffprobe -v error -allowed_extensions ALL -show_packets -show_data_hash adler32 -of csv=p=0 \
+	-show_entries packet=stream_index,pts,dts,duration,size,flags,data_hash "$1" | cut -d, -f1-7 > "$2"; }
+V="-f lavfi -i testsrc2=s=96x64:r=25"
+A48="-f lavfi -i sine=f=440:sample_rate=48000"
+A44="-f lavfi -i sine=f=660:sample_rate=44100"
+ff $V $A48 $A44 -t 1.2 -map 0 -map 1 -map 2 -c:v libx264 -preset veryfast -g 10 -bf 2 -c:a aac -b:a 32k \
+	-metadata service_name=RMPTest -metadata:s:a:0 language=eng -metadata:s:a:1 language=fra mpegts/h264_aac_2audio.ts
+ff $V $A48 -t 1 -c:v libx265 -x265-params log-level=none:keyint=10 -c:a ac3 -b:a 96k mpegts/hevc_ac3.ts
+ff $V $A44 -t 1 -c:v mpeg2video -g 6 -bf 2 -c:a mp2 mpegts/mpeg2_mp2.ts
+ff $V $A44 -t 1 -c:v libx264 -preset veryfast -g 10 -c:a libmp3lame -b:a 64k -mpegts_m2ts_mode 1 mpegts/h264_mp3.m2ts
+ff $V $A48 -t 1.2 -c:v libx264 -preset veryfast -g 10 -c:a aac -b:a 32k -output_ts_offset 95441.5 mpegts/wrap.ts
+# Opus in TS (registration 'Opus', 5.1 Vorbis layout: channel_config_code 6).
+ff -f lavfi -i "sine=f=440:sample_rate=48000" -af "pan=5.1|c0=c0|c1=c0|c2=c0|c3=c0|c4=c0|c5=c0" -t 0.6 \
+	-c:a libopus -b:a 96k mpegts/opus_51.ts
+for f in mpegts/*.ts mpegts/*.m2ts; do ts_packets "$f" "${f%.*}.packets.csv"; done
+
+HLS="-c:v libx264 -preset veryfast -g 10 -c:a aac -b:a 32k -f hls -hls_time 0.4 -hls_playlist_type vod"
+ff $V $A48 -t 1.2 $HLS -hls_segment_filename 'hls/ts/s%d.ts' hls/ts/index.m3u8
+ff $V $A48 -t 1.2 $HLS -hls_segment_type fmp4 -hls_segment_filename 'hls/fmp4/s%d.m4s' hls/fmp4/index.m3u8
+ff $V $A48 -t 1.2 $HLS -hls_flags single_file hls/single/index.m3u8
+printf '0123456789abcdef' > hls/aes/key.bin
+printf 'key.bin\nhls/aes/key.bin\n00000000000000000000000000000007\n' > /tmp/rmp_keyinfo
+ff $V $A48 -t 1.2 $HLS -hls_key_info_file /tmp/rmp_keyinfo -hls_segment_filename 'hls/aes/s%d.ts' hls/aes/index.m3u8
+ff $V $A48 -t 1.2 -map 0:v -map 0:v -map 1:a -c:v libx264 -preset veryfast -g 10 -s:v:1 48x32 -b:v:0 200k \
+	-b:v:1 50k -c:a aac -b:a 32k -f hls -hls_time 0.4 -hls_playlist_type vod -master_pl_name master.m3u8 \
+	-var_stream_map "v:0,agroup:aud v:1,agroup:aud a:0,agroup:aud,default:yes,language:eng" \
+	-hls_segment_filename 'hls/master/%v_%d.ts' hls/master/%v.m3u8
+for d in ts fmp4 aes; do ts_packets hls/$d/index.m3u8 hls/$d/index.packets.csv; done
+
+DASH="-c:v libx264 -preset veryfast -g 10 -c:a aac -b:a 32k -f dash -seg_duration 0.4"
+(cd dash/template && ff $V $A48 -t 1.2 $DASH -use_template 1 -use_timeline 1 manifest.mpd)
+(cd dash/list && ff $V $A48 -t 1.2 $DASH -single_file 1 manifest.mpd)
+(cd dash/template && ts_packets manifest.mpd manifest.packets.csv)
+# SegmentBase: one fragmented MP4 per representation with a global sidx,
+# described by a hand-written MPD (FFmpeg doesn't write SegmentBase).
+ff $V -t 1.2 -c:v libx264 -preset veryfast -g 10 -movflags +dash+global_sidx dash/base/v.mp4
+python3 - dash/base <<'PY'
+import struct, sys
+d = sys.argv[1]
+data = open(f"{d}/v.mp4", "rb").read()
+at = 0
+while at < len(data):
+    size, kind = struct.unpack(">I4s", data[at:at + 8])
+    if kind == b"sidx":
+        break
+    at += size
+mpd = f'''<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="PT1.2S">
+ <Period><AdaptationSet mimeType="video/mp4"><Representation id="v" bandwidth="100000" width="96" height="64">
+  <BaseURL>v.mp4</BaseURL><SegmentBase indexRange="{at}-{at + size - 1}"><Initialization range="0-{at - 1}"/></SegmentBase>
+ </Representation></AdaptationSet></Period>
+</MPD>
+'''
+open(f"{d}/manifest.mpd", "w").write(mpd)
+PY
+ts_packets dash/base/v.mp4 dash/base/v.packets.csv

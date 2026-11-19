@@ -302,3 +302,128 @@ fn dithers_when_rounding_to_integer_samples() {
 		rmp(&["-i", &source, "-ar", "96000", "-dither_method", "lipshitz", bad.to_str().unwrap()]);
 	assert!(!ok && err.contains("44100"), "{err}");
 }
+
+#[test]
+fn transport_streams_and_manifests_as_input() {
+	let dir = tempfile::tempdir().unwrap();
+	let (ok, out, _) = rmp(&["-i", &fixture("mpegts/h264_aac_2audio.ts")]);
+	assert!(ok);
+	assert!(out.contains("Stream #0: video h264, 96x64"), "{out}");
+	assert!(out.contains("service_name: RMPTest"), "{out}");
+	// TS → MP4 / MKV stream copy (Annex B → avcC, ADTS → raw AAC), and an
+	// HLS master playlist and a DASH MPD straight into a file.
+	for (input, name) in [
+		("mpegts/h264_aac_2audio.ts", "ts.mp4"),
+		("mpegts/hevc_ac3.ts", "ts.mkv"),
+		("hls/master/master.m3u8", "hls.mp4"),
+		("dash/template/manifest.mpd", "dash.mkv"),
+	] {
+		let out = tmp(&dir, name);
+		let (ok, _, err) = rmp(&["-i", &fixture(input), "-c", "copy", out.to_str().unwrap()]);
+		assert!(ok, "{input}: {err}");
+		let kinds = kinds(&out);
+		assert_eq!(kinds[0].0, StreamKind::Video, "{input}");
+		assert!(kinds.iter().any(|(k, _)| *k == StreamKind::Audio), "{input}");
+	}
+}
+
+#[test]
+fn transport_stream_and_hls_output() {
+	let dir = tempfile::tempdir().unwrap();
+	// MP4 → TS: Annex B and ADTS; reads back with both streams.
+	let ts = tmp(&dir, "out.ts");
+	let (ok, _, err) = rmp(&["-i", &fixture("mp4/h264_bframes_aac.mp4"), ts.to_str().unwrap()]);
+	assert!(ok, "{err}");
+	assert_eq!(kinds(&ts), [(StreamKind::Video, "h264".into()), (StreamKind::Audio, "aac".into())]);
+	// Matroska with FLAC and SRT → HLS: FLAC becomes AAC, SRT a WebVTT
+	// rendition behind a master playlist.
+	let hls = tmp(&dir, "live.m3u8");
+	let (ok, _, err) = rmp(&[
+		"-i",
+		&fixture("mkv/h264_flac_srt.mkv"),
+		"-hls_time",
+		"1",
+		"-hls_playlist_type",
+		"vod",
+		hls.to_str().unwrap(),
+	]);
+	assert!(ok, "{err}");
+	assert!(std::fs::read_to_string(&hls).unwrap().contains("#EXT-X-ENDLIST"));
+	let master = tmp(&dir, "live_master.m3u8");
+	assert_eq!(
+		kinds(&master),
+		[
+			(StreamKind::Video, "h264".into()),
+			(StreamKind::Audio, "aac".into()),
+			(StreamKind::Subtitle, "webvtt".into())
+		]
+	);
+	// Options go where they belong.
+	let (ok, _, err) = rmp(&[
+		"-i",
+		&fixture("mp4/h264_bframes_aac.mp4"),
+		"-hls_time",
+		"2",
+		tmp(&dir, "x.mp4").to_str().unwrap(),
+	]);
+	assert!(!ok && err.contains("HLS"), "{err}");
+	let (ok, _, err) =
+		rmp(&["-i", &fixture("mp4/h264_bframes_aac.mp4"), "-hls_time", "-3", hls.to_str().unwrap()]);
+	assert!(!ok && err.contains("hls_time"), "{err}");
+}
+
+/// Decoded samples of the first audio stream, as one byte vector.
+fn decoded_audio(path: &str) -> Vec<u8> {
+	use rmp::core::{Frame, Resolver};
+	let mut input = Input::open(path).unwrap();
+	let stream = input.streams().iter().find(|s| s.kind == StreamKind::Audio).unwrap().clone();
+	let decoder = Resolver::new().decoder_for(&stream).unwrap();
+	let mut state = decoder.create_state(&stream.parameters);
+	let mut out = Vec::new();
+	while let Some(p) = input.read().unwrap() {
+		if p.stream_id == stream.id {
+			for f in decoder.decode(&mut state, p).unwrap().value {
+				if let Frame::Audio(a) = f {
+					out.extend(a.data);
+				}
+			}
+		}
+	}
+	out
+}
+
+#[test]
+fn vp8_alac_and_text_subtitles_convert() {
+	let dir = tempfile::tempdir().unwrap();
+	// VP8 decodes for re-encoding.
+	let mp4 = tmp(&dir, "vp8.mp4");
+	let (ok, _, err) = rmp(&["-i", &fixture("vp8/basic.webm"), mp4.to_str().unwrap()]);
+	assert!(ok, "{err}");
+	assert_eq!(kinds(&mp4), [(StreamKind::Video, "h264".to_string())]);
+	// 24-bit and 16-bit ALAC to FLAC stay lossless (no dither), and ALAC
+	// copies between MP4 and Matroska.
+	for (input, bits) in [("alac/s24_51.mkv", 24), ("alac/s16_stereo.m4a", 16)] {
+		let flac = tmp(&dir, &format!("{bits}.flac"));
+		let (ok, _, err) = rmp(&["-i", &fixture(input), flac.to_str().unwrap()]);
+		assert!(ok, "{err}");
+		let info = Input::open(flac.to_str().unwrap()).unwrap();
+		assert_eq!(info.streams().streams[0].parameters.bits_per_sample, Some(bits));
+		assert!(decoded_audio(flac.to_str().unwrap()) == decoded_audio(&fixture(input)), "{input}");
+	}
+	let mkv = tmp(&dir, "alac.mkv");
+	let m4a = tmp(&dir, "alac.m4a");
+	assert!(rmp(&["-i", &fixture("alac/s24_stereo.m4a"), mkv.to_str().unwrap()]).0);
+	assert!(rmp(&["-i", mkv.to_str().unwrap(), m4a.to_str().unwrap()]).0);
+	assert!(decoded_audio(m4a.to_str().unwrap()) == decoded_audio(&fixture("alac/s24_stereo.m4a")));
+	// Text subtitles move between SRT, WebVTT and ASS files.
+	let vtt = tmp(&dir, "s.vtt");
+	let srt = tmp(&dir, "s.srt");
+	let ass = tmp(&dir, "s.ass");
+	assert!(rmp(&["-i", &fixture("subtitles/sample.srt"), vtt.to_str().unwrap()]).0);
+	assert!(rmp(&["-i", vtt.to_str().unwrap(), srt.to_str().unwrap()]).0);
+	let text =
+		|p: &str| std::fs::read_to_string(p).unwrap().replace("\r\n", "\n").trim_end().to_string();
+	assert_eq!(text(srt.to_str().unwrap()), text(&fixture("subtitles/sample.srt")));
+	assert!(rmp(&["-i", &fixture("subtitles/sample.ass"), ass.to_str().unwrap()]).0);
+	assert_eq!(kinds(&ass), [(StreamKind::Subtitle, "ass".to_string())]);
+}
