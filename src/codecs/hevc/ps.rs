@@ -258,6 +258,8 @@ pub fn parse_short_term_rps(
 #[derive(Debug, Clone)]
 pub struct Sps {
 	pub id: usize,
+	/// sps_max_sub_layers_minus1 + 1.
+	pub max_sub_layers: u32,
 	pub chroma_format_idc: u32,
 	pub width: u32,
 	pub height: u32,
@@ -412,6 +414,7 @@ impl Sps {
 		check(!bs.overrun(), "hevc: truncated sps")?;
 		let ctb_size = 1 << log2_ctb_size;
 		Ok(Self {
+			max_sub_layers: max_sub_layers_minus1 as u32 + 1,
 			id,
 			chroma_format_idc,
 			width,

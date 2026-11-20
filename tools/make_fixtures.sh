@@ -201,6 +201,14 @@ ff -i process/tone_44k_stereo.wav -ar 8000 -ac 1 -f f32le process/tone_8k_mono.f
 # 	--debug /tmp/kv_rec.yuv
 # ff -fflags +genpts -r 25 -i /tmp/kv.hevc -c copy hevc/kvazaar_tiles_wpp.mp4
 # ff -f rawvideo -s 192x128 -pix_fmt yuv420p -r 25 -i /tmp/kv_rec.yuv -f framecrc hevc/kvazaar_tiles_wpp.framecrc
+# Multi-row WPP (threading tests): 4 rows of 64x64 CTBs, and 13 rows of
+# 16x16 CTBs with three slices per picture.
+# ff -f lavfi -i testsrc2=size=416x240:rate=25 -vf noise=alls=8:allf=t -frames:v 12 -c:v libx265 \
+# 	-pix_fmt yuv420p -x265-params "log-level=error:keyint=12:bframes=3:wpp=1:ref=3" hevc/x265_wpp.mp4
+# ff -f lavfi -i testsrc2=size=352x208:rate=25 -vf noise=alls=8:allf=t -frames:v 10 -c:v libx265 \
+# 	-pix_fmt yuv420p10le -x265-params "log-level=error:keyint=10:bframes=2:wpp=1:ctu=16:slices=3:weightb=1" \
+# 	hevc/x265_wpp_ctu16_slices.mkv
+# for n in x265_wpp.mp4 x265_wpp_ctu16_slices.mkv; do ff -threads 1 -i hevc/$n -f framecrc hevc/${n%.*}.framecrc; done
 
 # --- MPEG-TS, HLS and DASH -------------------------------------------------
 # Needs FFmpeg with libx264 and libx265. References are ffprobe dumps with

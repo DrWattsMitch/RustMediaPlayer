@@ -71,6 +71,9 @@ pub struct SliceHeader {
 	pub loop_filter_across_slices: bool,
 	/// Byte offset of slice_data() in the unescaped NAL unit.
 	pub data_offset: usize,
+	/// entry_point_offset_minus1[i] + 1: sizes of the substreams (tiles or
+	/// WPP rows) before the last, in bytes of the escaped NAL unit.
+	pub entry_points: Vec<u32>,
 	/// Address (raster scan) of the first CTB of the independent slice this
 	/// segment belongs to (`SliceAddrRs`).
 	pub slice_addr_rs: u32,
@@ -348,6 +351,7 @@ pub fn parse(
 		tc_offset,
 		loop_filter_across_slices,
 		data_offset: 0,
+		entry_points: Vec::new(),
 		slice_addr_rs: segment_address,
 	};
 	finish_entry_points(&mut bs, pps, &mut h)?;
@@ -363,10 +367,13 @@ fn finish_entry_points(
 	if pps.tiles_enabled || pps.entropy_coding_sync {
 		let n = bs.ue();
 		check(n <= 4400, "hevc: too many entry points")?;
+		h.entry_points.clear();
 		if n > 0 {
 			let len = bs.ue() + 1;
 			check(len <= 32, "hevc: invalid entry point size")?;
-			bs.skip(n as usize * len as usize);
+			for _ in 0..n {
+				h.entry_points.push(bs.bits(len).saturating_add(1));
+			}
 		}
 	}
 	if pps.slice_header_extension_present {

@@ -88,40 +88,43 @@ impl SliceDecoder<'_, '_> {
 
 	fn col_mv(
 		&self,
-		col: &crate::codecs::hevc::picture::Frame,
+		col: &crate::codecs::hevc::picture::RefPic,
 		x: i32,
 		y: i32,
 		ref_idx: usize,
 		list: usize,
 	) -> Option<[i16; 2]> {
-		let m = *col.mv_at(x as usize, y as usize);
-		if m.pred == PF_INTRA {
-			return None;
-		}
-		let list_col = if m.pred & PF_L0 == 0 {
-			1
-		} else if m.pred & PF_L1 == 0 {
-			0
-		} else if self.refs.no_backward_pred {
-			list
-		} else {
-			usize::from(self.sh.collocated_from_l0)
-		};
-		let col_refs = col.refs_at(x as usize, y as usize);
-		let ri = m.ref_idx[list_col] as usize;
-		let cur = &self.refs.info;
-		let cur_lt = cur.long_term[list][ref_idx];
-		if cur_lt != col_refs.long_term[list_col][ri] {
-			return None;
-		}
-		let mv = m.mv[list_col];
-		let col_diff = col.poc - col_refs.poc[list_col][ri];
-		let cur_diff = self.pic.poc - cur.poc[list][ref_idx];
-		if cur_lt || col_diff == cur_diff || col_diff == 0 {
-			Some(mv)
-		} else {
-			Some(scale_mv(mv, col_diff, cur_diff))
-		}
+		// The collocated picture may still be decoding on another thread.
+		col.with_motion(y as usize, |f| {
+			let m = *f.mv_at(x as usize, y as usize);
+			if m.pred == PF_INTRA {
+				return None;
+			}
+			let list_col = if m.pred & PF_L0 == 0 {
+				1
+			} else if m.pred & PF_L1 == 0 {
+				0
+			} else if self.refs.no_backward_pred {
+				list
+			} else {
+				usize::from(self.sh.collocated_from_l0)
+			};
+			let col_refs = f.refs_at(x as usize, y as usize);
+			let ri = m.ref_idx[list_col] as usize;
+			let cur = &self.refs.info;
+			let cur_lt = cur.long_term[list][ref_idx];
+			if cur_lt != col_refs.long_term[list_col][ri] {
+				return None;
+			}
+			let mv = m.mv[list_col];
+			let col_diff = col.poc - col_refs.poc[list_col][ri];
+			let cur_diff = self.pic.poc - cur.poc[list][ref_idx];
+			if cur_lt || col_diff == cur_diff || col_diff == 0 {
+				Some(mv)
+			} else {
+				Some(scale_mv(mv, col_diff, cur_diff))
+			}
+		})
 	}
 
 	// -----------------------------------------------------------------

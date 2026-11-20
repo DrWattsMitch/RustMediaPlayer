@@ -402,8 +402,8 @@ See [docs/WAV_Y4M.md](docs/WAV_Y4M.md), [docs/MP3_MP4.md](docs/MP3_MP4.md),
 [docs/OPUS_PLC.md](docs/OPUS_PLC.md),
 [docs/VORBIS_VP9.md](docs/VORBIS_VP9.md),
 [docs/SUBTITLES_VP8_ALAC.md](docs/SUBTITLES_VP8_ALAC.md) and
-[docs/THREADING.md](docs/THREADING.md) (H.264 frame threads, VP9 tile
-threads, the transcode pipeline and how they compare with FFmpeg) and
+[docs/THREADING.md](docs/THREADING.md) (H.264 and HEVC frame threads, HEVC
+WPP rows, VP9 tile threads, the transcode pipeline and how they compare with FFmpeg) and
 [docs/ZERO_COPY.md](docs/ZERO_COPY.md) (reference-counted frames and buffer
 pools) for how each part
 works and how to extend it. The examples show single features in a few

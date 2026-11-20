@@ -7,8 +7,13 @@
 //! * `ctu` — coding tree, residual coding, reconstruction, QP derivation,
 //!   deblocking boundary strengths; `mvs` — merge / AMVP / temporal MVs.
 //! * `intra`, `mc`, `transform` — prediction and inverse transforms.
-//! * `filter` — deblocking and SAO.
-//! * [`decoder`] — POC, reference picture sets, lists, DPB and output.
+//! * `filter` — deblocking and SAO, CTB row by CTB row.
+//! * [`decoder`] — POC, reference picture sets, lists, DPB and output,
+//!   and the picture jobs that frame threads run.
+//! * `picture` — planes, motion, and `RefPic`, through which pictures still
+//!   being decoded on another thread are read (row progress).
+//! * `wpp` — WPP slice segments decoded row by row from their entry
+//!   points, on several threads.
 //!
 //! Supported: Main, Main 10 (and Main 12) 4:2:0 — tiles, WPP, dependent
 //! slices, AMP, SAO, scaling lists, PCM, transform skip, lossless
@@ -29,9 +34,11 @@ mod simd;
 pub mod slice;
 mod tables;
 mod transform;
+mod wpp;
 
 pub use decoder::{HevcDecoderState, OutputPicture};
 
+use crate::codecs::threading;
 use crate::core::{
 	self, CodecPrivate, CodecState, DecodeOut, Frame, Keyframe, Packet, Parameters, State,
 	VideoFrame, VideoState, video,
@@ -79,7 +86,10 @@ impl core::Decoder for HevcDecoder {
 				dts: None,
 				last_pts: None,
 			},
-			private: CodecPrivate::Hevc(Box::new(HevcDecoderState::new(&parameters.extradata))),
+			private: CodecPrivate::Hevc(Box::new(HevcDecoderState::with_threads(
+				&parameters.extradata,
+				threading::default_threads(),
+			))),
 		})
 	}
 
@@ -88,8 +98,10 @@ impl core::Decoder for HevcDecoder {
 			return Err(Message::Codec("hevc decoder requires a video state"));
 		};
 		if !matches!(video.private, CodecPrivate::Hevc(_)) {
-			video.private =
-				CodecPrivate::Hevc(Box::new(HevcDecoderState::new(&video.codec_state.extradata)));
+			video.private = CodecPrivate::Hevc(Box::new(HevcDecoderState::with_threads(
+				&video.codec_state.extradata,
+				threading::default_threads(),
+			)));
 		}
 		let CodecPrivate::Hevc(dec) = &mut video.private else {
 			return Err(Message::Codec("hevc decoder state missing"));

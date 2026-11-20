@@ -103,8 +103,10 @@ fn idct_1d(src: &[i32], src_stride: usize, n: usize, nz: usize, shift: u32, out:
 
 /// In-place inverse DCT of an `n`x`n` block of dequantised coefficients
 /// into residuals. `max_x`/`max_y` bound the non-zero coefficients;
-/// `tmp` and `tmp2` are scratch space of at least `n * n`.
+/// `tmp` and `tmp2` are scratch space of at least `n * n`, `tmp16` of
+/// `2 * 32 * 32`.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub fn idct(
 	coeffs: &mut [i32],
 	n: usize,
@@ -113,9 +115,15 @@ pub fn idct(
 	bit_depth: u32,
 	tmp: &mut [i32],
 	tmp2: &mut [i32],
+	tmp16: &mut [i16],
 ) {
 	if (max_x | max_y) != 0 && crate::simd::enabled() {
-		super::simd::idct(coeffs, n, max_x, max_y, bit_depth, tmp, tmp2);
+		if n >= 8 {
+			let (a, b) = tmp16.split_at_mut(32 * 32);
+			super::simd::idct16(coeffs, n, max_x, max_y, bit_depth, a, b);
+		} else {
+			super::simd::idct(coeffs, n, max_x, max_y, bit_depth, tmp, tmp2);
+		}
 	} else {
 		idct_scalar(coeffs, n, max_x, max_y, bit_depth, tmp);
 	}

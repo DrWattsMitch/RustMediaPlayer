@@ -119,3 +119,154 @@ fn damaged_hevc_packets_do_not_panic() {
 		}
 	}
 }
+
+/// x265 with WPP over several CTB rows (416x240: 4 rows of 7 CTBs),
+/// B-pyramid, three references.
+#[test]
+fn hevc_wpp_rows_are_bit_exact() {
+	let mut d = Mp4Demuxer::new(memory(fixture("hevc/x265_wpp.mp4"))).unwrap();
+	check("x265_wpp", &decode(&mut d), (416, 240), 8);
+}
+
+/// Main 10, 16x16 CTBs (13 rows), three slices per picture with WPP,
+/// weighted bi-prediction.
+#[test]
+fn hevc_wpp_with_slices_and_small_ctbs_is_bit_exact() {
+	let mut d = MkvDemuxer::new(memory(fixture("hevc/x265_wpp_ctu16_slices.mkv"))).unwrap();
+	check("x265_wpp_ctu16_slices", &decode(&mut d), (352, 208), 10);
+}
+
+fn demuxer_for(name: &str) -> Box<dyn Demuxer> {
+	let data = memory(fixture(name));
+	if name.ends_with(".mkv") {
+		Box::new(MkvDemuxer::new(data).unwrap())
+	} else {
+		Box::new(Mp4Demuxer::new(data).unwrap())
+	}
+}
+
+/// Decodes `name` with `threads` threads; `damage` flips bits as in
+/// [`damaged_hevc_packets_do_not_panic`] (seed), errors ignored.
+fn decode_threads(name: &str, threads: usize, damage: Option<u32>) -> Vec<(Vec<u8>, Option<u64>)> {
+	rmp::codecs::threading::with_default_threads(threads, || {
+		let mut d = demuxer_for(name);
+		let stream = d.streams().by_kind(StreamKind::Video)[0].clone();
+		let decoder = Resolver::new().decoder_for(&stream).unwrap();
+		let mut state = decoder.create_state(&stream.parameters);
+		let mut out = Vec::new();
+		let mut push = |r: rmp::Result<rmp::core::DecodeOut>| {
+			for f in r.map(|o| o.value).unwrap_or_default() {
+				let Frame::Video(v) = f else { panic!("video expected") };
+				out.push((v.data().to_vec(), v.pts.map(|t| t.ticks())));
+			}
+		};
+		let mut n = damage.unwrap_or(0);
+		while let Some(mut packet) = d.read().unwrap() {
+			if packet.stream_id != stream.id {
+				continue;
+			}
+			if damage.is_some() {
+				for b in packet.data.iter_mut().skip(4) {
+					n = n.wrapping_mul(1_103_515_245).wrapping_add(12345);
+					if (n >> 16).is_multiple_of(61) {
+						*b ^= (n >> 8) as u8;
+					}
+				}
+			}
+			push(decoder.decode(&mut state, packet));
+		}
+		push(decoder.flush(&mut state));
+		out
+	})
+}
+
+const ALL_FIXTURES: [&str; 6] = [
+	"hevc/x265_main.mp4",
+	"hevc/x265_main10.mkv",
+	"hevc/x265_tools.mp4",
+	"hevc/kvazaar_tiles_wpp.mp4",
+	"hevc/x265_wpp.mp4",
+	"hevc/x265_wpp_ctu16_slices.mkv",
+];
+
+/// Frame (and WPP row) threading never changes the output.
+#[test]
+fn hevc_output_is_identical_for_every_thread_count() {
+	for name in ALL_FIXTURES {
+		let one = decode_threads(name, 1, None);
+		assert!(!one.is_empty());
+		for threads in [2, 3, 8] {
+			let many = decode_threads(name, threads, None);
+			assert_eq!(many.len(), one.len(), "{name}: frame count at {threads} threads");
+			for (i, (a, b)) in one.iter().zip(&many).enumerate() {
+				assert!(a == b, "{name}: frame {i} differs at {threads} threads");
+			}
+		}
+	}
+}
+
+/// Damaged streams decode the same way at every thread count too.
+#[test]
+fn damaged_hevc_output_is_identical_for_every_thread_count() {
+	for name in ALL_FIXTURES {
+		for seed in 0..6u32 {
+			let one = decode_threads(name, 1, Some(seed));
+			for threads in [2, 4] {
+				let many = decode_threads(name, threads, Some(seed));
+				assert!(one == many, "{name} seed {seed}: output differs at {threads} threads");
+			}
+		}
+	}
+}
+
+/// Decodes `name` through [`HevcDecoderState`] with explicit frame and
+/// WPP row thread counts.
+fn decode_threading(
+	name: &str,
+	frames: usize,
+	rows: usize,
+	damage: Option<u32>,
+) -> (Vec<Vec<u8>>, u64) {
+	use rmp::codecs::hevc::HevcDecoderState;
+	let mut d = demuxer_for(name);
+	let stream = d.streams().by_kind(StreamKind::Video)[0].clone();
+	let mut dec = HevcDecoderState::with_threading(&stream.parameters.extradata, frames, rows);
+	let mut out = Vec::new();
+	let mut n = damage.unwrap_or(0);
+	while let Some(mut packet) = d.read().unwrap() {
+		if packet.stream_id != stream.id {
+			continue;
+		}
+		if damage.is_some() {
+			for b in packet.data.iter_mut().skip(4) {
+				n = n.wrapping_mul(1_103_515_245).wrapping_add(12345);
+				if (n >> 16).is_multiple_of(61) {
+					*b ^= (n >> 8) as u8;
+				}
+			}
+		}
+		out.extend(dec.decode_packet(&packet.data, packet.pts).into_iter().map(|p| p.data));
+	}
+	out.extend(dec.drain().into_iter().map(|p| p.data));
+	(out, dec.damaged_slices)
+}
+
+/// WPP rows on several threads, with and without frame threads, give the
+/// single-threaded output, also on damaged input (same damage count too).
+#[test]
+fn hevc_wpp_row_threads_match_one_thread() {
+	for name in ALL_FIXTURES {
+		let one = decode_threading(name, 1, 1, None);
+		for (f, r) in [(1, 2), (1, 3), (1, 8), (2, 2), (3, 1), (4, 4)] {
+			let many = decode_threading(name, f, r, None);
+			assert!(one == many, "{name}: differs with {f} frame / {r} row threads");
+		}
+		for seed in 0..8u32 {
+			let one = decode_threading(name, 1, 1, Some(seed));
+			for (f, r) in [(1, 3), (3, 2)] {
+				let many = decode_threading(name, f, r, Some(seed));
+				assert!(one == many, "{name} seed {seed}: differs with {f} frame / {r} row threads");
+			}
+		}
+	}
+}

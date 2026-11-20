@@ -1,6 +1,8 @@
 //! In-loop filters: deblocking (§8.7.2) and sample adaptive offset
-//! (§8.7.3), run over the whole picture once all slices are decoded
-//! (FFmpeg `hevc/filter.c`, `hevc/dsp_template.c`).
+//! (§8.7.3), run CTB row by CTB row as decoding completes the rows, a row
+//! or two behind (FFmpeg `hevc/filter.c`, `hevc/dsp_template.c`). The
+//! result equals filtering the whole picture at once; see
+//! [`PicState::advance`].
 
 use super::ctu::{PicState, chroma_qp};
 use super::picture::Plane;
@@ -33,19 +35,25 @@ impl PicState {
 		self.no_filter[(y >> 2) * self.w4 + (x >> 2)] != 0
 	}
 
-	/// Deblocks the whole picture: vertical edges first, then horizontal.
-	pub fn deblock(&mut self) {
-		let (w, h) = (self.sps.width as usize, self.sps.height as usize);
+	/// Deblocks the edges in luma rows `y0..y1` (a band of whole CTB rows):
+	/// the vertical edges of those rows, then the horizontal edges at
+	/// `y0 <= y < y1`. Running the bands top to bottom gives the same
+	/// result as filtering every vertical edge of the picture first: a
+	/// horizontal edge at `y` reads rows `y - 4..y + 4`, which the band and
+	/// the one above have already filtered vertically, and modifies only
+	/// rows `y - 3..y + 3`, which no later vertical edge reads.
+	pub fn deblock_rows(&mut self, y0: usize, y1: usize) {
+		let (w, h) = (self.sps.width as usize, y1.min(self.sps.height as usize));
 		let bd = self.sps.bit_depth;
 		let max = (1i32 << bd) - 1;
 		let s = self.planes[0].stride;
 		for dir in 0..2 {
 			// Luma.
 			if bd <= 10 && crate::simd::enabled() {
-				self.deblock_luma_simd(dir, max);
+				self.deblock_luma_simd(dir, max, y0, h);
 			} else {
 				let (xs, ys, xstep, ystep) = if dir == 0 { (8, 0, 8, 4) } else { (0, 8, 4, 8) };
-				for y in (ys..h).step_by(ystep) {
+				for y in (ys.max(y0)..h).step_by(ystep) {
 					for x in (xs..w).step_by(xstep) {
 						let i4 = (y >> 2) * self.w4 + (x >> 2);
 						let bs = i32::from(if dir == 0 { self.bs_v[i4] } else { self.bs_h[i4] });
@@ -70,7 +78,7 @@ impl PicState {
 				let cs = self.planes[c].stride;
 				let (xs, ys, xstep, ystep) = if dir == 0 { (16, 0, 16, 8) } else { (0, 16, 8, 16) };
 				let qp_off = if c == 1 { self.pps.cb_qp_offset } else { self.pps.cr_qp_offset };
-				for y in (ys..h).step_by(ystep) {
+				for y in (ys.max(y0)..h).step_by(ystep) {
 					for x in (xs..w).step_by(xstep) {
 						let i4 = (y >> 2) * self.w4 + (x >> 2);
 						let bs = if dir == 0 { self.bs_v[i4] } else { self.bs_h[i4] };
@@ -97,12 +105,12 @@ impl PicState {
 	}
 
 	/// Luma edges of one direction, two 4-line segments at a time.
-	fn deblock_luma_simd(&mut self, dir: usize, max: i32) {
-		let (w, h) = (self.sps.width as usize, self.sps.height as usize);
+	fn deblock_luma_simd(&mut self, dir: usize, max: i32, y0: usize, h: usize) {
+		let w = self.sps.width as usize;
 		let bd = self.sps.bit_depth;
 		let s = self.planes[0].stride;
 		let (xs, ys) = if dir == 0 { (8, 0) } else { (0, 8) };
-		for y in (ys..h).step_by(8) {
+		for y in (ys.max(y0)..h).step_by(8) {
 			for x in (xs..w).step_by(8) {
 				let mut beta = [0; 2];
 				let mut tc = [0; 2];
@@ -138,147 +146,194 @@ impl PicState {
 		}
 	}
 
-	/// Applies SAO to the whole (deblocked) picture.
-	pub fn sao(&mut self) {
-		if !self.sao.iter().any(|s| s.type_idx.iter().any(|&t| t != 0)) {
-			return;
-		}
+	/// Applies SAO to CTB row `r`. Rows above must have been done already,
+	/// and the picture deblocked down to the row below: SAO reads the
+	/// deblocked samples one row outside the band, so they are kept in
+	/// `sao_src` (rows are copied in as they are first needed, before SAO
+	/// of the band above has changed them).
+	pub fn sao_row(&mut self, r: usize) {
 		let log2 = self.sps.log2_ctb_size as usize;
 		let (cw, ch) = (self.sps.ctb_width as usize, self.sps.ctb_height as usize);
+		let band = &self.sao[r * cw..(r + 1) * cw];
+		if !band.iter().any(|s| s.type_idx.iter().any(|&t| t != 0)) {
+			return;
+		}
 		let bd = self.sps.bit_depth;
 		let max = (1i32 << bd) - 1;
-		let any_nf = self.no_filter.iter().any(|&v| v != 0);
+		let (y0l, y1l) = (r << log2, ((r + 1) << log2).min(self.sps.height as usize));
+		let any_nf =
+			self.no_filter[(y0l >> 2) * self.w4..(y1l.div_ceil(4)) * self.w4].iter().any(|&v| v != 0);
 		for c in 0..3 {
-			if !self.sao.iter().any(|s| s.type_idx[c] != 0) {
+			if !self.sao[r * cw..(r + 1) * cw].iter().any(|s| s.type_idx[c] != 0) {
 				continue;
 			}
-			let src = self.planes[c].clone();
 			let sh = usize::from(c > 0);
-			let (pw, ph) = (src.width, src.height);
+			let (pw, ph) = (self.planes[c].width, self.planes[c].height);
 			let ctb = (1usize << log2) >> sh;
-			for cy in 0..ch {
-				for cx in 0..cw {
-					let rs = cy * cw + cx;
-					let sao = self.sao[rs];
-					let t = sao.type_idx[c];
-					if t == 0 {
-						continue;
+			// The deblocked rows y0 - 1 ..= y1 of this band, the rows SAO reads.
+			// Row y0 - 1 has already had SAO applied with the band above, so
+			// it comes from the copy kept then.
+			let (y0, y1) = (r * ctb, ((r + 1) * ctb).min(ph));
+			let plane = &self.planes[c];
+			let stride = plane.stride;
+			let mut src =
+				BandSrc { data: std::mem::take(&mut self.sao_band[c]), stride, pad: plane.pad, y0 };
+			src.data.resize((ctb + 2) * stride, 0);
+			if y0 > 0 {
+				let row = &mut src.data[..stride];
+				if self.sao_last_row[c] == Some(y0 - 1) {
+					row.copy_from_slice(&self.sao_last[c]);
+				} else {
+					row.copy_from_slice(&plane.data[plane.rows_range(y0 as isize - 1, y0 as isize)]);
+				}
+			}
+			let to = (y1 + 1).min(ph);
+			src.data[stride..(to - y0 + 1) * stride]
+				.copy_from_slice(&plane.data[plane.rows_range(y0 as isize, to as isize)]);
+			self.sao_last[c].clear();
+			self.sao_last[c].extend_from_slice(&src.data[(y1 - y0) * stride..(y1 - y0 + 1) * stride]);
+			self.sao_last_row[c] = Some(y1 - 1);
+			// Destination indexed like `src`.
+			let boff = (y0 + plane.pad - 1) * stride;
+			let cy = r;
+			for cx in 0..cw {
+				let rs = cy * cw + cx;
+				let sao = self.sao[rs];
+				let t = sao.type_idx[c];
+				if t == 0 {
+					continue;
+				}
+				let x0 = cx * ctb;
+				let y0 = cy * ctb;
+				let x1 = (x0 + ctb).min(pw);
+				let y1 = (y0 + ctb).min(ph);
+				let off = &sao.offset[c];
+				if t == 1 {
+					let shift = bd - 5;
+					let mut table = [0i32; 32];
+					for k in 0..4 {
+						table[(k + sao.band_position[c] as usize) & 31] = i32::from(off[k + 1]);
 					}
-					let x0 = cx * ctb;
-					let y0 = cy * ctb;
-					let x1 = (x0 + ctb).min(pw);
-					let y1 = (y0 + ctb).min(ph);
-					let off = &sao.offset[c];
-					if t == 1 {
-						let shift = bd - 5;
-						let mut table = [0i32; 32];
-						for k in 0..4 {
-							table[(k + sao.band_position[c] as usize) & 31] = i32::from(off[k + 1]);
+					let dst = &mut self.planes[c];
+					let n = x1 - x0;
+					let fast = if crate::simd::enabled() { n & !7 } else { 0 };
+					let bo = [off[1], off[2], off[3], off[4]];
+					for y in y0..y1 {
+						let row = dst.idx(x0 as isize, y as isize);
+						if fast > 0 {
+							super::simd::sao_band(
+								&mut dst.data[row..],
+								fast,
+								shift,
+								sao.band_position[c],
+								&bo,
+								max,
+							);
 						}
-						let dst = &mut self.planes[c];
-						let n = x1 - x0;
-						let fast = if crate::simd::enabled() { n & !7 } else { 0 };
-						let bo = [off[1], off[2], off[3], off[4]];
-						for y in y0..y1 {
-							let row = dst.idx(x0 as isize, y as isize);
-							if fast > 0 {
-								super::simd::sao_band(
-									&mut dst.data[row..],
-									fast,
-									shift,
-									sao.band_position[c],
-									&bo,
-									max,
-								);
-							}
-							for v in &mut dst.data[row + fast..row + n] {
-								let o = table[(*v >> shift) as usize];
-								*v = (i32::from(*v) + o).clamp(0, max) as u16;
-							}
+						for v in &mut dst.data[row + fast..row + n] {
+							let o = table[(*v >> shift) as usize];
+							*v = (i32::from(*v) + o).clamp(0, max) as u16;
 						}
-					} else {
-						// Usability of the eight neighbouring CTBs.
-						let mut ok = [[true; 3]; 3];
-						for (dy, row) in ok.iter_mut().enumerate() {
-							for (dx, v) in row.iter_mut().enumerate() {
-								let (nx, ny) = (cx as isize + dx as isize - 1, cy as isize + dy as isize - 1);
-								*v = !(nx < 0 || ny < 0 || nx >= cw as isize || ny >= ch as isize)
-									&& (dx == 1 && dy == 1
-										|| self.sao_neighbour_ok(rs, ny as usize * cw + nx as usize));
-							}
+					}
+				} else {
+					// Usability of the eight neighbouring CTBs.
+					let mut ok = [[true; 3]; 3];
+					for (dy, row) in ok.iter_mut().enumerate() {
+						for (dx, v) in row.iter_mut().enumerate() {
+							let (nx, ny) = (cx as isize + dx as isize - 1, cy as isize + dy as isize - 1);
+							*v = !(nx < 0 || ny < 0 || nx >= cw as isize || ny >= ch as isize)
+								&& (dx == 1 && dy == 1
+									|| self.sao_neighbour_ok(rs, ny as usize * cw + nx as usize));
 						}
-						let (hp, vp): ([isize; 2], [isize; 2]) = match sao.eo_class[c] {
-							0 => ([-1, 1], [0, 0]),
-							1 => ([0, 0], [-1, 1]),
-							2 => ([-1, 1], [-1, 1]),
-							_ => ([1, -1], [-1, 1]),
-						};
-						let s = src.stride as isize;
-						let d0 = vp[0] * s + hp[0];
-						let d1 = vp[1] * s + hp[1];
-						let dst = &mut self.planes[c];
-						// Offsets by raw edgeIdx 2 + sign + sign (0..=4).
-						let offs = [off[1], off[2], 0, off[3], off[4]];
-						let usable = |x: usize, y: usize| -> bool {
-							(0..2).all(|k| {
-								let nx = x as isize + hp[k];
-								let ny = y as isize + vp[k];
-								if nx < 0 || ny < 0 || nx >= pw as isize || ny >= ph as isize {
-									return false;
-								}
-								let dx = if nx < x0 as isize {
-									0
-								} else if nx >= (x0 + ctb) as isize {
-									2
-								} else {
-									1
-								};
-								let dy = if ny < y0 as isize {
-									0
-								} else if ny >= (y0 + ctb) as isize {
-									2
-								} else {
-									1
-								};
-								ok[dy][dx]
-							})
-						};
-						for y in y0..y1 {
-							let base = src.idx(x0 as isize, y as isize);
-							// Interior samples share the row's neighbour CTBs;
-							// only the two ends can reach a CTB to the side.
-							if x1 - x0 > 2 && usable(x0 + 1, y) {
-								sao_edge_run(&src.data, &mut dst.data, base + 1, x1 - x0 - 2, d0, d1, &offs, max);
+					}
+					let (hp, vp): ([isize; 2], [isize; 2]) = match sao.eo_class[c] {
+						0 => ([-1, 1], [0, 0]),
+						1 => ([0, 0], [-1, 1]),
+						2 => ([-1, 1], [-1, 1]),
+						_ => ([1, -1], [-1, 1]),
+					};
+					let s = src.stride as isize;
+					let d0 = vp[0] * s + hp[0];
+					let d1 = vp[1] * s + hp[1];
+					let dst = &mut self.planes[c].data[boff..];
+					// Offsets by raw edgeIdx 2 + sign + sign (0..=4).
+					let offs = [off[1], off[2], 0, off[3], off[4]];
+					let usable = |x: usize, y: usize| -> bool {
+						(0..2).all(|k| {
+							let nx = x as isize + hp[k];
+							let ny = y as isize + vp[k];
+							if nx < 0 || ny < 0 || nx >= pw as isize || ny >= ph as isize {
+								return false;
+							}
+							let dx = if nx < x0 as isize {
+								0
+							} else if nx >= (x0 + ctb) as isize {
+								2
 							} else {
-								for x in x0 + 1..x1.saturating_sub(1) {
-									if usable(x, y) {
-										sao_edge_run(&src.data, &mut dst.data, base + x - x0, 1, d0, d1, &offs, max);
-									}
-								}
-							}
-							for x in [x0, x1 - 1] {
-								if (x == x0 || x1 - x0 > 1) && usable(x, y) {
-									sao_edge_run(&src.data, &mut dst.data, base + x - x0, 1, d0, d1, &offs, max);
+								1
+							};
+							let dy = if ny < y0 as isize {
+								0
+							} else if ny >= (y0 + ctb) as isize {
+								2
+							} else {
+								1
+							};
+							ok[dy][dx]
+						})
+					};
+					for y in y0..y1 {
+						let base = src.idx(x0 as isize, y as isize);
+						// Interior samples share the row's neighbour CTBs;
+						// only the two ends can reach a CTB to the side.
+						if x1 - x0 > 2 && usable(x0 + 1, y) {
+							sao_edge_run(&src.data, dst, base + 1, x1 - x0 - 2, d0, d1, &offs, max);
+						} else {
+							for x in x0 + 1..x1.saturating_sub(1) {
+								if usable(x, y) {
+									sao_edge_run(&src.data, dst, base + x - x0, 1, d0, d1, &offs, max);
 								}
 							}
 						}
+						for x in [x0, x1 - 1] {
+							if (x == x0 || x1 - x0 > 1) && usable(x, y) {
+								sao_edge_run(&src.data, dst, base + x - x0, 1, d0, d1, &offs, max);
+							}
+						}
 					}
-					if any_nf {
-						// Restore PCM / bypass samples.
-						let dst = &mut self.planes[c];
-						for y in y0..y1 {
-							for x in x0..x1 {
-								let (lx, ly) = (x << sh, y << sh);
-								if self.no_filter[(ly >> 2) * self.w4 + (lx >> 2)] != 0 {
-									let at = dst.idx(x as isize, y as isize);
-									dst.data[at] = src.data[at];
-								}
+				}
+				if any_nf {
+					// Restore PCM / bypass samples.
+					let dst = &mut self.planes[c].data[boff..];
+					for y in y0..y1 {
+						for x in x0..x1 {
+							let (lx, ly) = (x << sh, y << sh);
+							if self.no_filter[(ly >> 2) * self.w4 + (lx >> 2)] != 0 {
+								let at = src.idx(x as isize, y as isize);
+								dst[at] = src.data[at];
 							}
 						}
 					}
 				}
 			}
+			self.sao_band[c] = src.data;
 		}
+	}
+}
+
+/// The deblocked rows `y0 - 1 ..= y0 + ctb` of a plane around the band
+/// SAO is applied to, with the plane's stride and padding.
+struct BandSrc {
+	data: Vec<u16>,
+	stride: usize,
+	pad: usize,
+	y0: usize,
+}
+
+impl BandSrc {
+	#[inline]
+	fn idx(&self, x: isize, y: isize) -> usize {
+		((y + 1 - self.y0 as isize) as usize) * self.stride + (x + self.pad as isize) as usize
 	}
 }
 
@@ -478,3 +533,86 @@ fn chroma_edge(
 
 #[allow(dead_code)]
 fn _plane_unused(_: &Plane) {}
+
+impl PicState {
+	/// Runs the in-loop filters as far as the decoded rows allow, and
+	/// publishes the rows that became final (FFmpeg filters and reports
+	/// progress the same way, a CTB row behind decoding).
+	///
+	/// * CTB row `r` is deblocked once row `r + 1` is decoded: intra
+	///   prediction in row `r + 1` reads row `r`'s last line unfiltered.
+	/// * SAO of row `r` runs once row `r + 1` is deblocked: it reads one
+	///   deblocked row below the band.
+	///
+	/// `finished`: the picture has no more slices; filter everything.
+	pub fn advance(&mut self, finished: bool) {
+		let (cw, ch) = (self.sps.ctb_width as usize, self.sps.ctb_height as usize);
+		while self.rows_complete < ch && self.row_ctbs[self.rows_complete] as usize == cw {
+			self.rows_complete += 1;
+		}
+		let log2 = self.sps.log2_ctb_size;
+		let h = self.sps.height as usize;
+		let deblock_to = if finished { ch } else { self.rows_complete.saturating_sub(1) };
+		while self.rows_deblocked < deblock_to {
+			let r = self.rows_deblocked;
+			self.deblock_rows(r << log2, ((r + 1) << log2).min(h));
+			self.rows_deblocked += 1;
+		}
+		let final_to = if finished { ch } else { self.rows_deblocked.saturating_sub(1) };
+		let prev = self.rows_final;
+		while self.rows_final < final_to {
+			self.sao_row(self.rows_final);
+			self.rows_final += 1;
+		}
+		if self.rows_final > prev {
+			let last = self.rows_final == ch;
+			for (c, p) in self.planes.iter_mut().enumerate() {
+				let sh = u32::from(c > 0);
+				p.extend_rows((prev << log2) >> sh, (self.rows_final << log2) >> sh);
+				if prev == 0 {
+					p.extend_top();
+				}
+				if last {
+					p.extend_bottom();
+				}
+			}
+		}
+		if !finished && (self.rows_final > prev || self.rows_complete > self.motion_published) {
+			self.publish(prev);
+		}
+	}
+
+	/// Copies newly final rows (from CTB row `prev`) and newly final motion
+	/// into the shared picture, and reports the progress.
+	fn publish(&mut self, prev: usize) {
+		let Some(out) = self.out.clone() else { return };
+		let log2 = self.sps.log2_ctb_size;
+		let h = self.sps.height as usize;
+		let cw = self.sps.ctb_width as usize;
+		let rows = ((self.rows_final << log2).min(h)) as u32;
+		let (m0, m1) = (self.motion_published, self.rows_complete);
+		let final_now = self.rows_final;
+		out.publish(rows, m1 as u32, |live| {
+			if final_now > prev {
+				for c in 0..3 {
+					let (src, dst) = (&self.planes[c], &mut live.planes[c]);
+					let sh = u32::from(c > 0);
+					let y0 = if prev == 0 { -(src.pad as isize) } else { ((prev << log2) >> sh) as isize };
+					let y1 = ((final_now << log2) >> sh).min(src.height) as isize;
+					let r = src.rows_range(y0, y1);
+					dst.data[r.clone()].copy_from_slice(&src.data[r]);
+				}
+			}
+			if m1 > m0 {
+				let w4 = self.w4;
+				let (a, b) = ((m0 << log2) >> 2, ((m1 << log2) >> 2).min(self.h4));
+				live.mvf[a * w4..b * w4].copy_from_slice(&self.mvf[a * w4..b * w4]);
+				live.ctb_slice[m0 * cw..m1 * cw].copy_from_slice(&self.ctb_slice[m0 * cw..m1 * cw]);
+				if live.slice_refs.len() != self.slices.len() {
+					live.slice_refs = self.slices.iter().map(|s| s.refs.clone()).collect();
+				}
+			}
+		});
+		self.motion_published = m1;
+	}
+}

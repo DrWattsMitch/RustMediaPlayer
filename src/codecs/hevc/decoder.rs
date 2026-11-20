@@ -2,13 +2,17 @@
 //! reference lists, the DPB and output order (ITU-T H.265 §8.1-8.3,
 //! Annex C; FFmpeg `hevcdec.c`, `hevc/refs.c`).
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use super::ctu::{PicState, SliceDecoder, SliceRefs};
-use super::picture::{Frame, FrameRef, MvField, PAD_CHROMA, PAD_LUMA, Plane, RefInfo};
+use super::picture::{Frame, FrameRef, MvField, PAD_CHROMA, PAD_LUMA, Plane, RefInfo, RefPic};
 use super::ps::{Layout, MAX_PPS, MAX_SPS, Pps, Sps};
 use super::slice::{self, SliceHeader, SliceType, is_idr, is_irap, nal};
-use crate::codecs::h264::nal::{split_annex_b, split_length_prefixed, unescape};
+use super::wpp::{self, Workspaces};
+use crate::codecs::h264::nal::{split_annex_b, split_length_prefixed};
+use crate::codecs::threading::WorkerPool;
 use crate::core::Time;
 
 /// A picture in display order, cropped.
@@ -24,6 +28,18 @@ pub struct OutputPicture {
 	pub keyframe: bool,
 }
 
+/// A picture bumped for output in packet `at`.
+struct PendingOutput {
+	at: u64,
+	frame: FrameRef,
+	crop: [u32; 4],
+	pts: Option<Time>,
+	keyframe: bool,
+}
+
+/// Recycled buffers for pictures published while they decode.
+type LivePool = Arc<Mutex<Vec<Frame>>>;
+
 struct DpbEntry {
 	frame: Option<FrameRef>,
 	poc: i32,
@@ -37,10 +53,26 @@ struct DpbEntry {
 	crop: [u32; 4],
 }
 
+/// One slice segment of the current picture, kept until the picture is
+/// complete and decoded by its picture job.
+pub(super) struct SliceJob {
+	pub header: SliceHeader,
+	pub rbsp: Vec<u8>,
+	/// Positions (in the escaped NAL unit) of the emulation prevention
+	/// bytes removed from `rbsp`, to locate the entry points.
+	pub escapes: Vec<u32>,
+	pub refs: Arc<SliceRefs>,
+}
+
 struct Current {
-	pic: PicState,
+	sps: Arc<Sps>,
+	pps: Arc<Pps>,
+	layout: Arc<Layout>,
+	poc: i32,
 	header: SliceHeader,
 	dpb_index: usize,
+	handle: FrameRef,
+	slices: Vec<SliceJob>,
 	refs_of_slice: Option<Arc<SliceRefs>>,
 	/// Pictures of the RPS current lists (with long-term marking).
 	st_before: Vec<Option<FrameRef>>,
@@ -65,7 +97,20 @@ pub struct HevcDecoderState {
 	active_sps: Option<Arc<Sps>>,
 	/// Last independent slice header of the current picture.
 	prev_header: Option<SliceHeader>,
+	/// Bumped pictures, waiting for their picture job and the output delay.
+	pending_out: VecDeque<PendingOutput>,
 	out: Vec<OutputPicture>,
+	/// Packets (access units) decoded so far.
+	packets: u64,
+	threads: usize,
+	/// Frame threads (none with one thread: pictures decode on the caller).
+	pool: Option<Arc<WorkerPool>>,
+	in_flight: VecDeque<FrameRef>,
+	/// Recycled buffers for pictures published while they decode.
+	live_pool: LivePool,
+	/// Threads per picture for the rows of WPP slice segments.
+	wpp_threads: usize,
+	workspaces: Arc<Workspaces>,
 	pub damaged_slices: u64,
 	pub unsupported: Option<&'static str>,
 }
@@ -79,13 +124,16 @@ impl std::fmt::Debug for HevcDecoderState {
 impl Clone for HevcDecoderState {
 	/// Cloning yields a fresh decoder with the same configuration.
 	fn clone(&self) -> Self {
-		Self {
+		let mut s = Self {
 			sps: self.sps.clone(),
 			pps: self.pps.clone(),
 			layouts: self.layouts.clone(),
 			nal_length_size: self.nal_length_size,
 			..Self::default()
-		}
+		};
+		s.set_threads(self.threads);
+		s.wpp_threads = self.wpp_threads;
+		s
 	}
 }
 
@@ -103,7 +151,15 @@ impl Default for HevcDecoderState {
 			no_rasl_output: true,
 			active_sps: None,
 			prev_header: None,
+			pending_out: VecDeque::new(),
 			out: Vec::new(),
+			packets: 0,
+			threads: 1,
+			pool: None,
+			in_flight: VecDeque::new(),
+			live_pool: Arc::new(Mutex::new(Vec::new())),
+			wpp_threads: 1,
+			workspaces: Arc::new(Workspaces::default()),
 			damaged_slices: 0,
 			unsupported: None,
 		}
@@ -114,10 +170,29 @@ impl Default for HevcDecoderState {
 pub struct HevcError(pub &'static str);
 
 impl HevcDecoderState {
-	/// Creates a decoder; `extradata` may be an `hvcC` record or Annex B
-	/// parameter sets.
+	/// Creates a decoder that decodes on the calling thread; `extradata` may
+	/// be an `hvcC` record or Annex B parameter sets. See
+	/// [`Self::with_threads`].
 	pub fn new(extradata: &[u8]) -> Self {
+		Self::with_threads(extradata, 1)
+	}
+
+	/// Creates a decoder that decodes up to `threads` pictures at once
+	/// (frame threading, FFmpeg's `-threads`). Pictures are returned
+	/// `threads - 1` packets later than with one thread; the output is
+	/// identical.
+	pub fn with_threads(extradata: &[u8], threads: usize) -> Self {
+		let (frames, rows) = split_threads(threads);
+		Self::with_threading(extradata, frames, rows)
+	}
+
+	/// Creates a decoder with `frame_threads` pictures in flight and up to
+	/// `row_threads` threads per picture for the rows of WPP slice segments
+	/// (both 1: everything on the calling thread).
+	pub fn with_threading(extradata: &[u8], frame_threads: usize, row_threads: usize) -> Self {
 		let mut s = Self::default();
+		s.set_threads(frame_threads);
+		s.wpp_threads = row_threads.clamp(1, crate::codecs::threading::MAX_THREADS);
 		if extradata.len() > 22 && extradata[0] == 1 {
 			s.nal_length_size = Some(usize::from(extradata[21] & 3) + 1);
 			let narrays = extradata[22] as usize;
@@ -147,6 +222,11 @@ impl HevcDecoderState {
 		s
 	}
 
+	fn set_threads(&mut self, threads: usize) {
+		self.threads = threads.clamp(1, crate::codecs::threading::MAX_THREADS);
+		self.pool = (self.threads > 1).then(|| WorkerPool::new(self.threads, "hevc"));
+	}
+
 	/// Decodes one access unit (or a run of NAL units); returns pictures
 	/// ready for display.
 	pub fn decode_packet(&mut self, data: &[u8], pts: Option<Time>) -> Vec<OutputPicture> {
@@ -167,6 +247,8 @@ impl HevcDecoderState {
 		}
 		// Packets carry whole access units: finish the picture now.
 		self.finish_picture();
+		self.packets += 1;
+		self.emit(false);
 		std::mem::take(&mut self.out)
 	}
 
@@ -175,6 +257,10 @@ impl HevcDecoderState {
 		self.finish_picture();
 		while self.bump() {}
 		self.dpb.clear();
+		self.emit(true);
+		while !self.in_flight.is_empty() {
+			self.retire_one();
+		}
 		std::mem::take(&mut self.out)
 	}
 
@@ -182,7 +268,45 @@ impl HevcDecoderState {
 		self.cur = None;
 		self.dpb.clear();
 		self.out.clear();
+		self.pending_out.clear();
+		while !self.in_flight.is_empty() {
+			self.retire_one();
+		}
 		self.first_picture = true;
+	}
+
+	/// Crops the bumped pictures whose output delay has passed (all of
+	/// them with `all`), waiting for their picture jobs. The delay is fixed
+	/// (`threads - 1` packets), so which call returns a picture never
+	/// depends on timing.
+	fn emit(&mut self, all: bool) {
+		let delay = self.threads as u64 - 1;
+		while let Some(p) = self.pending_out.front() {
+			// Bumped while decoding packet `at`: returned by the call for
+			// packet `at + delay` (`packets` counts the packets done).
+			if !all && p.at + delay >= self.packets {
+				break;
+			}
+			let PendingOutput { frame: f, crop, pts, keyframe, .. } =
+				self.pending_out.pop_front().expect("front");
+			let frame = f.wait_done();
+			let ready = f.output.lock().unwrap_or_else(|e| e.into_inner()).take();
+			self.out.push(match ready {
+				Some(data) => output_picture(frame, crop, data, pts, keyframe),
+				None => crop_output(frame, crop, pts, keyframe),
+			});
+		}
+		// Count the damage of finished jobs.
+		while self.in_flight.front().is_some_and(|f| f.done().is_some()) {
+			self.retire_one();
+		}
+	}
+
+	fn retire_one(&mut self) {
+		if let Some(f) = self.in_flight.pop_front() {
+			f.wait_done();
+			self.damaged_slices += f.damaged.load(Ordering::Acquire);
+		}
 	}
 
 	fn nal_unit(&mut self, data: &[u8], pts: Option<Time>) -> Result<(), HevcError> {
@@ -197,13 +321,13 @@ impl HevcDecoderState {
 		}
 		match t {
 			nal::SPS => {
-				let rbsp = unescape(data);
+				let rbsp = unescape_with_positions(data).0;
 				let sps = Sps::parse(&rbsp).map_err(|e| HevcError(e.0))?;
 				let id = sps.id;
 				self.sps[id] = Some(Arc::new(sps));
 			}
 			nal::PPS => {
-				let rbsp = unescape(data);
+				let rbsp = unescape_with_positions(data).0;
 				let pps = Pps::parse(&rbsp, &self.sps).map_err(|e| HevcError(e.0))?;
 				let sps = self.sps[pps.sps_id].clone().ok_or(HevcError("hevc: pps without sps"))?;
 				let layout = pps.layout(&sps).map_err(|e| HevcError(e.0))?;
@@ -216,15 +340,22 @@ impl HevcDecoderState {
 				self.first_picture = true;
 			}
 			0..=9 | 16..=21 => {
-				let rbsp = unescape(data);
-				self.slice(&rbsp, t, tid, pts)?;
+				let (rbsp, escapes) = unescape_with_positions(data);
+				self.slice(rbsp, escapes, t, tid, pts)?;
 			}
 			_ => {}
 		}
 		Ok(())
 	}
 
-	fn slice(&mut self, rbsp: &[u8], t: u8, tid: u8, pts: Option<Time>) -> Result<(), HevcError> {
+	fn slice(
+		&mut self,
+		rbsp: Vec<u8>,
+		escapes: Vec<u32>,
+		t: u8,
+		tid: u8,
+		pts: Option<Time>,
+	) -> Result<(), HevcError> {
 		// Peek first_slice_segment_in_pic_flag.
 		let first = rbsp.get(2).is_some_and(|b| b & 0x80 != 0);
 		if first {
@@ -238,7 +369,7 @@ impl HevcDecoderState {
 			return Err(HevcError("hevc: slice without picture start"));
 		}
 		let prev = if first { None } else { self.prev_header.as_ref() };
-		let sh = slice::parse(rbsp, t, &self.sps, &self.pps, prev).map_err(|e| HevcError(e.0))?;
+		let sh = slice::parse(&rbsp, t, &self.sps, &self.pps, prev).map_err(|e| HevcError(e.0))?;
 		if !sh.dependent {
 			self.prev_header = Some(sh.clone());
 		}
@@ -252,12 +383,6 @@ impl HevcDecoderState {
 		if sh.pps_id != cur.header.pps_id {
 			return Err(HevcError("hevc: pps change within a picture"));
 		}
-		// A segment starting on an already decoded CTB (a duplicate or
-		// overlapping slice) is dropped, as FFmpeg does, rather than
-		// overwriting good samples.
-		if cur.pic.ctb_addr.get(sh.segment_address as usize) != Some(&u32::MAX) {
-			return Err(HevcError("hevc: overlapping slice segment"));
-		}
 		// Reference lists.
 		let refs = if sh.dependent {
 			cur.refs_of_slice.clone().ok_or(HevcError("hevc: dependent slice without lists"))?
@@ -266,8 +391,7 @@ impl HevcDecoderState {
 			cur.refs_of_slice = Some(r.clone());
 			r
 		};
-		let mut sd = SliceDecoder::new(&mut cur.pic, &sh, &refs, rbsp);
-		sd.decode().map_err(|e| HevcError(e.0))?;
+		cur.slices.push(SliceJob { header: sh, rbsp, escapes, refs });
 		Ok(())
 	}
 
@@ -421,9 +545,25 @@ impl HevcDecoderState {
 			}
 		}
 		let dpb_index = self.dpb.iter().position(|e| e.frame.is_none()).unwrap_or(dpb_index);
-		let pic = PicState::new(sps, pps, layout, poc);
+		// Other pictures can read this one while it decodes unless it is a
+		// sub-layer non-reference picture of the highest sub-layer, which no
+		// picture references.
+		let referenced = !(slice::is_sub_layer_non_ref(t) && u32::from(tid) + 1 >= sps.max_sub_layers);
+		let live = (self.pool.is_some() && referenced).then(|| self.live_frame(&sps, poc));
+		let handle = Arc::new(RefPic::pending(
+			poc,
+			sps.height as usize,
+			sps.ctb_height as usize,
+			sps.log2_ctb_size,
+			live,
+		));
 		self.cur = Some(Box::new(Current {
-			pic,
+			sps,
+			pps,
+			layout,
+			poc,
+			handle,
+			slices: Vec::new(),
 			header: sh.clone(),
 			dpb_index,
 			refs_of_slice: None,
@@ -435,31 +575,69 @@ impl HevcDecoderState {
 		Ok(())
 	}
 
-	/// Runs the in-loop filters on the current picture and stores it.
+	/// A buffer for publishing a picture's rows while it decodes, recycled
+	/// from earlier pictures when the geometry matches. Readers only see
+	/// rows after they are published, so its old contents never matter.
+	fn live_frame(&self, sps: &Sps, poc: i32) -> Box<Frame> {
+		let reuse = {
+			let mut pool = self.live_pool.lock().unwrap_or_else(|e| e.into_inner());
+			let k = pool.iter().position(|f| {
+				f.planes[0].width == sps.width as usize
+					&& f.planes[0].height == sps.height as usize
+					&& f.log2_ctb_size == sps.log2_ctb_size
+			});
+			k.map(|k| Box::new(pool.swap_remove(k)))
+		};
+		let mut f = reuse.unwrap_or_else(|| Box::new(blank_frame(sps, 0, 0)));
+		f.poc = poc;
+		f.bit_depth = sps.bit_depth;
+		f.slice_refs.clear();
+		f
+	}
+
+	/// Stores the current picture in the DPB and starts its picture job
+	/// (on a frame thread, or here with one thread).
 	fn finish_picture(&mut self) {
 		let Some(cur) = self.cur.take() else { return };
-		let mut pic = cur.pic;
-		pic.deblock();
-		pic.sao();
-		for p in &mut pic.planes {
-			p.extend_edges();
-		}
-		let sps = pic.sps.clone();
-		let frame = Frame {
-			planes: pic.planes,
-			poc: pic.poc,
-			mvf: pic.mvf,
-			w4: pic.w4,
-			ctb_slice: pic.ctb_slice,
-			slice_refs: pic.slices.into_iter().map(|s| s.refs).collect(),
-			log2_ctb_size: sps.log2_ctb_size,
-			ctb_width: sps.ctb_width as usize,
-			bit_depth: sps.bit_depth,
-		};
+		let sps = cur.sps.clone();
+		let handle = cur.handle.clone();
+		let mut crop = None;
 		if let Some(e) = self.dpb.get_mut(cur.dpb_index) {
-			e.frame = Some(Arc::new(frame));
+			e.frame = Some(handle.clone());
+			// Frame threads also prepare the output copy.
+			if e.output && self.pool.is_some() {
+				crop = Some(e.crop);
+			}
 		}
-		let _ = cur.header;
+		let job = PictureJob {
+			sps: cur.sps,
+			pps: cur.pps,
+			layout: cur.layout,
+			poc: cur.poc,
+			slices: cur.slices,
+			out: handle.clone(),
+			live_pool: self.live_pool.clone(),
+			wpp_threads: self.wpp_threads,
+			workspaces: self.workspaces.clone(),
+			crop,
+		};
+		match self.pool.clone() {
+			Some(pool) => {
+				// At most `threads` pictures in flight (FFmpeg keeps one per
+				// frame thread): wait for the oldest before starting another.
+				// Jobs only wait on earlier jobs and the pool is FIFO, so this
+				// can't deadlock.
+				while self.in_flight.len() >= self.threads {
+					self.retire_one();
+				}
+				self.in_flight.push_back(handle);
+				pool.submit(move || job.run());
+			}
+			None => {
+				job.run();
+				self.damaged_slices += handle.damaged.load(Ordering::Acquire);
+			}
+		}
 		// Output now if allowed (C.5.2.3).
 		loop {
 			let waiting = self.dpb.iter().filter(|e| e.output && e.frame.is_some()).count();
@@ -489,12 +667,29 @@ impl HevcDecoderState {
 		let e = &mut self.dpb[k];
 		e.output = false;
 		let f = e.frame.clone().expect("filtered");
-		self.out.push(crop_output(&f, e.crop, e.pts, e.keyframe));
+		self.pending_out.push_back(PendingOutput {
+			at: self.packets,
+			frame: f,
+			crop: e.crop,
+			pts: e.pts,
+			keyframe: e.keyframe,
+		});
 		if !e.short_ref && !e.long_ref {
 			self.dpb.remove(k);
 		}
 		true
 	}
+}
+
+/// How `threads` are used: (pictures in flight, row threads per picture).
+/// Frame threads by default, as FFmpeg: they scale as well as WPP rows
+/// and cost less (no row hand-over). `RMP_HEVC_ROWS` adds WPP row threads
+/// to each picture; `RMP_HEVC_FRAMES` overrides the pictures in flight.
+fn split_threads(threads: usize) -> (usize, usize) {
+	let env = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<usize>().ok());
+	let frames = env("RMP_HEVC_FRAMES").filter(|&n| n > 0).unwrap_or(threads);
+	let rows = env("RMP_HEVC_ROWS").filter(|&n| n > 0).unwrap_or(1);
+	(frames, rows)
 }
 
 /// Whether `data` is a sequence of `n`-byte length-prefixed NAL units
@@ -508,15 +703,15 @@ fn tiles_exactly(data: &[u8], n: usize) -> bool {
 	at == data.len()
 }
 
-fn missing_frame(sps: &Sps, poc: i32) -> FrameRef {
-	let mid = 1u16 << (sps.bit_depth - 1);
+/// An all-`fill` picture with no motion (intra everywhere).
+fn blank_frame(sps: &Sps, poc: i32, fill: u16) -> Frame {
 	let (w, h) = (sps.width as usize, sps.height as usize);
 	let w4 = w.div_ceil(4);
-	Arc::new(Frame {
+	Frame {
 		planes: [
-			Plane::new(w, h, PAD_LUMA, mid),
-			Plane::new(w / 2, h / 2, PAD_CHROMA, mid),
-			Plane::new(w / 2, h / 2, PAD_CHROMA, mid),
+			Plane::new(w, h, PAD_LUMA, fill),
+			Plane::new(w / 2, h / 2, PAD_CHROMA, fill),
+			Plane::new(w / 2, h / 2, PAD_CHROMA, fill),
 		],
 		poc,
 		mvf: vec![MvField::default(); w4 * h.div_ceil(4)],
@@ -526,7 +721,106 @@ fn missing_frame(sps: &Sps, poc: i32) -> FrameRef {
 		log2_ctb_size: sps.log2_ctb_size,
 		ctb_width: sps.ctb_width as usize,
 		bit_depth: sps.bit_depth,
-	})
+	}
+}
+
+fn missing_frame(sps: &Sps, poc: i32) -> FrameRef {
+	RefPic::complete(blank_frame(sps, poc, 1u16 << (sps.bit_depth - 1)))
+}
+
+/// Everything needed to decode one picture's slices, independent of the
+/// decoder state, so it can run on a frame thread.
+struct PictureJob {
+	sps: Arc<Sps>,
+	pps: Arc<Pps>,
+	layout: Arc<Layout>,
+	poc: i32,
+	slices: Vec<SliceJob>,
+	out: FrameRef,
+	live_pool: LivePool,
+	/// Threads for the rows of a WPP slice segment.
+	wpp_threads: usize,
+	workspaces: Arc<Workspaces>,
+	/// Crop the output copy (the picture will be output).
+	crop: Option<[u32; 4]>,
+}
+
+/// Poisons the picture if its job unwinds, so that its readers fail
+/// instead of waiting forever.
+struct PoisonGuard(Option<FrameRef>);
+
+impl Drop for PoisonGuard {
+	fn drop(&mut self) {
+		if let Some(f) = self.0.take() {
+			f.poison();
+		}
+	}
+}
+
+impl PictureJob {
+	fn run(self) {
+		let mut guard = PoisonGuard(Some(self.out.clone()));
+		let mut pic = PicState::new(self.sps, self.pps, self.layout, self.poc);
+		if self.out.publishes() {
+			pic.out = Some(self.out.clone());
+		}
+		for s in &self.slices {
+			if let Err(e) = decode_slice(&mut pic, s, self.wpp_threads, &self.workspaces) {
+				if std::env::var_os("RMP_HEVC_DEBUG").is_some() {
+					eprintln!("hevc: {}", e.0);
+				}
+				self.out.damaged.fetch_add(1, Ordering::AcqRel);
+			}
+		}
+		pic.advance(true);
+		pic.out = None;
+		let frame = pic.into_frame();
+		if let Some(crop) = self.crop {
+			*self.out.output.lock().unwrap_or_else(|e| e.into_inner()) = Some(crop_samples(&frame, crop));
+		}
+		if let Some(live) = self.out.finish(frame) {
+			self.live_pool.lock().unwrap_or_else(|e| e.into_inner()).push(*live);
+		}
+		guard.0 = None;
+	}
+}
+
+/// Decodes one slice segment into the picture.
+fn decode_slice(
+	pic: &mut PicState,
+	s: &SliceJob,
+	wpp_threads: usize,
+	workspaces: &Workspaces,
+) -> Result<(), HevcError> {
+	// A segment starting on an already decoded CTB (a duplicate or
+	// overlapping slice) is dropped, as FFmpeg does, rather than
+	// overwriting good samples.
+	if pic.ctb_addr.get(s.header.segment_address as usize) != Some(&u32::MAX) {
+		return Err(HevcError("hevc: overlapping slice segment"));
+	}
+	if let Some(rows) = wpp::rows_of(pic, s) {
+		return wpp::decode_rows(pic, s, rows, wpp_threads, workspaces).map_err(|e| HevcError(e.0));
+	}
+	let mut sd = SliceDecoder::new(pic, &s.header, &s.refs, &s.rbsp);
+	sd.decode().map_err(|e| HevcError(e.0))
+}
+
+/// Removes emulation prevention bytes (00 00 03 -> 00 00) and returns the
+/// RBSP with the escaped positions of the removed bytes.
+fn unescape_with_positions(data: &[u8]) -> (Vec<u8>, Vec<u32>) {
+	let mut out = Vec::with_capacity(data.len());
+	let mut esc = Vec::new();
+	let mut zeros = 0;
+	for (i, &b) in data.iter().enumerate() {
+		if zeros >= 2 && b == 3 {
+			esc.push(i as u32);
+			zeros = 0;
+			continue;
+		}
+		zeros = if b == 0 { zeros + 1 } else { 0 };
+		out.push(b);
+	}
+	(out, esc)
 }
 
 /// Reference picture lists of a slice (8.3.4).
@@ -571,7 +865,7 @@ fn build_lists(cur: &Current, sh: &SliceHeader) -> Result<SliceRefs, HevcError> 
 			let (f, lt) = temp.get(idx).cloned().ok_or(HevcError("hevc: invalid list entry"))?;
 			if let Some(fr) = &f {
 				refs.info.poc[l][i] = fr.poc;
-				if fr.poc > cur.pic.poc {
+				if fr.poc > cur.poc {
 					refs.no_backward_pred = false;
 				}
 			}
@@ -588,6 +882,24 @@ fn build_lists(cur: &Current, sh: &SliceHeader) -> Result<SliceRefs, HevcError> 
 
 /// Crops a frame into packed planar bytes.
 fn crop_output(f: &Frame, crop: [u32; 4], pts: Option<Time>, keyframe: bool) -> OutputPicture {
+	output_picture(f, crop, crop_samples(f, crop), pts, keyframe)
+}
+
+fn output_picture(
+	f: &Frame,
+	crop: [u32; 4],
+	data: Vec<u8>,
+	pts: Option<Time>,
+	keyframe: bool,
+) -> OutputPicture {
+	let [l, r, t, b] = crop.map(|v| v as usize);
+	let w = f.planes[0].width - l - r;
+	let h = f.planes[0].height - t - b;
+	OutputPicture { width: w as u32, height: h as u32, bit_depth: f.bit_depth, data, pts, keyframe }
+}
+
+/// The cropped samples of a frame, packed planar.
+fn crop_samples(f: &Frame, crop: [u32; 4]) -> Vec<u8> {
 	// crop: left, right, top, bottom in luma samples.
 	let [l, r, t, b] = crop.map(|v| v as usize);
 	let w = f.planes[0].width - l - r;
@@ -608,5 +920,5 @@ fn crop_output(f: &Frame, crop: [u32; 4], pts: Option<Time>, keyframe: bool) -> 
 			}
 		}
 	}
-	OutputPicture { width: w as u32, height: h as u32, bit_depth: f.bit_depth, data, pts, keyframe }
+	data
 }

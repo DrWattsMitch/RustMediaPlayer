@@ -217,6 +217,13 @@ impl<'a> Cabac<'a> {
 
 	/// Restarts the engine at the byte after the last terminate (new
 	/// substream: tile or WPP row), keeping the contexts.
+	/// Restarts the engine at byte `start` with contexts `ctx` (a new
+	/// substream).
+	pub fn restart(&mut self, start: usize, ctx: Contexts) {
+		self.ctx = ctx;
+		self.init_engine(start);
+	}
+
 	pub fn reinit_after_terminate(&mut self) {
 		let p = self.byte_position();
 		self.init_engine(p);

@@ -4,10 +4,13 @@
 
 use std::sync::Arc;
 
-use super::cabac::{Cabac, Contexts};
+use super::cabac::Cabac;
+pub use super::cabac::Contexts;
 use super::intra;
 use super::mc;
-use super::picture::{FrameRef, MvField, PF_BI, PF_INTRA, PF_L0, PF_L1, Plane, RefInfo};
+use super::picture::{
+	Frame, FrameRef, MvField, PF_BI, PF_INTRA, PF_L0, PF_L1, Plane, RefInfo, RefPic,
+};
 use super::ps::{Layout, Pps, Sps, diag_scan};
 use super::slice::{SliceHeader, SliceType};
 use super::tables::*;
@@ -71,6 +74,26 @@ pub struct PicState {
 	/// Last QpY of the previous slice segment (dependent slices continue it).
 	pub ds_qp_y: i32,
 	pub ctbs_decoded: usize,
+	// In-loop filter progress (see `filter.rs`).
+	/// CTBs decoded in each CTB row.
+	pub row_ctbs: Vec<u32>,
+	/// CTB rows fully decoded (counted from the top), deblocked, and final
+	/// (SAO applied and padding written).
+	pub rows_complete: usize,
+	pub rows_deblocked: usize,
+	pub rows_final: usize,
+	/// CTB rows whose motion has been published.
+	pub motion_published: usize,
+	/// Per component: the deblocked rows SAO reads around its band, and
+	/// the last such row of the band done before (with its row number).
+	pub sao_band: [Vec<u16>; 3],
+	pub sao_last: [Vec<u16>; 3],
+	pub sao_last_row: [Option<usize>; 3],
+	/// Where finished rows are published for other picture jobs.
+	pub out: Option<Arc<RefPic>>,
+	/// A WPP row thread's private copy: it holds only the rows that thread
+	/// decodes (and the edge of the row above); no filtering here.
+	pub workspace: bool,
 }
 
 impl PicState {
@@ -107,6 +130,16 @@ impl PicState {
 			wpp_contexts: None,
 			ds_qp_y: 0,
 			ctbs_decoded: 0,
+			row_ctbs: vec![0; sps.ctb_height as usize],
+			rows_complete: 0,
+			rows_deblocked: 0,
+			rows_final: 0,
+			motion_published: 0,
+			sao_band: [Vec::new(), Vec::new(), Vec::new()],
+			sao_last: [Vec::new(), Vec::new(), Vec::new()],
+			sao_last_row: [None; 3],
+			out: None,
+			workspace: false,
 			sps,
 			pps,
 			layout,
@@ -114,8 +147,76 @@ impl PicState {
 	}
 }
 
+impl PicState {
+	/// The finished picture, for the DPB.
+	pub fn into_frame(self) -> Frame {
+		Frame {
+			planes: self.planes,
+			poc: self.poc,
+			mvf: self.mvf,
+			w4: self.w4,
+			ctb_slice: self.ctb_slice,
+			slice_refs: self.slices.into_iter().map(|s| s.refs).collect(),
+			log2_ctb_size: self.sps.log2_ctb_size,
+			ctb_width: self.sps.ctb_width as usize,
+			bit_depth: self.sps.bit_depth,
+		}
+	}
+
+	/// Records that CTB `rs` has been decoded, and runs the in-loop
+	/// filters on rows that are complete.
+	#[inline]
+	pub fn ctb_done(&mut self, rs: usize) {
+		if self.workspace {
+			return;
+		}
+		let cw = self.sps.ctb_width as usize;
+		let row = rs / cw;
+		self.row_ctbs[row] += 1;
+		self.ctbs_decoded += 1;
+		if self.row_ctbs[row] as usize == cw && row == self.rows_complete {
+			self.advance(false);
+		}
+	}
+}
+
 #[derive(Debug)]
 pub struct DecodeError(pub &'static str);
+
+impl SliceInfo {
+	pub fn of(sh: &SliceHeader, refs: &SliceRefs) -> Self {
+		Self {
+			beta_offset: sh.beta_offset,
+			tc_offset: sh.tc_offset,
+			lf_across_slices: sh.loop_filter_across_slices,
+			refs: refs.info.clone(),
+		}
+	}
+}
+
+/// initType of a slice (Table 9-4 selection).
+pub fn init_type_of(sh: &SliceHeader) -> usize {
+	let t = match sh.slice_type {
+		SliceType::I => 0,
+		SliceType::P => 1,
+		SliceType::B => 2,
+	};
+	if sh.cabac_init && sh.slice_type != SliceType::I { 3 - t } else { t }
+}
+
+/// Synchronisation of a WPP row with the row above it.
+pub trait RowHooks {
+	/// Called before CTB column `cx`: waits until the row above has decoded
+	/// CTB `cx + 1` (or ended) and makes its bottom edge visible in `pic`.
+	/// `false`: the row above failed first, stop.
+	fn before(&mut self, pic: &mut PicState, cx: usize) -> bool;
+	/// Contexts for the row start (after `before(_, 0)`), `None` to keep
+	/// the ones the decoder was created with.
+	fn start_contexts(&mut self) -> Option<Contexts>;
+	/// Called after CTB `cx`, with the contexts after it for `cx <= 1` (the
+	/// row below starts from those after CTB 1).
+	fn after(&mut self, pic: &PicState, cx: usize, ctx: Option<&Contexts>);
+}
 
 /// Reference pictures of the current slice.
 pub struct SliceRefs {
@@ -152,6 +253,10 @@ struct Cu {
 	intra_mode_c: u32,
 	merge_flag: bool,
 }
+
+/// Prediction buffer of one list (the vector stores read up to 8 samples
+/// past a block's end).
+const PRED_LEN: usize = mc::MAX_PB * mc::MAX_PB + 16;
 
 const SCAN_DIAG: usize = 0;
 const SCAN_HORIZ: usize = 1;
@@ -213,10 +318,13 @@ pub struct SliceDecoder<'a, 'b> {
 	ctb_x: i32,
 	ctb_y: i32,
 	coeffs: Box<[i32; 32 * 32]>,
-	pred: Box<[[i16; mc::MAX_PB * mc::MAX_PB]; 2]>,
+	/// Prediction of each list, one component at a time.
+	pred: Box<[[i16; PRED_LEN]; 2]>,
 	mc_tmp: Box<[i16; mc::TMP_LEN]>,
 	tr_tmp: Box<[i32; 32 * 32]>,
 	tr_tmp2: Box<[i32; 32 * 32]>,
+	/// 16-bit scratch for the vector inverse DCT (two 32x32 blocks).
+	tr16: Box<[i16; 2 * 32 * 32]>,
 	pub(super) cur_slice_addr: u32,
 }
 
@@ -227,26 +335,28 @@ impl<'a, 'b> SliceDecoder<'a, 'b> {
 		refs: &'a SliceRefs,
 		data: &'b [u8],
 	) -> Self {
+		pic.slices.push(SliceInfo::of(sh, refs));
+		let slice_idx = (pic.slices.len() - 1) as u16;
+		let ctx = Contexts::new(init_type_of(sh), sh.slice_qp);
+		Self::with_slice(pic, sh, refs, data, sh.data_offset, slice_idx, ctx)
+	}
+
+	/// A decoder for one substream (a WPP row) starting at byte `start` of
+	/// `data`, for slice `slice_idx` of the picture, with contexts `ctx`.
+	pub fn with_slice(
+		pic: &'a mut PicState,
+		sh: &'a SliceHeader,
+		refs: &'a SliceRefs,
+		data: &'b [u8],
+		start: usize,
+		slice_idx: u16,
+		ctx: Contexts,
+	) -> Self {
 		let sps = pic.sps.clone();
 		let pps = pic.pps.clone();
 		let layout = pic.layout.clone();
-		let mut init_type = match sh.slice_type {
-			SliceType::I => 0,
-			SliceType::P => 1,
-			SliceType::B => 2,
-		};
-		if sh.cabac_init && sh.slice_type != SliceType::I {
-			init_type = 3 - init_type;
-		}
-		let ctx = Contexts::new(init_type, sh.slice_qp);
-		let cabac = Cabac::new(data, sh.data_offset, ctx);
-		pic.slices.push(SliceInfo {
-			beta_offset: sh.beta_offset,
-			tc_offset: sh.tc_offset,
-			lf_across_slices: sh.loop_filter_across_slices,
-			refs: refs.info.clone(),
-		});
-		let slice_idx = (pic.slices.len() - 1) as u16;
+		let init_type = init_type_of(sh);
+		let cabac = Cabac::new(data, start, ctx);
 		Self {
 			pic,
 			sh,
@@ -267,12 +377,70 @@ impl<'a, 'b> SliceDecoder<'a, 'b> {
 			ctb_x: 0,
 			ctb_y: 0,
 			coeffs: Box::new([0; 32 * 32]),
-			pred: Box::new([[0; mc::MAX_PB * mc::MAX_PB]; 2]),
+			pred: Box::new([[0; PRED_LEN]; 2]),
 			mc_tmp: Box::new([0; mc::TMP_LEN]),
 			tr_tmp: Box::new([0; 32 * 32]),
 			tr_tmp2: Box::new([0; 32 * 32]),
+			tr16: Box::new([0; 2 * 32 * 32]),
 			cur_slice_addr: sh.slice_addr_rs,
 		}
+	}
+
+	/// Moves to another substream (the next WPP row), keeping the scratch
+	/// buffers.
+	pub fn restart(&mut self, start: usize, ctx: Contexts) {
+		self.cabac.restart(start, ctx);
+	}
+
+	/// Contexts and QpY where decoding stopped (for a dependent slice
+	/// segment that follows).
+	pub fn final_state(&self) -> (Contexts, i32) {
+		(self.cabac.ctx.clone(), self.qp_y)
+	}
+
+	/// Decodes CTB row `cy` of a WPP slice segment from its own substream
+	/// (FFmpeg `hls_decode_entry_wpp`). `hooks` synchronise with the row
+	/// above. Returns the number of CTBs decoded, the number written to
+	/// (one more when a CTB failed half way), and whether the segment ended
+	/// in this row (end_of_slice_segment_flag).
+	pub fn decode_row(
+		&mut self,
+		cy: usize,
+		hooks: &mut dyn RowHooks,
+	) -> (usize, usize, Result<bool, DecodeError>) {
+		let sps = self.sps.clone();
+		let cw = sps.ctb_width as usize;
+		let log2 = sps.log2_ctb_size;
+		self.qp_y = self.sh.slice_qp;
+		for cx in 0..cw {
+			if !hooks.before(self.pic, cx) {
+				return (cx, cx, Err(DecodeError("hevc: row above failed")));
+			}
+			if cx == 0 {
+				if let Some(c) = hooks.start_contexts() {
+					self.cabac.ctx = c;
+				}
+			}
+			let rs = cy * cw + cx;
+			self.pic.ctb_addr[rs] = self.cur_slice_addr;
+			self.pic.ctb_slice[rs] = self.slice_idx;
+			self.ctb_x = (cx as i32) << log2;
+			self.ctb_y = (cy as i32) << log2;
+			self.sao_syntax(cx, cy, rs);
+			if let Err(e) = self.coding_quadtree(self.ctb_x, self.ctb_y, log2, 0) {
+				return (cx, cx + 1, Err(e));
+			}
+			self.pic.ctb_done(rs);
+			let end_of_slice = self.cabac.terminate();
+			hooks.after(self.pic, cx, (cx <= 1).then_some(&self.cabac.ctx));
+			if self.cabac.overrun() {
+				return (cx + 1, cx + 1, Err(DecodeError("hevc: slice data truncated")));
+			}
+			if end_of_slice {
+				return (cx + 1, cx + 1, Ok(true));
+			}
+		}
+		(cw, cw, Ok(false))
 	}
 
 	fn fresh_contexts(&self) -> Contexts {
@@ -337,6 +505,11 @@ impl<'a, 'b> SliceDecoder<'a, 'b> {
 				}
 				self.qp_y = self.sh.slice_qp;
 			}
+			if self.pic.ctb_addr[rs] != u32::MAX {
+				// Rewriting a CTB (a damaged or overlapping slice) could change
+				// rows that are already filtered and published.
+				return Err(DecodeError("hevc: slice overlaps decoded CTBs"));
+			}
 			self.pic.ctb_addr[rs] = self.cur_slice_addr;
 			self.pic.ctb_slice[rs] = self.slice_idx;
 			let log2 = sps.log2_ctb_size;
@@ -344,7 +517,7 @@ impl<'a, 'b> SliceDecoder<'a, 'b> {
 			self.ctb_y = (cy as i32) << log2;
 			self.sao_syntax(cx, cy, rs);
 			self.coding_quadtree(self.ctb_x, self.ctb_y, log2, 0)?;
-			self.pic.ctbs_decoded += 1;
+			self.pic.ctb_done(rs);
 			let end_of_slice = self.cabac.terminate();
 			if pps.entropy_coding_sync && cx - tile_x0 <= 1 {
 				// Stored after a tile row's second CTB (the first's copy is
@@ -1428,6 +1601,7 @@ impl<'a, 'b> SliceDecoder<'a, 'b> {
 				bit_depth,
 				&mut self.tr_tmp[..],
 				&mut self.tr_tmp2[..],
+				&mut self.tr16[..],
 			);
 		}
 		let _ = pred_mode;
@@ -1436,6 +1610,12 @@ impl<'a, 'b> SliceDecoder<'a, 'b> {
 		let plane = &mut self.pic.planes[c];
 		let at = plane.idx(x0 as isize, y0 as isize);
 		let s = plane.stride;
+		if crate::simd::enabled() {
+			// Rows are padded on the right, so a 4-wide block may read (and
+			// rewrite unchanged) 4 samples past its end.
+			super::simd::add_residual(&mut plane.data, s, at, &coeffs[..], n, max_v);
+			return;
+		}
 		for y in 0..n {
 			let row = &mut plane.data[at + y * s..at + y * s + n];
 			for (d, &r) in row.iter_mut().zip(&coeffs[y * n..y * n + n]) {
@@ -1693,19 +1873,24 @@ impl<'a, 'b> SliceDecoder<'a, 'b> {
 		let bit_depth = self.sps.bit_depth;
 		let weights = self.sh.weights.as_ref();
 		let (w, h) = (w as usize, h as usize);
-		let lists: Vec<usize> = (0..2).filter(|&l| mv.pred & (1 << l) != 0).collect();
-		let mut frames = [None, None];
-		for &l in &lists {
-			let f = self.refs.list[l].get(mv.ref_idx[l] as usize).and_then(|f| f.clone());
-			match f {
-				Some(f) => frames[l] = Some(f),
-				None => return,
+		let mut lists = [0usize; 2];
+		let mut nl = 0;
+		for l in 0..2 {
+			if mv.pred & (1 << l) != 0 {
+				lists[nl] = l;
+				nl += 1;
+			}
+		}
+		let lists = &lists[..nl];
+		for &l in lists {
+			if self.refs.list[l].get(mv.ref_idx[l] as usize).is_none_or(|f| f.is_none()) {
+				return;
 			}
 		}
 		for c in 0..3 {
 			let (cx, cy, cw, ch) = if c == 0 { (x0, y0, w, h) } else { (x0 / 2, y0 / 2, w / 2, h / 2) };
 			for (k, &l) in lists.iter().enumerate() {
-				let f = frames[l].as_ref().expect("checked above");
+				let f = self.refs.list[l][mv.ref_idx[l] as usize].as_ref().expect("checked above");
 				let m = mv.mv[l];
 				let (ix, iy, fx, fy) = if c == 0 {
 					(
@@ -1722,19 +1907,19 @@ impl<'a, 'b> SliceDecoder<'a, 'b> {
 						(m[1] & 7) as usize,
 					)
 				};
-				mc::interpolate(
-					&f.planes[c],
-					ix,
-					iy,
-					fx,
-					fy,
-					cw,
-					ch,
-					c > 0,
-					bit_depth,
-					&mut self.pred[k][..cw * ch],
-					&mut self.mc_tmp[..],
-				);
+				// Reference rows the 8-tap luma / 4-tap chroma filter reads,
+				// in luma rows (a frame thread may still be decoding the
+				// reference).
+				let (lo, hi) = if c == 0 {
+					(iy - 3, iy + ch as isize + 4)
+				} else {
+					(2 * (iy - 1), 2 * (iy + ch as isize + 2) + 1)
+				};
+				let pred = &mut self.pred[k][..cw * ch];
+				let tmp = &mut self.mc_tmp[..];
+				f.with_rows(lo, hi, |fr| {
+					mc::interpolate(&fr.planes[c], ix, iy, fx, fy, cw, ch, c > 0, bit_depth, pred, tmp)
+				});
 			}
 			let wp_of = |l: usize| -> mc::Wp {
 				let wt = &weights.expect("weights").l[l][mv.ref_idx[l] as usize];
@@ -1746,6 +1931,15 @@ impl<'a, 'b> SliceDecoder<'a, 'b> {
 			};
 			let denom =
 				weights.map_or(0, |wt| if c == 0 { wt.luma_log2_denom } else { wt.chroma_log2_denom });
+			// Explicit weights of 1 << denom with offset 0 give exactly the
+			// default prediction (the rounding terms cancel), which has a
+			// vector path. Encoders signal such tables for most P slices.
+			let weights = weights.filter(|_| {
+				lists.iter().any(|&l| {
+					let w = wp_of(l);
+					w.weight != 1 << denom || w.offset != 0
+				})
+			});
 			let plane = &mut self.pic.planes[c];
 			let at = plane.idx(cx as isize, cy as isize);
 			let (p0, p1) = self.pred.split_at(1);

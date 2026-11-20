@@ -1,16 +1,17 @@
-# Threading: H.264 frames, VP9 tiles/rows, transcode pipeline
+# Threading: H.264 and HEVC frames, HEVC WPP rows, VP9 tiles/rows, transcode pipeline
 
-RMP decodes on several threads in three places. Every one of them is
+RMP decodes on several threads in four places. Every one of them is
 safe Rust (`std::thread`, `std::thread::scope`, `mpsc` channels, `Arc`,
 `Mutex`/`RwLock`/`Condvar`, `OnceLock`). There is no new `unsafe`. Output is
-**bit-identical** for every thread count: the tests decode every H.264 and
-VP9 fixture with 1, 2, 3 and 8 threads and compare, damaged streams
-included, and the pipelined transcode is checked byte-for-byte against the
-serial one.
+**bit-identical** for every thread count: the tests decode every H.264,
+HEVC and VP9 fixture with 1, 2, 3 and 8 threads and compare, damaged
+streams included, and the pipelined transcode is checked byte-for-byte
+against the serial one.
 
 | Where | Model (FFmpeg equivalent) | Code |
 | --- | --- | --- |
 | H.264 decoder | frame threading: picture N+1 waits only for the reference rows it reads (`pthread_frame.c`, `ff_thread_await_progress`) | `codecs/h264/decoder.rs`, `dpb.rs` (`PicData`) |
+| HEVC decoder | frame threading with per-CTB-row progress, plus optional WPP row threading from the entry points (`hevc_refs.c` / `pthread_frame.c`; `hls_decode_entry_wpp`) | `codecs/hevc/decoder.rs`, `picture.rs` (`RefPic`), `filter.rs` (`advance`), `wpp.rs` |
 | VP9 decoder | tile-column threading, with the loop filter running one superblock row behind (`vp9.c: decode_tiles_mt` + `loopfilter_proc`) | `codecs/vp9/tile_threads.rs` |
 | `transcode` / CLI | demux, decode and encode+mux on separate threads (FFmpeg 7's threaded `ffmpeg`) | `transcode.rs` (`run_pipelined`) |
 | shared | `Progress`, `WorkerPool`, thread-count defaults | `codecs/threading.rs` |
@@ -21,9 +22,11 @@ serial one.
 environment, or `threading::set_default_threads`. The default is the CPU
 count (capped at 16), like FFmpeg. `-threads 1` makes everything
 single-threaded. `-j` is still the number of files a batch converts at once.
-The library constructors `H264DecoderState::new()` and
-`Vp9DecoderState::new()` stay single-threaded. Use `with_threads(n)` to
-choose a count. The `Decoder` trait implementations (which the resolver and
+The library constructors `H264DecoderState::new()`,
+`HevcDecoderState::new()` and `Vp9DecoderState::new()` stay
+single-threaded. Use `with_threads(n)` to choose a count
+(`HevcDecoderState::with_threading(extradata, frames, rows)` sets the two
+HEVC levels separately). The `Decoder` trait implementations (which the resolver and
 `transcode` use) take `default_threads()`.
 
 ## H.264 frame threading
@@ -55,6 +58,85 @@ choose a count. The `Decoder` trait implementations (which the resolver and
 * Out-of-order slices that would rewrite rows that were already filtered
   are dropped as damaged. Only ASO streams, which RMP rejects anyway, have
   them.
+
+## HEVC frame threading and WPP rows
+
+**Frame threads (the default).** As for H.264, the calling thread parses
+NAL units, slice headers, POC, the RPS, reference lists and DPB marking in
+decode order. It no longer decodes slices: it keeps each slice segment's
+RBSP, header and lists, and when the picture is complete it hands them to
+a `PictureJob` on the `WorkerPool`. The DPB holds an `Arc<RefPic>` for the
+picture from that moment.
+
+* **In-loop filters run in CTB-row bands** (`PicState::advance`). Row `r`
+  is deblocked once row `r + 1` is decoded, because intra prediction in
+  row `r + 1` reads row `r`'s last line before filtering. SAO of row `r`
+  runs once row `r + 1` is deblocked, because it reads one deblocked row
+  below. The result equals filtering the whole picture at once. A
+  horizontal edge at `y` reads rows `y - 4..y + 4`, which this band and the
+  one above have already filtered vertically. It writes only rows
+  `y - 3..y + 3`, which no later vertical edge reads. SAO keeps a
+  deblocked copy of the band plus one row on each side; the row above
+  comes from a copy saved before that row had its own SAO.
+* **Progress = final rows.** After SAO of a band, its rows get their
+  left/right padding (the first band also the top padding), are copied
+  into `RefPic::live` (an `RwLock`), and `rows` is raised. The motion
+  field, CTB slice map and slice reference POCs of fully decoded CTB rows
+  are published with them, under a second counter (`motion`).
+* **Readers wait for what they read.** Motion compensation computes the
+  reference rows the 8-tap luma or 4-tap chroma window touches (anything
+  in the bottom padding needs the whole picture) and calls
+  `RefPic::with_rows`. TMVP calls `with_motion` for the collocated CTB
+  row. Finished pictures are read without locking from a `OnceLock`.
+* **No copy when nobody can read.** Sub-layer non-reference pictures of
+  the highest sub-layer (x265's non-reference B frames) never publish:
+  their readers, if any, wait for the whole picture. With one thread
+  nothing is published and the job runs on the calling thread.
+* The cropped output copy is also made by the job, so the calling thread
+  does only parsing.
+* **Output delay**: pictures are returned `threads - 1` packets after the
+  packet that bumped them. The delay is fixed, so which call returns a
+  picture never depends on timing.
+* At most `threads` pictures are in flight, jobs wait only on earlier
+  jobs, and the pool is FIFO, so there is no deadlock. A panicking job
+  poisons its picture, and readers then panic instead of hanging.
+
+**WPP rows (`wpp.rs`).** A WPP slice segment (entropy coding sync, no
+tiles) that starts a CTB row and carries entry points is decoded row by
+row, each row from its own substream. Entry points count bytes of the
+escaped NAL unit, so the unescaper records where it removed emulation
+prevention bytes and the offsets are mapped through them. With
+`row_threads > 1` the rows run on scoped threads, each row two CTBs behind
+the row above:
+
+* Each row thread decodes into its own full-size `PicState` workspace
+  (recycled across pictures), so the CTU code keeps whole-picture
+  indexing. A row reads only its own CTBs and the last line of the row
+  above: samples, motion, CBFs, split depths, skip flags, SAO parameters
+  and slice addresses. After every CTB the thread copies that CTB's bottom
+  line into a shared `Edge` and raises the row's `Progress`. The thread
+  below waits for CTB `x + 1` above before decoding CTB `x`, copies the
+  edge in, and starts its row from the contexts saved after CTB 1 above
+  (9.3.1).
+* Finished rows are merged into the picture, which runs the filters and
+  publishes progress as rows complete. That is how frame and row threads
+  combine.
+* **Same output with any thread count, damaged streams included.** The
+  one-thread path runs the same row decoder in place. A row decodes CTB
+  `x` only if the row above decoded CTB `x + 1`, whatever the timing.
+  Workspaces reset each CTB's area before decoding it, so a half-decoded
+  CTB merges exactly as it would have been written in place.
+* Whether a segment goes row by row depends only on the stream. Valid
+  streams decode identically either way. A segment that overlaps decoded
+  CTBs is dropped.
+
+**Defaults.** `-threads n` / `RMP_THREADS=n` give HEVC `n` frame threads
+and one row thread per picture, as FFmpeg does. Frame threads scaled as
+well as WPP rows here and cost less CPU: rows add the edge copies, the
+workspace resets and the merge. `RMP_HEVC_ROWS=r` adds row threads per
+picture, and `RMP_HEVC_FRAMES=f` overrides the pictures in flight. Row
+threads help when frame threads stall, for example on low-delay streams
+or with more cores than pictures that can progress together.
 
 ## VP9 tile and row threading
 
@@ -132,6 +214,22 @@ Transcodes on the same machine:
 | VP9, 4 tiles | 1.99 → 1.28 s | 1.56x | 1.13 → 0.85 s | 1.32x |
 | VP9, 1 tile | 1.80 → 1.85 s | 1.0x | 1.11 → 0.80 s | 1.40x |
 
+**HEVC, x86-64 cloud VM, 2 vCPUs, AVX2, FFmpeg 6.1.1.** 1080p30 `testsrc2`
++ noise, x265 medium CRF 26 (B-pyramid, WPP), decode to null, best of 5.
+The VM is noisy (±10%).
+
+| Clip | RMP 1T | RMP 2T (2 frames) | RMP 2 rows | RMP speed-up | FFmpeg 1T → 2T | FFmpeg speed-up | RMP/FFmpeg at 2T |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 8-bit, 4.7 Mb/s, 150 frames | 1.94 s | **1.17 s** | 1.52 s | 1.66x | 0.90 → 0.68 s | 1.32x | 1.72x slower |
+| 10-bit, 4.7 Mb/s | 2.03 s | **1.30 s** | 1.72 s | 1.56x | 1.33 → 0.81 s | 1.64x | 1.60x slower |
+| 8-bit, 12.6 Mb/s | 4.20 s | **2.57 s** | | 1.63x | 2.78 → 1.54 s | 1.81x | 1.67x slower |
+| 8-bit intra only, 60 frames | 1.13 s | **0.69 s** | 0.90 s | 1.64x | 0.66 → 0.46 s | 1.43x | 1.50x slower |
+
+Before this work HEVC had no threads at all: 2.03 s, 2.04 s, 5.32 s and
+1.11 s on two threads, so the gap at 2T was 2.5–3.5x. Total CPU rises by
+about 6% with two frame threads (1.81 → 1.93 s on the first clip), and
+by 15% (inter) to 50% (intra only) with two row threads.
+
 ### Reading the numbers
 
 * **On 4 cores, scaling matches or beats FFmpeg's** for H.264 frame
@@ -157,3 +255,6 @@ Transcodes on the same machine:
   work (see `docs/SIMD.md`).
 * **VP9 without tiles needs frame threading** to scale. That's the
   remaining gap against FFmpeg in this table.
+* **HEVC now scales like FFmpeg** on two threads. What is left is the
+  single-thread gap (1.5–2.2x, see `docs/HEVC_AV1_HEAAC_AC3.md`). It wasn't
+  possible to measure on the 4-core aarch64 machine for this change.

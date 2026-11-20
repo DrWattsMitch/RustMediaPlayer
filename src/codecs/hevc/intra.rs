@@ -178,6 +178,58 @@ pub fn predict(
 	edge_filters: bool,
 	bit_depth: u32,
 ) {
+	if mode == MODE_DC || !crate::simd::enabled() {
+		return predict_scalar(plane, at, n, mode, r, edge_filters, bit_depth);
+	}
+	let s = plane.stride;
+	if mode == MODE_PLANAR {
+		super::simd::intra_planar(&r.top, &r.left, n, &mut plane.data, at, s);
+		return;
+	}
+	let angle = INTRA_PRED_ANGLE[mode as usize];
+	let vertical = mode >= 18;
+	let (main, side) = if vertical { (&r.top, &r.left) } else { (&r.left, &r.top) };
+	let mut ref_buf = [0i16; 3 * 64 + 1 + 16];
+	let base = 64; // ref_buf[base + k] = ref[k], k in -n..=2n
+	let len = if angle < 0 { n } else { 2 * n };
+	for k in 0..=len {
+		ref_buf[base + k] = main[k] as i16;
+	}
+	if angle < 0 {
+		let inv = INV_ANGLE[(mode - 11) as usize];
+		let last = (n as i32 * angle) >> 5;
+		if last < -1 {
+			let mut x = -1;
+			while x >= last {
+				let idx = (((x * inv) + 128) >> 8) as usize;
+				ref_buf[(base as i32 + x) as usize] = side[idx] as i16;
+				x -= 1;
+			}
+		}
+	}
+	super::simd::intra_angular(&ref_buf, base, n, angle, !vertical, &mut plane.data, at, s);
+	if edge_filters && angle == 0 && n < 32 {
+		// Mode 26 (vertical) or 10 (horizontal): gradient on the first
+		// column / row.
+		let max = (1i32 << bit_depth) - 1;
+		for k in 0..n {
+			let v = i32::from(main[1]) + ((i32::from(side[1 + k]) - i32::from(side[0])) >> 1);
+			let o = if vertical { at + k * s } else { at + k };
+			plane.data[o] = v.clamp(0, max) as u16;
+		}
+	}
+}
+
+/// [`predict`] without SIMD (the reference for its kernels).
+pub fn predict_scalar(
+	plane: &mut Plane,
+	at: usize,
+	n: usize,
+	mode: u32,
+	r: &Refs,
+	edge_filters: bool,
+	bit_depth: u32,
+) {
 	let s = plane.stride;
 	let d = &mut plane.data;
 	let max = (1i32 << bit_depth) - 1;
@@ -274,6 +326,54 @@ pub fn predict(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// The vector planar and angular kernels give the scalar prediction.
+	#[test]
+	fn simd_prediction_matches_scalar() {
+		let mut seed = 0x2545_f491u32;
+		let mut next = move || {
+			seed ^= seed << 13;
+			seed ^= seed >> 17;
+			seed ^= seed << 5;
+			seed
+		};
+		for bit_depth in [8u32, 10, 12] {
+			let max = (1u32 << bit_depth) - 1;
+			for log2 in 2..=5 {
+				let n = 1usize << log2;
+				for round in 0..6 {
+					let mut r = Refs { left: [0; 129], top: [0; 129] };
+					for k in 0..=2 * n {
+						// Smooth, noisy and extreme references.
+						let v = match round % 3 {
+							0 => next() & max,
+							1 => (k as u32 * 7 + 100) & max,
+							_ => {
+								if next() & 1 == 0 {
+									0
+								} else {
+									max
+								}
+							}
+						};
+						r.left[k] = v as u16;
+						r.top[k] = (next() & max) as u16;
+					}
+					r.top[0] = r.left[0];
+					for mode in 0..35 {
+						for edge in [false, true] {
+							let mut a = Plane::new(80, 80, 8, 7);
+							let mut b = a.clone();
+							let at = a.idx(4, 4);
+							predict(&mut a, at, n, mode, &r, edge, bit_depth);
+							predict_scalar(&mut b, at, n, mode, &r, edge, bit_depth);
+							assert!(a.data == b.data, "mode {mode} n {n} bd {bit_depth}");
+						}
+					}
+				}
+			}
+		}
+	}
 
 	#[test]
 	fn flat_references_predict_flat_blocks() {

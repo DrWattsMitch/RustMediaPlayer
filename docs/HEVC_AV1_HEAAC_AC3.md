@@ -68,9 +68,11 @@ extensions. These are rejected with an error.
 | `ctu.rs` | coding tree, residual coding, QP derivation, intra/inter reconstruction, deblocking bS |
 | `mvs.rs` | merge, AMVP, temporal MV prediction |
 | `intra.rs`, `mc.rs`, `transform.rs` | prediction and inverse transforms; scalar reference kernels |
-| `filter.rs` | deblocking (whole picture: vertical edges, then horizontal) and SAO |
+| `filter.rs` | deblocking and SAO, run in CTB-row bands as rows complete (same result as whole-picture filtering) |
 | `simd.rs` | vector kernels, see below |
-| `decoder.rs` | NAL dispatch, POC, RPS marking, reference lists, DPB bumping, output |
+| `decoder.rs` | NAL dispatch, POC, RPS marking, reference lists, DPB bumping, output; picture jobs (frame threading) |
+| `picture.rs` | planes, motion field, and `RefPic`: a DPB picture other threads read while it decodes |
+| `wpp.rs` | WPP rows decoded from the entry points, on several threads |
 
 Two design points:
 
@@ -93,9 +95,18 @@ bit-exact with their scalar originals, which differential tests check:
 - luma 8-tap and chroma 4-tap interpolation (h, v, hv), using `madd` on
   interleaved sample pairs
 - uni- and bi-prediction stores
-- the inverse DCT, 4 columns at a time in 32-bit lanes
+- the inverse DCT: 8x8 to 32x32 in 16-bit lanes (even/odd halves with
+  `madd` on interleaved coefficient rows, `transpose8x8` between the
+  passes, exact 32-bit sums); 4x4 in 32-bit lanes
+- the residual add (16-bit saturating add, then clip)
+- planar and angular intra prediction (`madd` on reference pairs;
+  horizontal modes are transposed in registers)
 - SAO edge and band offsets
 - luma deblocking, 8 lines per call through `transpose8x8` (bit depth ≤ 10)
+
+Explicit weighted prediction whose weight is `1 << denom` with offset 0
+(the tables most P slices carry) takes the default, vectorised path. The
+rounding terms cancel, so the result is the same.
 
 `I16x8::load_u16` / `store_u16` were added to all three SIMD backends,
 with tests.
@@ -115,7 +126,8 @@ with tests.
 
 **AV1.** Bit-exact with libdav1d (`framecrc`).
 
-**HEVC.** Bit-exact with FFmpeg on all of the following:
+**HEVC.** Bit-exact with FFmpeg on all of the following, at every
+thread count (frame and WPP row threads) and SIMD level:
 
 - x265 streams:
   - 8, 10 and 12-bit
@@ -127,7 +139,8 @@ with tests.
   - 16 and 32-pixel CTBs, QP groups, chroma QP offsets, deblocking offsets
   - SAO and deblocking off
   - TMVP off, 5 references, constrained intra
-  - odd sizes, and 1080p
+  - odd sizes, and 1080p (8- and 10-bit, 150 frames)
+  - WPP over many CTB rows, with three slices per picture and 16x16 CTBs
 - Kvazaar streams: tiles (uniform and as slices), dependent slices
   (`--slices wpp`), scaling lists, lossless, transform skip, AMP/SMP.
 
@@ -137,7 +150,10 @@ reconstruction exactly, so that fixture uses the encoder's reconstruction
 as its reference.
 
 The fixtures in `tests/fixtures/hevc/` cover main, Main 10 with slices in
-MKV, coding tools, tiles + WPP, and damaged input. `tools/make_fixtures.sh`
+MKV, coding tools, tiles + WPP, multi-row WPP (`x265_wpp.mp4`,
+`x265_wpp_ctu16_slices.mkv`), and damaged input. The threading tests
+decode every fixture, clean and damaged, with 1 to 8 frame threads and 1
+to 8 row threads, and require identical output and damage counts. `tools/make_fixtures.sh`
 lists the commands that made them.
 
 ## 3. Performance vs FFmpeg
@@ -160,8 +176,8 @@ Clips:
 
 | Clip | RMP, 1 thread | FFmpeg, 1 thread | ratio | RMP, auto | FFmpeg, auto | ratio |
 |---|---|---|---|---|---|---|
-| HEVC 1080p 8-bit | 2.55 | 1.31 | 1.94x | 2.36 | 0.86 | 2.75x |
-| HEVC 1080p 10-bit | 2.68 | 1.60 | 1.68x | 2.79 | 1.01 | 2.77x |
+| HEVC 1080p 8-bit | 1.94 | 0.90 | 2.16x | **1.17** | 0.68 | **1.72x** |
+| HEVC 1080p 10-bit | 2.03 | 1.33 | 1.53x | **1.30** | 0.81 | **1.60x** |
 | AV1 1080p 8-bit | 1.20 | 1.20 | 1.00x | 0.77 | 0.82 | 0.94x |
 | AV1 1080p 10-bit | 1.47 | 1.37 | 1.07x | 0.95 | 0.91 | 1.04x |
 | HE-AAC v1 stereo | 0.33 | 0.33 | 0.98x | 0.32 | 0.34 | 0.94x |
@@ -174,8 +190,12 @@ Ratios above 1 mean RMP is slower.
 - **AV1:** rav1d runs at libdav1d speed, as expected.
 - **Audio:** the decoders match FFmpeg or beat it. These figures include
   process start-up, demuxing and the S16 conversion on both sides.
-- **HEVC, single thread:** RMP is 1.7–1.9x behind FFmpeg (FFmpeg uses
+- **HEVC, single thread:** RMP is 1.5–2.2x behind FFmpeg (FFmpeg uses
   hand-written assembly), against 2.3x for RMP's H.264 decoder.
+- **HEVC, auto:** frame threading took the gap from 2.75x to about 1.7x;
+  RMP now scales like FFmpeg. The HEVC rows were re-measured for that
+  change on a noisier VM, so they don't compare one to one with the other
+  rows. See `docs/THREADING.md` for the full HEVC threading table.
 
 HEVC speed during this work, on a 1080p clip, single thread:
 
@@ -185,23 +205,26 @@ HEVC speed during this work, on a 1080p clip, single thread:
 | After removing per-block scratch zeroing and recomputed edges | 2.5 s |
 | After adding MC SIMD | 2.0 s |
 | After adding SAO, IDCT and deblocking SIMD | about 1.5 s (1.7–1.8x FFmpeg) |
+| After the 16-bit IDCT, residual-add and intra SIMD, MC without bounds checks, and default-weight WP on the vector path | 1.7–2.2x FFmpeg on the clips above. On the 12.6 Mb/s clip: 5.27 → 4.20 s (1.9x → 1.5x FFmpeg). On the 4.7 Mb/s clip, instructions went from 4.73 G to 4.33 G (−8%). |
 
 ### What's left (HEVC)
 
-1. **Threading.** The decoder is single-threaded. That accounts for the
-   whole gap in the auto column, because FFmpeg uses frame threads.
-   Options:
-   - WPP row threading. x265 enables WPP by default at HD sizes.
-   - Frame threading with per-row progress, as the H.264 decoder does.
-   - Running the in-loop filters in row bands on a worker, which is the
-     cheapest of the three.
-2. **Kernels.** The remaining profile is:
-   - CABAC and residual parsing: about 20%
-   - intra prediction: about 7%, still scalar
-   - bS computation: about 7%
-   - chroma deblocking and 12-bit deblocking: scalar
+1. **Threading** is done (`docs/THREADING.md`). Frame threads are the
+   default and WPP row threads are optional. Neither was measured on more
+   than two vCPUs for this change.
+2. **Kernels.** Profile of the 4.7 Mb/s clip, single thread, inclusive:
+   - inter prediction (MV prediction + MC): about 38%
+   - in-loop filters: about 22%, including the SAO band copy
+   - residual parsing and reconstruction: about 19%, of which CABAC
+     decisions are about 7%
+   - bS computation: about 4.5%
+   - chroma deblocking and 12-bit luma deblocking are still scalar
 3. **8-bit storage.** Storing 8-bit pictures as `u8` would halve the memory
-   traffic, at the cost of a generic sample type.
+   traffic, at the cost of a generic sample type. Two hyperthreads share
+   one core's bandwidth, so this also limits threaded scaling.
+4. **Allocation.** Each picture still allocates and fills a new
+   `PicState` (about 2% of instructions). Recycling the planes of pictures
+   that left the DPB would remove that.
 
 ## 4. Known limitations
 

@@ -35,7 +35,7 @@ Global options:
   -o <output>           output file or directory (or give it last)
   -y | -n               overwrite / never overwrite an existing output
   -j <jobs>             files converted at once in batch mode (default: CPU count)
-  -threads <n|auto>     threads per decoder (H.264 frames, VP9 tiles) and, above 1,
+  -threads <n|auto>     threads per decoder (H.264/HEVC frames, VP9 tiles) and, above 1,
                         demux / decode / encode on threads of their own
                         (default auto: CPU count; 1 = single-threaded)
   --show                list packets when inspecting

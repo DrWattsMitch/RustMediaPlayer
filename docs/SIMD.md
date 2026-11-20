@@ -108,6 +108,9 @@ rather than a closure.
 | AAC, Vorbis | radix-2 FFT stages; IMDCT pre/post twiddle | `dsp/simd.rs` | shared `dsp::Imdct` (also the AAC encoder's MDCT) |
 | Opus | CELT mixed-radix FFT combining loop | `opus/mdct.rs` | vectorised over `k`; twiddle table hoisted out of the loop |
 | FLAC | LPC restore | `flac/decoder.rs` | scalar, monomorphised per order (see below) |
+| HEVC | inverse DCT 8x8–32x32 | `hevc/simd.rs` (`idct16`) | 16-bit lanes; even/odd halves via `madd` on interleaved coefficient rows; `transpose8x8` between passes; the saturating pack is the spec's 16-bit clip |
+| HEVC | residual add | `hevc/simd.rs` | 16-bit saturating add + clip, exact for every bit depth |
+| HEVC | planar / angular intra prediction | `hevc/simd.rs` | `madd` on `(ref[i], ref[i+1])` pairs; horizontal modes transposed in registers; differential test over all 35 modes, 4 sizes, 3 bit depths |
 
 Non-SIMD fixes made along the way, all exact:
 
@@ -131,8 +134,9 @@ Non-SIMD fixes made along the way, all exact:
   one), and an exact sum needs 64-bit accumulation for 16-bit audio with
   15-bit coefficients. SSE2 has no 64-bit multiply, so the gain is small.
   The order-specialised scalar loop is about 10% faster.
-- **Intra prediction** (both codecs) and the H.264 boundary-strength
-  computation are scalar. They are the next items on the H.264 profile.
+- **Intra prediction** in H.264, and the H.264 and HEVC boundary-strength
+  computation, are scalar. (HEVC planar/angular intra is vectorised; DC
+  stays scalar since it is a fill.)
 
 ## 3. Correctness
 
