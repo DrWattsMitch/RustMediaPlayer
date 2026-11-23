@@ -68,8 +68,8 @@ FFmpeg's `skip_samples`.
     macroblocks are copied from the latest reference picture. The picture is
     still deblocked, stored and output. `damaged_slices` counts these.
 - Unsupported features return a clear `Message::Codec` error. These are
-  interlace, 4:2:2/4:4:4, more than 8 bits, lossless, FMO, SP/SI slices and AAC
-  Main/LTP/SSR/CCE.
+  H.264 4:4:4/monochrome, lossless, FMO, SP/SI slices and AAC Main/LTP/SSR/CCE.
+  Interlaced, High 10 and 4:2:2 H.264 are decoded; see `H264_INTERLACED_HIGH.md`.
 
 **2. Efficiency**
 
@@ -372,8 +372,8 @@ RMP_FUZZ_ROUNDS=4000 RMP_FUZZ_SEED=11 cargo test --test container robustness
 
 | Limitation | Where to start |
 | --- | --- |
-| Interlaced H.264 (field pictures, MBAFF) is rejected. | `params::parse_sps` rejects `frame_mbs_only_flag = 0`. Needs field POC, field reference lists, MBAFF neighbour derivation in `mb.rs`, and field deblocking. |
-| H.264 4:2:2, 4:4:4, >8-bit, lossless; FMO/ASO; SP/SI; data partitioning; SVC/MVC. | `params.rs` checks. 4:4:4 needs CABAC contexts 460-1023 (extend `gen_h264_tables.py`). |
+| H.264 4:4:4, monochrome, lossless; FMO/ASO; SP/SI; data partitioning; SVC/MVC. | `params.rs` checks. 4:4:4 needs CABAC contexts 460-1023 (extend `gen_h264_tables.py`) and three-plane luma-style residual coding. Interlaced, High 10 and 4:2:2 are done (`H264_INTERLACED_HIGH.md`). |
+| H.264 I_PCM at high bit depth or in field macroblocks has no test stream (x264 never emits PCM). | `decode.rs` PCM path; a JM-encoded stream would cover it. |
 | HE-AAC: SBR and PS are not reconstructed. The AAC-LC core is decoded at half rate and bandwidth, and reported with that rate. | Add `aac/sbr.rs` (QMF analysis/synthesis, HF generation, envelope adjustment) driven by the FIL element's extension payload. |
 | AAC Main prediction, LTP, SSR, coupling channels (CCE), 960-sample frames. | `ics::decode_ics_info` and the `Cce` arm in `decoder.rs` report these. |
 | H.264 speed is about 2.3× FFmpeg's C path. | In profile order: `mc_rect` and interpolation (SIMD-friendly fixed-size kernels per block size); deblocking (filter whole 16-sample edges with early-out on α/β); CABAC (FFmpeg's scaled `low` with byte-wise refills); then frame-level threading. |

@@ -13,15 +13,17 @@
 //! * [`encoder`] — Constrained Baseline encoder (CAVLC, I/P, quarter-sample
 //!   motion), reconstructing with the decoder's own `recon`/`deblock`.
 //!
-//! Supported: Constrained Baseline, Main and High profiles at 8-bit 4:2:0,
-//! progressive frames — CAVLC and CABAC, I/P/B slices, 8x8 transform,
-//! scaling matrices, multiple slices, multiple and long-term references,
-//! reference list modification, MMCO, POC types 0-2, explicit and implicit
-//! weighted prediction, spatial and temporal direct, I_PCM.
+//! Supported: Constrained Baseline, Main, High, High 10 and High 4:2:2
+//! profiles — 4:2:0 and 4:2:2 chroma at 8 to 14 bits (decoded to `u16`
+//! samples above 8 bits), progressive frames, field pictures (PAFF) and
+//! MBAFF frames, CAVLC and CABAC, I/P/B slices, 8x8 transform, scaling
+//! matrices, multiple slices, multiple and long-term references, reference
+//! list modification, MMCO, POC types 0-2, explicit and implicit weighted
+//! prediction, spatial and temporal direct, I_PCM.
 //!
-//! Not supported (reported as errors): interlaced coding (field pictures,
-//! MBAFF), 4:2:2/4:4:4, bit depths above 8, lossless, FMO/ASO, SP/SI
-//! slices, data partitioning, SVC/MVC extensions.
+//! Not supported (reported as errors): 4:4:4 and monochrome, luma and
+//! chroma bit depths that differ, lossless, FMO/ASO, SP/SI slices, data
+//! partitioning, SVC/MVC extensions.
 
 // Transform, prediction and table code indexes several parallel arrays by
 // the same position, mirroring the equations of the specification.

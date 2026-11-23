@@ -207,9 +207,9 @@ mod tests {
 		for qp in [0, 10, 22, 28, 40] {
 			let mut c = fdct4(&src);
 			Quant::new(qp, true).block4(&mut c, false);
-			recon::dequant4(&mut c, qp, &dq.l4[0][(qp % 6) as usize], false);
-			let mut p = Plane::new(4, 4, 128);
-			recon::idct4_add(&mut p, 0, 0, &c);
+			recon::dequant4(&mut c, qp, &dq.l4[0][(qp % 6) as usize], false, 8);
+			let mut p = Plane::new(4, 4, 128u8);
+			recon::idct4_add(&mut p.d8(), 0, 0, &c);
 			let err: i32 =
 				(0..16).map(|i| (i32::from(p.data[i]) - 128 - src[i]).abs()).max().unwrap_or(0);
 			let step = (0.625 * 2f64.powf(f64::from(qp) / 6.0)) as i32 + 1;

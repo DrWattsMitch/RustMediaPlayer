@@ -5,6 +5,16 @@
 /// 4x4 frame zig-zag scan: scan position → raster index (Table 8-13).
 pub const ZIGZAG_4X4: [u8; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
 
+/// Field scan of a 4x4 block (Table 8-13), raster positions.
+pub const FIELD_SCAN_4X4: [u8; 16] = [0, 4, 1, 8, 12, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15];
+
+/// Field scan of an 8x8 block (Table 8-14), raster positions.
+pub const FIELD_SCAN_8X8: [u8; 64] = [
+	0, 8, 16, 1, 9, 24, 32, 17, 2, 25, 40, 48, 56, 33, 10, 3, 18, 41, 49, 57, 26, 11, 4, 19, 34, 42,
+	50, 58, 27, 12, 5, 20, 35, 43, 51, 59, 28, 13, 6, 21, 36, 44, 52, 60, 29, 14, 22, 37, 45, 53, 61,
+	30, 7, 15, 38, 46, 54, 62, 23, 31, 39, 47, 55, 63,
+];
+
 /// 8x8 frame zig-zag scan: scan position → raster index (Table 8-14).
 pub const ZIGZAG_8X8: [u8; 64] = [
 	0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
@@ -52,9 +62,12 @@ pub const GOLOMB_TO_INTER_CBP: [u8; 48] = [
 pub const CHROMA_QP_HIGH: [u8; 22] =
 	[29, 30, 31, 32, 32, 33, 34, 34, 35, 35, 36, 36, 37, 37, 37, 38, 38, 38, 39, 39, 39, 39];
 
-pub fn chroma_qp(qp_y: i32, offset: i32) -> u8 {
-	let qpi = (qp_y + offset).clamp(0, 51);
-	if qpi < 30 { qpi as u8 } else { CHROMA_QP_HIGH[(qpi - 30) as usize] }
+/// QPc from QPY and chroma_qp_index_offset (Table 8-15); `qp_bd` is
+/// QpBdOffsetC, below which qPI may go for high bit depths. The result
+/// excludes the offset (QP'c = QPc + QpBdOffsetC).
+pub fn chroma_qp(qp_y: i32, offset: i32, qp_bd: i32) -> i8 {
+	let qpi = (qp_y + offset).clamp(-qp_bd, 51);
+	if qpi < 30 { qpi as i8 } else { CHROMA_QP_HIGH[(qpi - 30) as usize] as i8 }
 }
 
 /// normAdjust4x4 (8-315) values `v[m][0..3]`.
@@ -145,6 +158,14 @@ pub const SIG_8X8_CTX: [u8; 63] = [
 	0, 1, 2, 3, 4, 5, 5, 4, 4, 3, 3, 4, 4, 4, 5, 5, 4, 4, 4, 4, 3, 3, 6, 7, 7, 7, 8, 9, 10, 9, 8, 7,
 	7, 6, 11, 12, 13, 11, 6, 7, 8, 9, 14, 10, 9, 8, 6, 11, 12, 13, 11, 6, 9, 14, 10, 9, 11, 12, 13,
 	11, 14, 10, 12,
+];
+
+/// CABAC ctxIdxInc of significant_coeff_flag for field-coded 8x8 blocks
+/// (Table 9-43).
+pub const SIG_8X8_FIELD_CTX: [u8; 63] = [
+	0, 1, 1, 2, 2, 3, 3, 4, 5, 6, 7, 7, 7, 8, 4, 5, 6, 9, 10, 10, 8, 11, 12, 11, 9, 9, 10, 10, 8, 11,
+	12, 11, 9, 9, 10, 10, 8, 11, 12, 11, 9, 9, 10, 10, 8, 13, 13, 9, 9, 10, 10, 8, 13, 13, 9, 9, 10,
+	10, 14, 14, 14, 14, 14,
 ];
 
 /// CABAC ctxIdxInc of last_significant_coeff_flag for 8x8 blocks (Table 9-43).

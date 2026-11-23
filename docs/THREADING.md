@@ -130,13 +130,16 @@ the row above:
   streams decode identically either way. A segment that overlaps decoded
   CTBs is dropped.
 
-**Defaults.** `-threads n` / `RMP_THREADS=n` give HEVC `n` frame threads
-and one row thread per picture, as FFmpeg does. Frame threads scaled as
-well as WPP rows here and cost less CPU: rows add the edge copies, the
-workspace resets and the merge. `RMP_HEVC_ROWS=r` adds row threads per
-picture, and `RMP_HEVC_FRAMES=f` overrides the pictures in flight. Row
-threads help when frame threads stall, for example on low-delay streams
-or with more cores than pictures that can progress together.
+**Defaults.** `-threads n` / `RMP_THREADS=n` give HEVC `n` frame
+threads, as FFmpeg does. From 8 threads up, each picture also gets 2 WPP
+row threads. On a 14-core Mac that was 7–15% faster than frame threads
+alone, on every clip. On 2 vCPUs the extra row threads oversubscribed the
+cores and were slower, so below 8 the default stays frame threads only.
+Rows alone, with one picture in flight, lost on both machines: frame
+threads are the main mechanism, and rows fill in when they wait on
+references. `RMP_HEVC_ROWS=r` sets the row threads per picture (1 turns
+them off) and `RMP_HEVC_FRAMES=f` overrides the pictures in flight.
+`tools/bench_hevc.sh` measures the combinations.
 
 ## VP9 tile and row threading
 
@@ -225,6 +228,25 @@ The VM is noisy (±10%).
 | 8-bit, 12.6 Mb/s | 4.20 s | **2.57 s** | | 1.63x | 2.78 → 1.54 s | 1.81x | 1.67x slower |
 | 8-bit intra only, 60 frames | 1.13 s | **0.69 s** | 0.90 s | 1.64x | 0.66 → 0.46 s | 1.43x | 1.50x slower |
 
+**HEVC, Apple-silicon Mac (macOS, arm64/NEON), 14 cores, FFmpeg 9.0.2.**
+The same clips, `tools/bench_hevc.sh`, best of 5. "14T + rows" is 14 frame
+threads plus 2 row threads per picture (the default from 8 threads);
+"rows only" is one picture in flight with 14 row threads.
+
+| Clip | RMP 1T | RMP 2T | RMP 4T | RMP 14T | RMP 14T + rows | RMP rows only | FFmpeg 1T | FFmpeg 2T | FFmpeg 4T | FFmpeg 14T | RMP/FFmpeg 1T | RMP/FFmpeg 14T (+ rows) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 8-bit, 4.7 Mb/s | 0.78 s | 0.45 s | 0.34 s | 0.30 s | **0.28 s** | 0.43 s | 0.47 s | 0.29 s | 0.23 s | 0.19 s | 1.66x | 1.47x |
+| 10-bit, 4.7 Mb/s | 0.89 s | 0.50 s | 0.37 s | 0.31 s | **0.28 s** | 0.54 s | 0.89 s | 0.50 s | 0.35 s | 0.25 s | 1.00x | 1.12x |
+| 8-bit, 12.6 Mb/s | 2.27 s | 1.23 s | 0.91 s | 0.55 s | **0.47 s** | 0.69 s | 1.39 s | 0.81 s | 0.62 s | 0.36 s | 1.63x | 1.31x |
+| 8-bit intra only, 60 frames | 0.55 s | 0.32 s | 0.21 s | 0.12 s | **0.11 s** | 0.31 s | 0.34 s | 0.21 s | 0.15 s | 0.11 s | 1.62x | 1.00x |
+
+From 1 to 14 threads RMP speeds up 2.6–4.6x, against 2.5–3.9x for FFmpeg.
+These clips are short: at 14 threads a run is 0.1–0.5 s, so start-up and
+the stream's ramp-up and drain weigh a lot, and the 14 cores mix
+performance and efficiency cores. The script now also measures 4 and 8
+threads with rows, and a 600-frame clip (`long8.mp4`) for steadier
+many-core numbers.
+
 Before this work HEVC had no threads at all: 2.03 s, 2.04 s, 5.32 s and
 1.11 s on two threads, so the gap at 2T was 2.5–3.5x. Total CPU rises by
 about 6% with two frame threads (1.81 → 1.93 s on the first clip), and
@@ -255,6 +277,6 @@ by 15% (inter) to 50% (intra only) with two row threads.
   work (see `docs/SIMD.md`).
 * **VP9 without tiles needs frame threading** to scale. That's the
   remaining gap against FFmpeg in this table.
-* **HEVC now scales like FFmpeg** on two threads. What is left is the
-  single-thread gap (1.5–2.2x, see `docs/HEVC_AV1_HEAAC_AC3.md`). It wasn't
-  possible to measure on the 4-core aarch64 machine for this change.
+* **HEVC scales like FFmpeg** on 2 vCPUs and on 14 Apple-silicon cores.
+  What is left is the single-thread gap (1.6–2.2x for 8-bit; 10-bit is
+  level with FFmpeg 9 on the Mac), see `docs/HEVC_AV1_HEAAC_AC3.md`.

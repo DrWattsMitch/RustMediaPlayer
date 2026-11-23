@@ -681,14 +681,24 @@ impl HevcDecoderState {
 	}
 }
 
+/// Row threads per picture that `threads` threads get by default: frame
+/// threads alone below 8 (on 2 vCPUs, adding rows was slower), plus 2 WPP
+/// row threads from 8 up (7–15% faster than frame threads alone on a
+/// 14-core Apple-silicon Mac, `docs/THREADING.md`). The rows only run on
+/// WPP streams and give each in-flight picture a second thread when frame
+/// threads wait on references.
+const fn default_rows(threads: usize) -> usize {
+	if threads >= 8 { 2 } else { 1 }
+}
+
 /// How `threads` are used: (pictures in flight, row threads per picture).
-/// Frame threads by default, as FFmpeg: they scale as well as WPP rows
-/// and cost less (no row hand-over). `RMP_HEVC_ROWS` adds WPP row threads
-/// to each picture; `RMP_HEVC_FRAMES` overrides the pictures in flight.
+/// `threads` frame threads, as FFmpeg, plus [`default_rows`].
+/// `RMP_HEVC_ROWS` sets the row threads per picture; `RMP_HEVC_FRAMES`
+/// overrides the pictures in flight.
 fn split_threads(threads: usize) -> (usize, usize) {
 	let env = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<usize>().ok());
 	let frames = env("RMP_HEVC_FRAMES").filter(|&n| n > 0).unwrap_or(threads);
-	let rows = env("RMP_HEVC_ROWS").filter(|&n| n > 0).unwrap_or(1);
+	let rows = env("RMP_HEVC_ROWS").filter(|&n| n > 0).unwrap_or(default_rows(threads));
 	(frames, rows)
 }
 
@@ -921,4 +931,15 @@ fn crop_samples(f: &Frame, crop: [u32; 4]) -> Vec<u8> {
 		}
 	}
 	data
+}
+
+#[cfg(test)]
+mod tests {
+	use super::default_rows;
+
+	#[test]
+	fn row_threads_start_at_eight_threads() {
+		assert_eq!([1, 2, 4, 7].map(default_rows), [1; 4]);
+		assert_eq!([8, 14, 16].map(default_rows), [2; 3]);
+	}
 }

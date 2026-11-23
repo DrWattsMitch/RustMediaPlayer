@@ -126,7 +126,7 @@ impl<'a> PicEncoder<'a> {
 			reference,
 			dq,
 			qp,
-			qpc: i32::from(chroma_qp(qp, 0)),
+			qpc: i32::from(chroma_qp(qp, 0, 0)),
 			lambda: lf.round().max(1.0) as u32,
 			lambda2: 0.85 * lf * lf,
 			max_mv_y,
@@ -205,7 +205,7 @@ impl<'a> PicEncoder<'a> {
 		y2: i32,
 	) -> Option<(&'b MbInfo, usize)> {
 		let (dx, dy) = (x2.div_euclid(2), y2.div_euclid(2));
-		let idx = 16 + 4 * comp + (y2.rem_euclid(2) * 2 + x2.rem_euclid(2)) as usize;
+		let idx = 16 + 8 * comp + (y2.rem_euclid(2) * 2 + x2.rem_euclid(2)) as usize;
 		if dx == 0 && dy == 0 {
 			return Some((cur, idx));
 		}
@@ -410,8 +410,8 @@ impl<'a> PicEncoder<'a> {
 
 	fn base_info(&self, kind: MbKind) -> MbInfo {
 		let mut info = MbInfo { slice: 1, kind, ipred: [2; 16], ..MbInfo::default() };
-		info.qp = self.qp as u8;
-		info.qpc = [self.qpc as u8; 2];
+		info.qp = self.qp as i8;
+		info.qpc = [self.qpc as i8; 2];
 		if kind == MbKind::I4x4 || kind == MbKind::I16x16 {
 			info.ref_idx = [[-1; 4]; 2];
 		} else {
@@ -452,7 +452,7 @@ impl<'a> PicEncoder<'a> {
 			}
 			let mut dcq = hadamard2(&dc);
 			any_dc |= quant.dc(&mut dcq);
-			res.chroma_dc[c] = dcq;
+			res.chroma_dc[c][..4].copy_from_slice(&dcq);
 			if !intra {
 				let score: u32 = (0..4).map(|b| decimate_score(&scan_ac(&res.chroma_ac[c][b]))).sum();
 				if score < 7 {
@@ -477,7 +477,7 @@ impl<'a> PicEncoder<'a> {
 		info.cbp |= cbp_c << 4;
 		for c in 0..2 {
 			for blk in 0..4 {
-				info.nnz[16 + 4 * c + blk] = if cbp_c == 2 { ac_nnz[c][blk] } else { 0 };
+				info.nnz[16 + 8 * c + blk] = if cbp_c == 2 { ac_nnz[c][blk] } else { 0 };
 				if cbp_c != 2 {
 					res.chroma_ac[c][blk] = [0; 16];
 				}
@@ -490,17 +490,17 @@ impl<'a> PicEncoder<'a> {
 		for c in 0..2 {
 			let list = if intra { 1 + c } else { 4 + c };
 			let scale = &self.dq.l4[list][(self.qpc % 6) as usize];
-			let dc = recon::chroma_dc_dequant(&res.chroma_dc[c], self.qpc, scale[0]);
+			let dc = recon::chroma_dc_dequant(&res.chroma_dc[c], self.qpc, scale[0], 8);
 			let plane = if c == 0 { &mut self.f.cb } else { &mut self.f.cr };
 			for blk in 0..4 {
 				let mut block = res.chroma_ac[c][blk];
-				let nz = info.nnz[16 + 4 * c + blk] != 0;
+				let nz = info.nnz[16 + 8 * c + blk] != 0;
 				if nz {
-					recon::dequant4(&mut block, self.qpc, scale, true);
+					recon::dequant4(&mut block, self.qpc, scale, true, 8);
 				}
 				block[0] = dc[blk];
 				if nz || dc[blk] != 0 {
-					recon::idct4_add(plane, cx + (blk % 2) * 4, cy + (blk / 2) * 4, &block);
+					recon::idct4_add(&mut plane.d8(), cx + (blk % 2) * 4, cy + (blk / 2) * 4, &block);
 				}
 			}
 		}
@@ -536,8 +536,8 @@ impl<'a> PicEncoder<'a> {
 		for raster in 0..16 {
 			if info.nnz[raster] != 0 {
 				let mut block = res.luma[raster];
-				recon::dequant4(&mut block, self.qp, scale, false);
-				recon::idct4_add(&mut self.f.y, px + (raster % 4) * 4, py + (raster / 4) * 4, &block);
+				recon::dequant4(&mut block, self.qp, scale, false, 8);
+				recon::idct4_add(&mut self.f.y.d8(), px + (raster % 4) * 4, py + (raster / 4) * 4, &block);
 			}
 		}
 	}
@@ -567,7 +567,7 @@ impl<'a> PicEncoder<'a> {
 		let cbp_c = info.cbp >> 4;
 		if cbp_c != 0 {
 			for c in 0..2 {
-				write_block(w, -1, &res.chroma_dc[c]);
+				write_block(w, -1, &res.chroma_dc[c][..4]);
 			}
 		}
 		if cbp_c == 2 {
@@ -596,7 +596,7 @@ impl<'a> PicEncoder<'a> {
 			let mut cost = 0;
 			for c in 0..2 {
 				let plane = if c == 0 { &mut self.f.cb } else { &mut self.f.cr };
-				recon::pred_block(plane, cx, cy, 8, mode, av, true);
+				recon::pred_block(&mut plane.d8(), cx, cy, 8, 8, mode, av, true);
 				for blk in 0..4 {
 					cost += satd4(&self.diff4(c + 1, cx + (blk % 2) * 4, cy + (blk / 2) * 4));
 				}
@@ -612,8 +612,8 @@ impl<'a> PicEncoder<'a> {
 	fn predict_chroma(&mut self, syntax: u8, av: Avail) {
 		let (cx, cy) = (self.mbx * 8, self.mby * 8);
 		let mode = chroma_mode(syntax);
-		recon::pred_block(&mut self.f.cb, cx, cy, 8, mode, av, true);
-		recon::pred_block(&mut self.f.cr, cx, cy, 8, mode, av, true);
+		recon::pred_block(&mut self.f.cb.d8(), cx, cy, 8, 8, mode, av, true);
+		recon::pred_block(&mut self.f.cr.d8(), cx, cy, 8, 8, mode, av, true);
 	}
 
 	/// Best Intra_16x16 mode by SATD, and its cost.
@@ -624,7 +624,7 @@ impl<'a> PicEncoder<'a> {
 			if !block_mode_ok(mode, av) {
 				continue;
 			}
-			recon::pred_block(&mut self.f.y, px, py, 16, mode, av, false);
+			recon::pred_block(&mut self.f.y.d8(), px, py, 16, 16, mode, av, false);
 			let cost: u32 =
 				(0..16).map(|r| satd4(&self.diff4(0, px + (r % 4) * 4, py + (r / 4) * 4))).sum();
 			if cost < best.1 {
@@ -640,7 +640,7 @@ impl<'a> PicEncoder<'a> {
 		let av = Avail { left: mb[0], top: mb[1], top_right: false, top_left: mb[3] };
 		let mut info = self.base_info(MbKind::I16x16);
 		let mut res = Residual::default();
-		recon::pred_block(&mut self.f.y, px, py, 16, mode, av, false);
+		recon::pred_block(&mut self.f.y.d8(), px, py, 16, 16, mode, av, false);
 		let quant = Quant::new(self.qp, true);
 		let mut dc = [0i32; 16];
 		let mut any_ac = false;
@@ -665,16 +665,16 @@ impl<'a> PicEncoder<'a> {
 			info.nnz[raster] = res.luma[raster].iter().filter(|&&v| v != 0).count() as u8;
 		}
 		let scale = &self.dq.l4[0][(self.qp % 6) as usize];
-		let dcd = recon::luma_dc_dequant(&res.dc, self.qp, scale[0]);
+		let dcd = recon::luma_dc_dequant(&res.dc, self.qp, scale[0], 8);
 		for raster in 0..16 {
 			let mut block = res.luma[raster];
 			let nz = info.nnz[raster] != 0;
 			if nz {
-				recon::dequant4(&mut block, self.qp, scale, true);
+				recon::dequant4(&mut block, self.qp, scale, true, 8);
 			}
 			block[0] = dcd[raster];
 			if nz || dcd[raster] != 0 {
-				recon::idct4_add(&mut self.f.y, px + (raster % 4) * 4, py + (raster / 4) * 4, &block);
+				recon::idct4_add(&mut self.f.y.d8(), px + (raster % 4) * 4, py + (raster / 4) * 4, &block);
 			}
 		}
 		self.predict_chroma(chroma, av);
@@ -710,7 +710,7 @@ impl<'a> PicEncoder<'a> {
 				if !intra4_mode_ok(mode, av) {
 					continue;
 				}
-				recon::pred4x4(&mut self.f.y, x, y, mode, av);
+				recon::pred4x4(&mut self.f.y.d8(), x, y, mode, av);
 				let bits = if mode == pred_mode { 1 } else { 4 };
 				let cost = satd4(&self.diff4(0, x, y)) + self.lambda * bits;
 				if cost < best.0 {
@@ -718,7 +718,7 @@ impl<'a> PicEncoder<'a> {
 				}
 			}
 			let mode = best.1;
-			recon::pred4x4(&mut self.f.y, x, y, mode, av);
+			recon::pred4x4(&mut self.f.y.d8(), x, y, mode, av);
 			info.ipred[raster] = mode;
 			if mode == pred_mode {
 				mode_bits.bit(true);
@@ -734,8 +734,8 @@ impl<'a> PicEncoder<'a> {
 			if n != 0 {
 				info.cbp |= 1 << ((y4 / 2) * 2 + x4 / 2);
 				let mut block = coef;
-				recon::dequant4(&mut block, self.qp, scale, false);
-				recon::idct4_add(&mut self.f.y, x, y, &block);
+				recon::dequant4(&mut block, self.qp, scale, false, 8);
+				recon::idct4_add(&mut self.f.y.d8(), x, y, &block);
 			}
 		}
 		let av = Avail { left: mb[0], top: mb[1], top_right: false, top_left: mb[3] };
@@ -782,7 +782,7 @@ impl<'a> PicEncoder<'a> {
 		let (mx, my) = (i32::from(mv[0]), i32::from(mv[1]));
 		let mut luma = [0u8; 256];
 		recon::mc_luma(
-			&r.y,
+			&r.y.s8(),
 			px as i32 + (mx >> 2),
 			py as i32 + (my >> 2),
 			mx & 3,
@@ -792,7 +792,7 @@ impl<'a> PicEncoder<'a> {
 			&mut luma,
 		);
 		recon::store_prediction(
-			&mut self.f.y,
+			&mut self.f.y.d8(),
 			px,
 			py,
 			bw,
@@ -804,10 +804,10 @@ impl<'a> PicEncoder<'a> {
 		let (cx, cy) = ((px / 2) as i32 + (mx >> 3), (py / 2) as i32 + (my >> 3));
 		for (c, rp) in [&r.cb, &r.cr].into_iter().enumerate() {
 			let mut chroma = [0u8; 64];
-			recon::mc_chroma(rp, cx, cy, mx & 7, my & 7, bw / 2, bh / 2, &mut chroma);
+			recon::mc_chroma(&rp.s8(), cx, cy, mx & 7, my & 7, bw / 2, bh / 2, &mut chroma);
 			let plane = if c == 0 { &mut self.f.cb } else { &mut self.f.cr };
 			recon::store_prediction(
-				plane,
+				&mut plane.d8(),
 				px / 2,
 				py / 2,
 				bw / 2,

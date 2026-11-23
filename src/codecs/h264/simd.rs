@@ -5,7 +5,7 @@
 //! compare against. FFmpeg: `h264_qpel_8bit.asm`, `h264_chromamc.asm`,
 //! `h264_deblock.asm`, `h264_idct.asm`.
 
-use super::recon::{Plane, Weighting, fetch};
+use super::recon::{Dst, Src, Weighting, fetch};
 use crate::multiversion;
 use crate::simd::{I16x8, I32x4, U8x16, transpose4x4, transpose8x8};
 
@@ -36,13 +36,13 @@ const EMU: usize = 24;
 
 /// Whether the `w` x `h` area at (x, y) lies inside the plane.
 #[inline(always)]
-fn inside(r: &Plane, x: i32, y: i32, w: usize, h: usize) -> bool {
+fn inside(r: &Src<u8>, x: i32, y: i32, w: usize, h: usize) -> bool {
 	x >= 0 && y >= 0 && x as usize + w <= r.width && y as usize + h <= r.height
 }
 
 /// The `w` x `h` area at (x, y) with the picture edges repeated.
 #[inline(never)]
-fn emulated(r: &Plane, x: i32, y: i32, w: usize, h: usize) -> [u8; EMU * EMU] {
+fn emulated(r: &Src<u8>, x: i32, y: i32, w: usize, h: usize) -> [u8; EMU * EMU] {
 	let mut emu = [0u8; EMU * EMU];
 	fetch(r, x, y, w, h, &mut emu, EMU);
 	emu
@@ -53,7 +53,7 @@ fn emulated(r: &Plane, x: i32, y: i32, w: usize, h: usize) -> [u8; EMU * EMU] {
 macro_rules! window {
 	($r:expr, $x:expr, $y:expr, $w:expr, $h:expr, $emu:ident) => {
 		if inside($r, $x, $y, $w, $h) {
-			Window { data: &$r.data, base: $y as usize * $r.width + $x as usize, stride: $r.width }
+			Window { data: $r.data, base: $r.idx($x as usize, $y as usize), stride: $r.stride }
 		} else {
 			$emu = emulated($r, $x, $y, $w, $h);
 			Window { data: &$emu, base: 0, stride: EMU }
@@ -110,7 +110,7 @@ fn store_n(v: U8x16, out: &mut [u8], n: usize) {
 multiversion! {
 	/// [`super::recon::mc_luma`] for `bw` in {4, 8, 16}.
 	#[allow(clippy::too_many_arguments)]
-	pub fn mc_luma(r: &Plane, x: i32, y: i32, fx: i32, fy: i32, bw: usize, bh: usize, out: &mut [u8]) {
+	pub fn mc_luma(r: &Src<u8>, x: i32, y: i32, fx: i32, fy: i32, bw: usize, bh: usize, out: &mut [u8]) {
 		// Groups of 8 columns read 13 samples per row, so a 4-wide block
 		// still needs a 13-wide window.
 		let cols = bw.max(8) + 5;
@@ -191,7 +191,7 @@ fn luma_block(w: &Window, fx: i32, fy: i32, bw: usize, bh: usize, out: &mut [u8]
 multiversion! {
 	/// [`super::recon::mc_chroma`] for `bw` in {4, 8}.
 	#[allow(clippy::too_many_arguments)]
-	pub fn mc_chroma(r: &Plane, x: i32, y: i32, fx: i32, fy: i32, bw: usize, bh: usize, out: &mut [u8]) {
+	pub fn mc_chroma(r: &Src<u8>, x: i32, y: i32, fx: i32, fy: i32, bw: usize, bh: usize, out: &mut [u8]) {
 		// Each row reads 9 samples (8 lanes and their right neighbours).
 		let emu;
 		let w = window!(r, x, y, 9, bh + 1, emu);
@@ -227,7 +227,7 @@ multiversion! {
 	/// weights outside the 8-bit range (which the scalar code handles).
 	#[allow(clippy::too_many_arguments)]
 	pub fn store_prediction(
-		p: &mut Plane,
+		p: &mut Dst<u8>,
 		x: usize,
 		y: usize,
 		bw: usize,
@@ -256,7 +256,7 @@ fn load_row<const BW: usize>(s: &[u8], j: usize) -> U8x16 {
 
 #[inline(always)]
 fn store_rows<const BW: usize>(
-	p: &mut Plane,
+	p: &mut Dst<u8>,
 	x: usize,
 	y: usize,
 	bh: usize,
@@ -264,8 +264,9 @@ fn store_rows<const BW: usize>(
 	l1: Option<&[u8]>,
 	wt: Weighting,
 ) {
-	let stride = p.width;
-	let data = &mut p.data[y * stride + x..];
+	let stride = p.stride;
+	let at = p.idx(x, y);
+	let data = &mut p.data[at..];
 	let mut put = |j: usize, v: U8x16| store_n(v, &mut data[j * stride..], BW);
 	match (l0, l1, wt) {
 		(Some(a), Some(b), Weighting::Default) => {
@@ -424,7 +425,7 @@ multiversion! {
 	/// starting at (x, y), with one strength and `tc0` per segment.
 	#[allow(clippy::too_many_arguments)]
 	pub fn filter_edge(
-		plane: &mut Plane,
+		plane: &mut Dst<u8>,
 		x: usize,
 		y: usize,
 		len: usize,
@@ -435,7 +436,6 @@ multiversion! {
 		beta: i32,
 		chroma: bool,
 	) {
-		let w = plane.width;
 		let seg = len / 4;
 		for g in 0..len / 8 {
 			let line = |l: usize| (g * 8 + l) / seg;
@@ -447,11 +447,12 @@ multiversion! {
 			let first = g * 8;
 			if vertical {
 				// Lines are rows: 8 bytes p3..q3 per row, transposed.
-				let rows: [I16x8; 8] = std::array::from_fn(|l| I16x8::load_u8(&plane.data[(y + first + l) * w + x - 4..]));
+				let rows: [I16x8; 8] = std::array::from_fn(|l| I16x8::load_u8(&plane.data[plane.idx(x - 4, y + first + l)..]));
 				let out = filter_lines(transpose8x8(rows), bs_v, tc_v, alpha as i16, beta as i16, chroma);
 				let back = transpose8x8(out);
 				for (l, r) in back.iter().enumerate() {
-					r.pack_u8(*r).store8(&mut plane.data[(y + first + l) * w + x - 4..]);
+					let at = plane.idx(x - 4, y + first + l);
+					r.pack_u8(*r).store8(&mut plane.data[at..]);
 				}
 			} else {
 				// Lines are columns: each sample row is contiguous. Chroma
@@ -460,12 +461,13 @@ multiversion! {
 				let (lo, hi) = if chroma { (2, 6) } else { (0, 8) };
 				let mut px = [I16x8::splat(0); 8];
 				for k in lo..hi {
-					px[k] = I16x8::load_u8(&plane.data[(y + k - 4) * w + base..]);
+					px[k] = I16x8::load_u8(&plane.data[plane.idx(base, y + k - 4)..]);
 				}
 				let out = filter_lines(px, bs_v, tc_v, alpha as i16, beta as i16, chroma);
 				let (lo, hi) = if chroma { (3, 5) } else { (1, 7) };
 				for k in lo..hi {
-					out[k].pack_u8(out[k]).store8(&mut plane.data[(y + k - 4) * w + base..]);
+					let at = plane.idx(base, y + k - 4);
+					out[k].pack_u8(out[k]).store8(&mut plane.data[at..]);
 				}
 			}
 		}
@@ -495,14 +497,15 @@ fn add_row4(dst: &mut [u8], v: I32x4) {
 }
 
 /// [`super::recon::idct4_add`].
-pub fn idct4_add(p: &mut Plane, x: usize, y: usize, c: &[i32; 16]) {
+pub fn idct4_add(p: &mut Dst<u8>, x: usize, y: usize, c: &[i32; 16]) {
 	// Lanes are rows for the row pass, so the coefficients go in
 	// transposed; the result is transposed back so lanes are columns.
 	let cols = transpose4x4(std::array::from_fn(|i| I32x4::load(&c[i * 4..])));
 	let rows = transpose4x4(idct4_1d(cols));
 	let out = idct4_1d(rows);
 	for (i, v) in out.iter().enumerate() {
-		add_row4(&mut p.data[(y + i) * p.width + x..], *v);
+		let at = p.idx(x, y + i);
+		add_row4(&mut p.data[at..], *v);
 	}
 }
 
@@ -553,14 +556,14 @@ fn idct8_cols(m: [[I32x4; 2]; 8]) -> [[I32x4; 2]; 8] {
 
 multiversion! {
 	/// [`super::recon::idct8_add`].
-	pub fn idct8_add(p: &mut Plane, x: usize, y: usize, c: &[i32; 64]) {
+	pub fn idct8_add(p: &mut Dst<u8>, x: usize, y: usize, c: &[i32; 64]) {
 		let m: [[I32x4; 2]; 8] = std::array::from_fn(|i| [I32x4::load(&c[i * 8..]), I32x4::load(&c[i * 8 + 4..])]);
 		// Row pass on the transpose, then the column pass in place.
 		let t = transpose8x8_i32(idct8_cols(transpose8x8_i32(m)));
 		let out = idct8_cols(t);
 		let round = I32x4::splat(32);
 		for (i, [lo, hi]) in out.iter().enumerate() {
-			let at = (y + i) * p.width + x;
+			let at = p.idx(x, y + i);
 			let px = U8x16::load8(&p.data[at..]).widen_lo();
 			let r = lo.add(round).shr(6).pack_i16(hi.add(round).shr(6));
 			// Residuals are within 16 bits only after saturation; the sum
@@ -624,12 +627,45 @@ mod tests {
 						let (x, y) = (rng.range(-24, 56), rng.range(-24, 48));
 						let mut a = [0u8; 256];
 						let mut b = [0u8; 256];
-						recon::mc_luma_scalar(&r, x, y, fx, fy, bw, bh, &mut a);
-						mc_luma(&r, x, y, fx, fy, bw, bh, &mut b);
+						recon::mc_luma_scalar(&r.s8(), x, y, fx, fy, bw, bh, &mut a);
+						mc_luma(&r.s8(), x, y, fx, fy, bw, bh, &mut b);
 						assert_eq!(a[..], b[..], "{bw}x{bh} frac ({fx},{fy}) at ({x},{y})");
 					}
 				}
 			}
+		}
+	}
+
+	#[test]
+	fn field_views_match_scalar() {
+		// Field pictures and MBAFF field macroblocks read and write every
+		// other row: the vector code must honour the stride.
+		let mut rng = Rng(6);
+		let r = noise_plane(&mut rng, 48, 64);
+		for parity in 0..2 {
+			let src = r.src(Some(parity), 255);
+			for (fx, fy) in [(0, 0), (1, 2), (2, 2), (3, 1)] {
+				for (x, y) in [(8, 4), (-6, -5), (40, 28)] {
+					let (mut a, mut b) = ([0u8; 256], [0u8; 256]);
+					recon::mc_luma_scalar(&src, x, y, fx, fy, 16, 16, &mut a);
+					mc_luma(&src, x, y, fx, fy, 16, 16, &mut b);
+					assert_eq!(a, b, "parity {parity} frac ({fx},{fy}) at ({x},{y})");
+				}
+			}
+			let mut p1 = blocky_plane(&mut rng, 32, 64);
+			let mut p2 = p1.clone();
+			let (bs, tc0) = ([2u8, 4, 1, 3], [1, 0, 1, 2]);
+			filter_edge_scalar(&mut p1.dst(Some(parity), 255), 8, 8, 16, true, &bs, &tc0, 40, 12, false);
+			filter_edge(&mut p2.dst(Some(parity), 255), 8, 8, 16, true, &bs, &tc0, 40, 12, false);
+			filter_edge_scalar(&mut p1.dst(Some(parity), 255), 8, 8, 16, false, &bs, &tc0, 40, 12, false);
+			filter_edge(&mut p2.dst(Some(parity), 255), 8, 8, 16, false, &bs, &tc0, 40, 12, false);
+			assert_eq!(p1.data, p2.data, "deblock, parity {parity}");
+			let mut q1 = noise_plane(&mut rng, 32, 32);
+			let mut q2 = q1.clone();
+			let c: [i32; 16] = std::array::from_fn(|i| (i as i32 * 37) % 200 - 100);
+			recon::idct4_add_scalar(&mut q1.dst(Some(parity), 255), 4, 4, &c);
+			idct4_add(&mut q2.dst(Some(parity), 255), 4, 4, &c);
+			assert_eq!(q1.data, q2.data, "idct, parity {parity}");
 		}
 	}
 
@@ -644,8 +680,8 @@ mod tests {
 						let (x, y) = (rng.range(-12, 28), rng.range(-12, 24));
 						let mut a = [0u8; 64];
 						let mut b = [0u8; 64];
-						recon::mc_chroma_scalar(&r, x, y, fx, fy, bw, bh, &mut a);
-						mc_chroma(&r, x, y, fx, fy, bw, bh, &mut b);
+						recon::mc_chroma_scalar(&r.s8(), x, y, fx, fy, bw, bh, &mut a);
+						mc_chroma(&r.s8(), x, y, fx, fy, bw, bh, &mut b);
 						assert_eq!(a, b, "{bw}x{bh} frac ({fx},{fy}) at ({x},{y})");
 					}
 				}
@@ -675,8 +711,8 @@ mod tests {
 			let mut p1 = noise_plane(&mut rng, 32, 32);
 			let mut p2 = p1.clone();
 			assert!(weights_supported(wt));
-			recon::store_prediction_scalar(&mut p1, 8, 4, bw, bh, a, b, wt);
-			store_prediction(&mut p2, 8, 4, bw, bh, a, b, wt);
+			recon::store_prediction_scalar(&mut p1.d8(), 8, 4, bw, bh, a, b, wt);
+			store_prediction(&mut p2.d8(), 8, 4, bw, bh, a, b, wt);
 			assert_eq!(p1.data, p2.data, "{bw}x{bh} {wt:?} {lists:?}");
 		}
 	}
@@ -700,8 +736,8 @@ mod tests {
 			let tc0: [i32; 4] = bs
 				.map(|s| if (1..4).contains(&s) { i32::from(TC0[index_a][usize::from(s) - 1]) } else { 0 });
 			let (x, y) = (8, 8);
-			filter_edge_scalar(&mut p1, x, y, len, vertical, &bs, &tc0, alpha, beta, chroma);
-			filter_edge(&mut p2, x, y, len, vertical, &bs, &tc0, alpha, beta, chroma);
+			filter_edge_scalar(&mut p1.d8(), x, y, len, vertical, &bs, &tc0, alpha, beta, chroma);
+			filter_edge(&mut p2.d8(), x, y, len, vertical, &bs, &tc0, alpha, beta, chroma);
 			assert_eq!(
 				p1.data, p2.data,
 				"chroma {chroma} vertical {vertical} bs {bs:?} a {alpha} b {beta}"
@@ -729,11 +765,11 @@ mod tests {
 			}
 			let mut p1 = noise_plane(&mut rng, 16, 16);
 			let mut p2 = p1.clone();
-			recon::idct4_add_scalar(&mut p1, 4, 8, &c4);
-			idct4_add(&mut p2, 4, 8, &c4);
+			recon::idct4_add_scalar(&mut p1.d8(), 4, 8, &c4);
+			idct4_add(&mut p2.d8(), 4, 8, &c4);
 			assert_eq!(p1.data, p2.data, "idct4 {c4:?}");
-			recon::idct8_add_scalar(&mut p1, 8, 0, &c8);
-			idct8_add(&mut p2, 8, 0, &c8);
+			recon::idct8_add_scalar(&mut p1.d8(), 8, 0, &c8);
+			idct8_add(&mut p2.d8(), 8, 0, &c8);
 			assert_eq!(p1.data, p2.data, "idct8 {c8:?}");
 		}
 	}

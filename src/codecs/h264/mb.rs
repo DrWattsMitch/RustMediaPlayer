@@ -5,10 +5,9 @@
 
 use super::cabac::{BlockCat, Cabac, ctx};
 use super::cavlc;
-use super::consts::{
-	BLK_XY, GOLOMB_TO_INTER_CBP, GOLOMB_TO_INTRA_CBP, RASTER_TO_BLK, ZIGZAG_4X4, ZIGZAG_8X8,
-};
+use super::consts::{BLK_XY, GOLOMB_TO_INTER_CBP, GOLOMB_TO_INTRA_CBP, RASTER_TO_BLK};
 use super::decode::SliceDecoder;
+use super::recon::Pixel;
 use super::slice::SliceType;
 use crate::codecs::bitstream::BitReader;
 
@@ -38,12 +37,15 @@ pub struct MbInfo {
 	pub cbp: u8,
 	pub chroma_pred: u8,
 	pub t8x8: bool,
-	/// QP'Y for deblocking (0 for I_PCM) and QPc per chroma component.
-	pub qp: u8,
-	pub qpc: [u8; 2],
-	/// Non-zero coefficient counts: luma raster 4x4 (0-15), Cb (16-19),
-	/// Cr (20-23) raster 2x2.
-	pub nnz: [u8; 24],
+	/// QPY for deblocking (0 for I_PCM) and QPc per chroma component,
+	/// without the bit-depth offset (so negative for some high bit depth
+	/// macroblocks).
+	pub qp: i8,
+	pub qpc: [i8; 2],
+	/// Non-zero coefficient counts: luma raster 4x4 (0-15), Cb (16-23),
+	/// Cr (24-31) in raster order of a 2-wide grid (2x2 blocks for 4:2:0,
+	/// 2x4 for 4:2:2).
+	pub nnz: [u8; 32],
 	/// coded_block_flag of the DC blocks: bit 0 luma, bit 1 Cb, bit 2 Cr.
 	pub dc_cbf: u8,
 	/// Intra 4x4/8x8 prediction modes per raster 4x4 block (2 otherwise).
@@ -55,6 +57,8 @@ pub struct MbInfo {
 	pub mvd: [[[u8; 2]; 16]; 2],
 	/// Bit n: 8x8 block n was predicted in direct mode.
 	pub direct8: u8,
+	/// Field macroblock (field picture or MBAFF field pair).
+	pub field: bool,
 }
 
 impl MbInfo {
@@ -65,6 +69,18 @@ impl MbInfo {
 	pub fn is_skip(&self) -> bool {
 		matches!(self.kind, MbKind::PSkip | MbKind::BSkip)
 	}
+
+	/// The motion kept with the picture (undecoded macroblocks count as
+	/// intra).
+	pub fn motion(&self) -> super::dpb::MbMotion {
+		super::dpb::MbMotion {
+			mv: self.mv,
+			ref_idx: self.ref_idx,
+			ref_id: self.ref_id,
+			intra: self.is_intra() || self.slice == 0,
+			field: self.field,
+		}
+	}
 }
 
 /// Coefficient levels of the current macroblock, in raster order per block.
@@ -73,9 +89,11 @@ pub struct Residual {
 	pub luma: [[i32; 16]; 16],
 	pub luma8: [[i32; 64]; 4],
 	pub dc: [i32; 16],
-	pub chroma_dc: [[i32; 4]; 2],
-	pub chroma_ac: [[[i32; 16]; 4]; 2],
-	pub pcm: [u8; 384],
+	/// Chroma DC per component: 2x2 (4:2:0) or 2x4 (4:2:2), raster.
+	pub chroma_dc: [[i32; 8]; 2],
+	pub chroma_ac: [[[i32; 16]; 8]; 2],
+	/// I_PCM samples: 256 luma, then Cb and Cr (64 or 128 each).
+	pub pcm: [u16; 512],
 }
 
 impl Default for Residual {
@@ -84,9 +102,9 @@ impl Default for Residual {
 			luma: [[0; 16]; 16],
 			luma8: [[0; 64]; 4],
 			dc: [0; 16],
-			chroma_dc: [[0; 4]; 2],
-			chroma_ac: [[[0; 16]; 4]; 2],
-			pcm: [0; 384],
+			chroma_dc: [[0; 8]; 2],
+			chroma_ac: [[[0; 16]; 8]; 2],
+			pcm: [0; 512],
 		}
 	}
 }
@@ -228,36 +246,104 @@ fn intra_type(t: u32) -> Option<MbType> {
 	}
 }
 
-impl<'a> SliceDecoder<'a> {
+impl<'a, T: Pixel> SliceDecoder<'a, T> {
 	// -----------------------------------------------------------------------
 	// Neighbour access
 
 	/// Neighbouring macroblock at offset (dx, dy) if it is available
-	/// (inside the picture and in the current slice).
+	/// (inside the picture and in the current slice). In MBAFF frames the
+	/// offsets name the neighbours A (-1, 0), B (0, -1), C (1, -1) and D
+	/// (-1, -1) of 6.4.10.1.
+	#[inline]
 	pub fn nb_mb(&self, dx: i32, dy: i32) -> Option<&MbInfo> {
+		if self.mbaff {
+			let xn = match dx {
+				-1 => -1,
+				0 => 0,
+				_ => 16,
+			};
+			return self.locate(xn, dy.min(0), 16, 16).map(|(i, _, _)| &self.f.mbs[i]);
+		}
 		let x = self.mbx as i32 + dx;
 		let y = self.mby as i32 + dy;
-		if x < 0 || y < 0 || x >= self.f.mb_w as i32 || y >= self.f.mb_h as i32 {
+		if x < 0 || y < 0 || x >= self.f.mb_w as i32 || y >= self.rows as i32 {
 			return None;
 		}
-		let mb = &self.f.mbs[y as usize * self.f.mb_w + x as usize];
+		let mb = &self.f.mbs[self.store_idx(x as usize, y as usize)];
 		(mb.slice == self.slice_num).then_some(mb)
+	}
+
+	/// MBAFF neighbour location (6.4.12.2, Table 6-4): the available
+	/// macroblock covering sample (xn, yn) relative to the current one,
+	/// outside it, in a `w` x `h` block grid (16x16 luma, 8x8 or 8x16
+	/// chroma), and the sample's position inside that macroblock. Every
+	/// case of the table is the macroblock that physically holds the
+	/// sample, with each pair's rows interleaved when it is a field pair.
+	pub fn locate(&self, xn: i32, yn: i32, w: i32, h: i32) -> Option<(usize, i32, i32)> {
+		let mb_w = self.f.mb_w as i32;
+		let bottom = (self.mby & 1) as i32;
+		// Row of the sample in the current pair (2h rows, interleaved for a
+		// field pair).
+		let r = if self.mb_field { 2 * yn + bottom } else { yn + h * bottom };
+		let (dx, xw) = (xn.div_euclid(w), xn.rem_euclid(w));
+		let (dy, rr) = (r.div_euclid(2 * h), r.rem_euclid(2 * h));
+		if dy > 0 || (dy == 0 && dx > 0) {
+			return None; // not decoded yet
+		}
+		let px = self.mbx as i32 + dx;
+		let pair_row = (self.mby >> 1) as i32 + dy;
+		if px < 0 || px >= mb_w || pair_row < 0 {
+			return None;
+		}
+		let top = (2 * pair_row * mb_w + px) as usize;
+		let first = &self.f.mbs[top];
+		if first.slice != self.slice_num {
+			return None;
+		}
+		let field = if dx == 0 && dy == 0 { self.mb_field } else { first.field };
+		let (mb, yw) = if field { (rr % 2, rr / 2) } else { (rr / h, rr % h) };
+		Some((top + mb as usize * mb_w as usize, xw, yw))
 	}
 
 	/// The macroblock and raster 4x4 index covering 4x4 position (x4, y4)
 	/// relative to the current macroblock (-1..=4). Positions inside the
 	/// current macroblock resolve to `cur`.
+	#[inline]
 	pub fn nb4<'b>(&'b self, cur: &'b MbInfo, x4: i32, y4: i32) -> Option<(&'b MbInfo, usize)> {
+		self.nb4_row(cur, x4, y4, 0)
+	}
+
+	/// [`Self::nb4`] for the block holding sample row `4 * y4 + sub` (in
+	/// MBAFF frames the rows of one 4x4 block of a frame macroblock can
+	/// belong to the two macroblocks of a field pair beside it): the
+	/// diagonal neighbour D of a partition is the bottom row (sub 3) of the
+	/// block above-left.
+	#[inline]
+	pub fn nb4_row<'b>(
+		&'b self,
+		cur: &'b MbInfo,
+		x4: i32,
+		y4: i32,
+		sub: i32,
+	) -> Option<(&'b MbInfo, usize)> {
 		let (dx, dy) = (x4.div_euclid(4), y4.div_euclid(4));
-		let idx = (y4.rem_euclid(4) * 4 + x4.rem_euclid(4)) as usize;
 		if dx == 0 && dy == 0 {
-			return Some((cur, idx));
+			return Some((cur, (y4 * 4 + x4) as usize));
 		}
+		if self.mbaff {
+			let xn = if x4 < 0 { -1 } else { x4 * 4 };
+			let yn = if y4 < 0 { -1 } else { y4 * 4 + sub };
+			return self
+				.locate(xn, yn, 16, 16)
+				.map(|(i, xw, yw)| (&self.f.mbs[i], ((yw / 4) * 4 + xw / 4) as usize));
+		}
+		let idx = (y4.rem_euclid(4) * 4 + x4.rem_euclid(4)) as usize;
 		self.nb_mb(dx, dy).map(|m| (m, idx))
 	}
 
-	/// Chroma 4x4 neighbour (2x2 grid per component): returns the macroblock
-	/// and the index into `nnz` (16 + 4 * comp + raster).
+	/// Chroma 4x4 neighbour (2-wide grid per component, 2 or 4 tall):
+	/// returns the macroblock and the index into `nnz` (16 + 8 * comp +
+	/// raster).
 	fn nb_chroma<'b>(
 		&'b self,
 		cur: &'b MbInfo,
@@ -265,12 +351,35 @@ impl<'a> SliceDecoder<'a> {
 		x2: i32,
 		y2: i32,
 	) -> Option<(&'b MbInfo, usize)> {
-		let (dx, dy) = (x2.div_euclid(2), y2.div_euclid(2));
-		let idx = 16 + 4 * comp + (y2.rem_euclid(2) * 2 + x2.rem_euclid(2)) as usize;
+		let rows = (self.mb_ch() / 4) as i32;
+		let (dx, dy) = (x2.div_euclid(2), y2.div_euclid(rows));
 		if dx == 0 && dy == 0 {
-			return Some((cur, idx));
+			return Some((cur, 16 + 8 * comp + (y2 * 2 + x2) as usize));
 		}
+		if self.mbaff {
+			let xn = if x2 < 0 { -1 } else { x2 * 4 };
+			let yn = if y2 < 0 { -1 } else { y2 * 4 };
+			return self
+				.locate(xn, yn, 8, self.mb_ch() as i32)
+				.map(|(i, xw, yw)| (&self.f.mbs[i], 16 + 8 * comp + ((yw / 4) * 2 + xw / 4) as usize));
+		}
+		let idx = 16 + 8 * comp + (y2.rem_euclid(rows) * 2 + x2.rem_euclid(2)) as usize;
 		self.nb_mb(dx, dy).map(|m| (m, idx))
+	}
+
+	/// How the motion of neighbour `m` scales for the current macroblock in
+	/// an MBAFF frame (8.4.1.3.1): 1 = current field, neighbour frame
+	/// (refIdx * 2, vertical mv / 2); -1 = current frame, neighbour field
+	/// (refIdx / 2, vertical mv * 2); 0 = same kind.
+	#[inline]
+	pub fn nb_scale(&self, m: &MbInfo) -> i32 {
+		if !self.mbaff || m.field == self.mb_field {
+			0
+		} else if self.mb_field {
+			1
+		} else {
+			-1
+		}
 	}
 
 	// -----------------------------------------------------------------------
@@ -497,7 +606,8 @@ impl<'a> SliceDecoder<'a> {
 
 	/// ref_idx_lX for the partition whose top-left 4x4 block is (x4, y4).
 	fn read_ref_idx(&mut self, cur: &MbInfo, list: usize, x4: usize, y4: usize) -> MbResult<i8> {
-		let count = self.h.num_ref_idx[list];
+		// MBAFF field macroblocks index the fields of the frame list.
+		let count = self.h.num_ref_idx[list] << usize::from(self.mbaff && self.mb_field);
 		if count <= 1 {
 			return Ok(0);
 		}
@@ -516,7 +626,10 @@ impl<'a> SliceDecoder<'a> {
 					if m.is_intra() || m.direct8 & (1 << b8) != 0 {
 						return 0;
 					}
-					usize::from(m.ref_idx[list][b8] > 0)
+					// 9.3.3.1.1.6: refIdx > 1 for a field neighbour of a frame
+					// macroblock (refIdx * 2 > 0 is refIdx > 0 the other way).
+					let r = m.ref_idx[list][b8];
+					usize::from(if self.nb_scale(m) < 0 { r > 1 } else { r > 0 })
 				};
 				let inc = cond(self.nb4(cur, x4 as i32 - 1, y4 as i32))
 					+ 2 * cond(self.nb4(cur, x4 as i32, y4 as i32 - 1));
@@ -542,8 +655,18 @@ impl<'a> SliceDecoder<'a> {
 		match &mut self.entropy {
 			Entropy::Cavlc(bs) => Ok(bs.se()),
 			Entropy::Cabac(_) => {
-				let get =
-					|n: Option<(&MbInfo, usize)>| n.map_or(0u32, |(m, i)| u32::from(m.mvd[list][i][comp]));
+				// 9.3.3.1.1.7: vertical |mvd| scales between frame and field
+				// macroblocks of an MBAFF frame.
+				let get = |n: Option<(&MbInfo, usize)>| {
+					n.map_or(0u32, |(m, i)| {
+						let v = u32::from(m.mvd[list][i][comp]);
+						match (comp, self.nb_scale(m)) {
+							(1, 1) => v >> 1,
+							(1, -1) => v << 1,
+							_ => v,
+						}
+					})
+				};
 				let sum = get(self.nb4(cur, x4 as i32 - 1, y4 as i32))
 					+ get(self.nb4(cur, x4 as i32, y4 as i32 - 1));
 				let inc = if sum < 3 {
@@ -628,7 +751,8 @@ impl<'a> SliceDecoder<'a> {
 				if k % 2 == 1 { mag } else { -mag }
 			}
 		};
-		if !(-26..=25).contains(&d) {
+		let half = self.qp_bd / 2;
+		if !(-(26 + half)..=25 + half).contains(&d) {
 			return Err(BadMb("mb_qp_delta out of range"));
 		}
 		Ok(d)
@@ -646,13 +770,10 @@ impl<'a> SliceDecoder<'a> {
 				cur.kind = MbKind::Pcm;
 				self.read_pcm()?;
 				cur.cbp = 0x2F;
-				cur.nnz = [16; 24];
+				cur.nnz = [16; 32];
 				cur.dc_cbf = 7;
 				cur.qp = 0;
-				cur.qpc = [
-					super::consts::chroma_qp(0, self.pps.chroma_qp_offset[0]),
-					super::consts::chroma_qp(0, self.pps.chroma_qp_offset[1]),
-				];
+				cur.qpc = self.chroma_qps(0);
 				cur.ipred = [2; 16];
 				cur.ref_idx = [[-1; 4]; 2];
 				self.prev_qp_delta_nonzero = false;
@@ -693,15 +814,14 @@ impl<'a> SliceDecoder<'a> {
 		if has_residual {
 			let d = self.read_qp_delta()?;
 			self.prev_qp_delta_nonzero = d != 0;
-			self.qp = (self.qp + d + 52) % 52;
+			// (7-37): QPY wraps within -QpBdOffsetY..=51.
+			let bd = self.qp_bd;
+			self.qp = (self.qp + d + 52 + 2 * bd) % (52 + bd) - bd;
 		} else {
 			self.prev_qp_delta_nonzero = false;
 		}
-		cur.qp = self.qp as u8;
-		cur.qpc = [
-			super::consts::chroma_qp(self.qp, self.pps.chroma_qp_offset[0]),
-			super::consts::chroma_qp(self.qp, self.pps.chroma_qp_offset[1]),
-		];
+		cur.qp = self.qp as i8;
+		cur.qpc = self.chroma_qps(self.qp);
 		if has_residual {
 			self.parse_residual(cur)?;
 		}
@@ -723,12 +843,14 @@ impl<'a> SliceDecoder<'a> {
 	}
 
 	fn read_pcm(&mut self) -> MbResult<()> {
+		let count = 256 + 2 * 8 * self.mb_ch();
+		let bits = self.bd;
 		let res = self.res.get_or_insert_with(Box::default);
 		match &mut self.entropy {
 			Entropy::Cavlc(bs) => {
 				bs.align();
-				for s in res.pcm.iter_mut() {
-					*s = bs.bits(8) as u8;
+				for s in res.pcm[..count].iter_mut() {
+					*s = bs.bits(bits) as u16;
 				}
 				if bs.overrun() {
 					return Err(BadMb("truncated pcm samples"));
@@ -737,8 +859,8 @@ impl<'a> SliceDecoder<'a> {
 			Entropy::Cabac(c) => {
 				let bs = c.reader();
 				bs.align();
-				for s in res.pcm.iter_mut() {
-					*s = bs.bits(8) as u8;
+				for s in res.pcm[..count].iter_mut() {
+					*s = bs.bits(bits) as u16;
 				}
 				if bs.overrun() {
 					return Err(BadMb("truncated pcm samples"));
@@ -896,7 +1018,7 @@ impl<'a> SliceDecoder<'a> {
 		if i16 {
 			let inc = self.cbf_dc_inc(cur, 0);
 			let nc = self.nc_luma(cur, 0, 0);
-			let n = self.block(BlockCat::LumaDc, Some(inc), nc, &ZIGZAG_4X4, 0, 16, &mut res.dc)?;
+			let n = self.block(BlockCat::LumaDc, Some(inc), nc, self.scan4, 0, 16, &mut res.dc)?;
 			if n != 0 {
 				cur.dc_cbf |= 1;
 			}
@@ -906,7 +1028,7 @@ impl<'a> SliceDecoder<'a> {
 			if cabac && cur.t8x8 {
 				let (x4, y4) = ((b8 % 2) * 2, (b8 / 2) * 2);
 				let n = if coded {
-					self.block(BlockCat::Luma8x8, None, 0, &ZIGZAG_8X8, 0, 64, &mut res.luma8[b8])?
+					self.block(BlockCat::Luma8x8, None, 0, self.scan8, 0, 64, &mut res.luma8[b8])?
 				} else {
 					0
 				};
@@ -926,7 +1048,7 @@ impl<'a> SliceDecoder<'a> {
 				let nc = if cabac { 0 } else { self.nc_luma(cur, x4 as i32, y4 as i32) };
 				let inc = if cabac { Some(self.cbf_luma_inc(cur, x4 as i32, y4 as i32)) } else { None };
 				let n = if i16 {
-					self.block(BlockCat::LumaAc, inc, nc, &ZIGZAG_4X4, 1, 15, &mut res.luma[raster])?
+					self.block(BlockCat::LumaAc, inc, nc, self.scan4, 1, 15, &mut res.luma[raster])?
 				} else if cur.t8x8 {
 					// CAVLC 8x8: four interleaved 4x4 scans (7.3.5.3.2).
 					let mut tmp = [0i32; 16];
@@ -934,30 +1056,42 @@ impl<'a> SliceDecoder<'a> {
 					let n = self.block(BlockCat::Luma4x4, None, nc, &identity, 0, 16, &mut tmp)?;
 					for (k, &v) in tmp.iter().enumerate() {
 						if v != 0 {
-							res.luma8[b8][usize::from(ZIGZAG_8X8[4 * k + i])] = v;
+							res.luma8[b8][usize::from(self.scan8[4 * k + i])] = v;
 						}
 					}
 					n
 				} else {
-					self.block(BlockCat::Luma4x4, inc, nc, &ZIGZAG_4X4, 0, 16, &mut res.luma[raster])?
+					self.block(BlockCat::Luma4x4, inc, nc, self.scan4, 0, 16, &mut res.luma[raster])?
 				};
 				cur.nnz[raster] = n;
 			}
 		}
 		if cur.cbp >> 4 != 0 {
+			// 4:2:2 DC: 8 coefficients of a 2x4 array, scanned as in 8-330.
+			const SCAN_420: [u8; 4] = [0, 1, 2, 3];
+			const SCAN_422: [u8; 8] = [0, 2, 1, 4, 6, 3, 5, 7];
+			let (scan, count, nc): (&[u8], usize, i32) =
+				if self.c422 { (&SCAN_422, 8, -2) } else { (&SCAN_420, 4, -1) };
 			for comp in 0..2 {
 				let inc = self.cbf_dc_inc(cur, comp + 1);
-				let scan: [u8; 4] = [0, 1, 2, 3];
-				let n =
-					self.block(BlockCat::ChromaDc, Some(inc), -1, &scan, 0, 4, &mut res.chroma_dc[comp])?;
+				let n = self.block(
+					BlockCat::ChromaDc,
+					Some(inc),
+					nc,
+					scan,
+					0,
+					count,
+					&mut res.chroma_dc[comp],
+				)?;
 				if n != 0 {
 					cur.dc_cbf |= 2 << comp;
 				}
 			}
 		}
+		let blocks = self.mb_ch() / 2;
 		for comp in 0..2 {
-			for blk in 0..4usize {
-				let idx = 16 + 4 * comp + blk;
+			for blk in 0..blocks {
+				let idx = 16 + 8 * comp + blk;
 				if cur.cbp >> 4 != 2 {
 					cur.nnz[idx] = 0;
 					continue;
@@ -969,7 +1103,7 @@ impl<'a> SliceDecoder<'a> {
 					BlockCat::ChromaAc,
 					inc,
 					nc,
-					&ZIGZAG_4X4,
+					self.scan4,
 					1,
 					15,
 					&mut res.chroma_ac[comp][blk],

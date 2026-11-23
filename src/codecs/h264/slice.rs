@@ -51,7 +51,14 @@ pub struct WeightTable {
 
 #[derive(Debug, Clone)]
 pub struct SliceHeader {
+	/// Address of the first macroblock (first_mb_in_slice, times two in
+	/// MBAFF frames).
 	pub first_mb: u32,
+	/// field_pic_flag / bottom_field_flag.
+	pub field_pic: bool,
+	pub bottom_field: bool,
+	/// MbaffFrameFlag: an MBAFF frame (macroblock pairs).
+	pub mbaff: bool,
 	pub slice_type: SliceType,
 	pub pps_id: usize,
 	pub frame_num: u32,
@@ -76,6 +83,18 @@ pub struct SliceHeader {
 	pub beta_offset: i32,
 	/// Bit offset of slice_data() within the RBSP.
 	pub data_bit_offset: usize,
+}
+
+impl SliceHeader {
+	/// The parity of a field picture (0 top, 1 bottom), `None` for a frame.
+	pub fn parity(&self) -> Option<usize> {
+		self.field_pic.then_some(usize::from(self.bottom_field))
+	}
+
+	/// CurrPicNum (7.4.3): frame_num, or 2 * frame_num + 1 for a field.
+	pub fn curr_pic_num(&self) -> i64 {
+		if self.field_pic { 2 * i64::from(self.frame_num) + 1 } else { i64::from(self.frame_num) }
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +212,15 @@ pub fn parse(
 	}
 	let pps_id = bs.ue() as usize;
 	let frame_num = bs.bits(sps.log2_max_frame_num);
+	let (mut field_pic, mut bottom_field) = (false, false);
+	if !sps.frame_mbs_only {
+		field_pic = bs.bit();
+		if field_pic {
+			bottom_field = bs.bit();
+		}
+	}
+	let mbaff = sps.mbaff && !field_pic;
+	let first_mb = first_mb.saturating_mul(1 + u32::from(mbaff));
 	let idr = nal_kind == super::nal::kind::IDR;
 	let idr_pic_id = if idr { bs.ue() } else { 0 };
 	let mut poc_lsb = 0;
@@ -200,12 +228,12 @@ pub fn parse(
 	let mut delta_poc = [0; 2];
 	if sps.poc_type == 0 {
 		poc_lsb = bs.bits(sps.log2_max_poc_lsb);
-		if pps.bottom_field_pic_order_present {
+		if pps.bottom_field_pic_order_present && !field_pic {
 			delta_poc_bottom = bs.se();
 		}
 	} else if sps.poc_type == 1 && !sps.delta_pic_order_always_zero {
 		delta_poc[0] = bs.se();
-		if pps.bottom_field_pic_order_present {
+		if pps.bottom_field_pic_order_present && !field_pic {
 			delta_poc[1] = bs.se();
 		}
 	}
@@ -258,7 +286,7 @@ pub fn parse(
 		}
 	}
 	let qp = pps.init_qp + bs.se();
-	if !(0..=51).contains(&qp) {
+	if !(-6 * (sps.bit_depth as i32 - 8)..=51).contains(&qp) {
 		return Err(BadSlice("slice qp out of range"));
 	}
 	let mut disable_deblocking = 0;
@@ -282,6 +310,9 @@ pub fn parse(
 	}
 	Ok(SliceHeader {
 		first_mb,
+		field_pic,
+		bottom_field,
+		mbaff,
 		slice_type,
 		pps_id,
 		frame_num,

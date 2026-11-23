@@ -2,16 +2,20 @@
 
 use std::sync::OnceLock;
 
-use super::tables::{COEFF_TOKEN, RUN_BEFORE, TOTAL_ZEROS, TOTAL_ZEROS_CHROMA_DC};
+use super::tables::{
+	COEFF_TOKEN, COEFF_TOKEN_CHROMA422_DC, RUN_BEFORE, TOTAL_ZEROS, TOTAL_ZEROS_CHROMA_DC,
+	TOTAL_ZEROS_CHROMA422_DC,
+};
 use crate::codecs::bitstream::{BitReader, Code, Vlc};
 
 struct Tables {
-	/// coeff_token per nC class (0-1, 2-3, 4-7, 8+, chroma DC); symbol =
-	/// `total_coeff * 4 + trailing_ones`.
+	/// coeff_token per nC class (0-1, 2-3, 4-7, 8+, 4:2:0 chroma DC, 4:2:2
+	/// chroma DC); symbol = `total_coeff * 4 + trailing_ones`.
 	coeff_token: Vec<Vlc>,
 	/// total_zeros per total_coeff (index 1..=15).
 	total_zeros: Vec<Vlc>,
 	total_zeros_dc: Vec<Vlc>,
+	total_zeros_dc422: Vec<Vlc>,
 	/// run_before per min(zeros_left, 7) (index 1..=7).
 	run_before: Vec<Vlc>,
 }
@@ -24,20 +28,22 @@ fn build(codes: impl Iterator<Item = (u32, u8, u32)>, root: u32) -> Vlc {
 
 fn tables() -> &'static Tables {
 	static T: OnceLock<Tables> = OnceLock::new();
+	fn token_table(t: &[[(u8, u8); 4]]) -> Vlc {
+		build(
+			t.iter().enumerate().flat_map(|(tc, row)| {
+				row
+					.iter()
+					.enumerate()
+					.map(move |(t1, &(code, len))| (u32::from(code), len, (tc * 4 + t1) as u32))
+			}),
+			8,
+		)
+	}
 	T.get_or_init(|| Tables {
 		coeff_token: COEFF_TOKEN
 			.iter()
-			.map(|t| {
-				build(
-					t.iter().enumerate().flat_map(|(tc, row)| {
-						row
-							.iter()
-							.enumerate()
-							.map(move |(t1, &(code, len))| (u32::from(code), len, (tc * 4 + t1) as u32))
-					}),
-					8,
-				)
-			})
+			.map(|t| token_table(t))
+			.chain(std::iter::once(token_table(&COEFF_TOKEN_CHROMA422_DC)))
 			.collect(),
 		total_zeros: TOTAL_ZEROS
 			.iter()
@@ -46,6 +52,10 @@ fn tables() -> &'static Tables {
 		total_zeros_dc: TOTAL_ZEROS_CHROMA_DC
 			.iter()
 			.map(|row| build(row.iter().enumerate().map(|(z, &(c, l))| (u32::from(c), l, z as u32)), 3))
+			.collect(),
+		total_zeros_dc422: TOTAL_ZEROS_CHROMA422_DC
+			.iter()
+			.map(|row| build(row.iter().enumerate().map(|(z, &(c, l))| (u32::from(c), l, z as u32)), 5))
 			.collect(),
 		run_before: RUN_BEFORE
 			.iter()
@@ -59,7 +69,8 @@ pub struct BadResidual;
 
 /// Decodes one `residual_block_cavlc()`.
 ///
-/// `nc` selects the coeff_token table (-1 = 4:2:0 chroma DC). Levels are
+/// `nc` selects the coeff_token table (-1 = 4:2:0 chroma DC, -2 = 4:2:2
+/// chroma DC). Levels are
 /// written to `out[scan[start + i]]` for `i < max`. Returns `total_coeff`.
 pub fn residual(
 	bs: &mut BitReader,
@@ -71,6 +82,7 @@ pub fn residual(
 ) -> Result<u8, BadResidual> {
 	let t = tables();
 	let table = match nc {
+		-2 => 5,
 		-1 => 4,
 		0..=1 => 0,
 		2..=3 => 1,
@@ -121,7 +133,8 @@ pub fn residual(
 			code += 2;
 		}
 		let value = if code % 2 == 0 { (code + 2) >> 1 } else { (-code - 1) >> 1 };
-		*level = value.clamp(-(1 << 16), 1 << 16) as i32;
+		// Conforming levels fit in 8 + 14 bits at most (any bit depth).
+		*level = value.clamp(-(1 << 22), 1 << 22) as i32;
 		if suffix_len == 0 {
 			suffix_len = 1;
 		}
@@ -132,7 +145,11 @@ pub fn residual(
 
 	let mut zeros_left = 0usize;
 	if total < max {
-		let vlc = if nc == -1 { t.total_zeros_dc.get(total) } else { t.total_zeros.get(total) };
+		let vlc = match nc {
+			-1 => t.total_zeros_dc.get(total),
+			-2 => t.total_zeros_dc422.get(total),
+			_ => t.total_zeros.get(total),
+		};
 		zeros_left = vlc.and_then(|v| v.decode(bs)).ok_or(BadResidual)? as usize;
 	}
 	if total + zeros_left > max {
@@ -174,7 +191,7 @@ mod tests {
 	#[test]
 	fn total_coeff_zero() {
 		let t = tables();
-		assert_eq!(t.coeff_token.len(), 5);
+		assert_eq!(t.coeff_token.len(), 6);
 		// With 0 <= nC < 2, the 1-bit code "1" means TotalCoeff = 0.
 		let mut bs = BitReader::new(&[0x80]);
 		let mut out = [0i32; 16];

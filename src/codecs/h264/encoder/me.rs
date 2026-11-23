@@ -259,7 +259,7 @@ mod tests {
 		for (x, y) in [(0, 0), (-20, -10), (20, 5), (30, 14)] {
 			let want: u32 = (0..8)
 				.flat_map(|j| (0..8).map(move |i| (i, j)))
-				.map(|(i, j)| u32::from(p.clamped(x + i, y + j).abs_diff(100)))
+				.map(|(i, j)| u32::from(p.s8().clamped(x + i, y + j).abs_diff(100)))
 				.sum();
 			assert_eq!(pad.sad(&src, 0, 0, x, y, 8, 8), want);
 		}
@@ -277,7 +277,7 @@ mod tests {
 			for fy in 0..4 {
 				for fx in 0..4 {
 					let (mut want, mut got) = ([0u8; 64], [0u8; 64]);
-					crate::codecs::h264::recon::mc_luma(&p, x, y, fx, fy, 8, 8, &mut want);
+					crate::codecs::h264::recon::mc_luma(&p.s8(), x, y, fx, fy, 8, 8, &mut want);
 					hp.predict(&pad, x, y, fx, fy, 8, 8, &mut got);
 					assert_eq!(want, got, "({x}, {y}) frac ({fx}, {fy})");
 				}

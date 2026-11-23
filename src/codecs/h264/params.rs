@@ -33,7 +33,10 @@ pub struct Sps {
 	pub profile_idc: u8,
 	pub level_idc: u8,
 	pub id: usize,
+	/// 1 = 4:2:0, 2 = 4:2:2 (4:4:4 and monochrome are rejected).
 	pub chroma_format_idc: u32,
+	/// Bit depth of luma and chroma samples (8 to 14; they must match).
+	pub bit_depth: u32,
 	pub scaling: Option<ScalingLists>,
 	pub log2_max_frame_num: u32,
 	pub poc_type: u32,
@@ -45,7 +48,13 @@ pub struct Sps {
 	pub max_num_ref_frames: u32,
 	pub gaps_in_frame_num_allowed: bool,
 	pub mb_width: u32,
+	/// Frame height in macroblocks (twice the map units when fields may
+	/// be coded).
 	pub mb_height: u32,
+	/// frame_mbs_only_flag: no field pictures or field macroblocks.
+	pub frame_mbs_only: bool,
+	/// mb_adaptive_frame_field_flag: frame pictures are MBAFF.
+	pub mbaff: bool,
 	pub direct_8x8_inference: bool,
 	/// Crop in luma samples: left, right, top, bottom.
 	pub crop: [u32; 4],
@@ -197,6 +206,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, Unsupported> {
 		return Err(bad);
 	}
 	let mut chroma_format_idc = 1;
+	let mut bit_depth = 8;
 	let mut scaling = None;
 	if matches!(profile_idc, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135)
 	{
@@ -204,11 +214,15 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, Unsupported> {
 		if chroma_format_idc == 3 {
 			bs.skip(1);
 		}
-		let depth_luma = bs.ue() + 8;
-		let depth_chroma = bs.ue() + 8;
-		if depth_luma != 8 || depth_chroma != 8 {
-			return Err(Unsupported("only 8-bit h264 is supported"));
+		let depth_luma = bs.ue().saturating_add(8);
+		let depth_chroma = bs.ue().saturating_add(8);
+		if depth_luma > 14 || depth_chroma > 14 {
+			return Err(bad);
 		}
+		if depth_luma != depth_chroma {
+			return Err(Unsupported("h264 with different luma and chroma bit depths is not supported"));
+		}
+		bit_depth = depth_luma;
 		if bs.bit() {
 			return Err(Unsupported("lossless h264 (transform bypass) is not supported"));
 		}
@@ -216,8 +230,11 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, Unsupported> {
 			scaling = Some(parse_scaling(&mut bs, if chroma_format_idc == 3 { 6 } else { 2 }, None));
 		}
 	}
-	if chroma_format_idc != 1 {
-		return Err(Unsupported("only 4:2:0 h264 is supported"));
+	match chroma_format_idc {
+		1 | 2 => {}
+		0 => return Err(Unsupported("monochrome h264 is not supported")),
+		3 => return Err(Unsupported("4:4:4 h264 is not supported")),
+		_ => return Err(bad),
 	}
 	let log2_max_frame_num = bs.ue() + 4;
 	if log2_max_frame_num > 16 {
@@ -229,6 +246,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, Unsupported> {
 		level_idc,
 		id,
 		chroma_format_idc,
+		bit_depth,
 		scaling,
 		log2_max_frame_num,
 		poc_type,
@@ -241,6 +259,8 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, Unsupported> {
 		gaps_in_frame_num_allowed: false,
 		mb_width: 0,
 		mb_height: 0,
+		frame_mbs_only: true,
+		mbaff: false,
 		direct_8x8_inference: false,
 		crop: [0; 4],
 		max_num_reorder_frames: None,
@@ -272,18 +292,28 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, Unsupported> {
 	}
 	sps.gaps_in_frame_num_allowed = bs.bit();
 	sps.mb_width = bs.ue().saturating_add(1);
-	sps.mb_height = bs.ue().saturating_add(1);
-	if !bs.bit() {
-		return Err(Unsupported("interlaced h264 (field/mbaff coding) is not supported"));
+	let map_units = bs.ue().saturating_add(1);
+	sps.frame_mbs_only = bs.bit();
+	if !sps.frame_mbs_only {
+		sps.mbaff = bs.bit();
 	}
+	sps.mb_height = map_units.saturating_mul(if sps.frame_mbs_only { 1 } else { 2 });
 	if sps.mb_width.checked_mul(sps.mb_height).is_none_or(|n| n > MAX_MBS) {
 		return Err(Unsupported("h264 picture too large"));
 	}
 	sps.direct_8x8_inference = bs.bit();
 	if bs.bit() {
 		let crop: [u32; 4] = [bs.ue(), bs.ue(), bs.ue(), bs.ue()];
-		// 4:2:0 progressive: crop units are 2 luma samples.
-		let crop = crop.map(|c| c.saturating_mul(2));
+		// CropUnitX = SubWidthC; CropUnitY = SubHeightC * (2 - frame_mbs_only)
+		// (7-19, 7-20).
+		let unit_y =
+			if chroma_format_idc == 1 { 2 } else { 1 } * if sps.frame_mbs_only { 1 } else { 2 };
+		let crop = [
+			crop[0].saturating_mul(2),
+			crop[1].saturating_mul(2),
+			crop[2].saturating_mul(unit_y),
+			crop[3].saturating_mul(unit_y),
+		];
 		if crop[0] + crop[1] >= sps.mb_width * 16 || crop[2] + crop[3] >= sps.mb_height * 16 {
 			return Err(bad);
 		}
@@ -399,7 +429,8 @@ pub fn parse_pps(
 	let init_qp = 26 + bs.se();
 	let _init_qs = bs.se();
 	let chroma_offset = bs.se();
-	if !(0..=51).contains(&init_qp) || !(-12..=12).contains(&chroma_offset) {
+	let qp_bd = 6 * (sps.bit_depth as i32 - 8);
+	if !(-qp_bd..=51).contains(&init_qp) || !(-12..=12).contains(&chroma_offset) {
 		return Err(bad);
 	}
 	let deblocking_control_present = bs.bit();

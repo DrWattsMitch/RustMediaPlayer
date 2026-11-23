@@ -10,9 +10,10 @@ use super::tables::{CABAC_INIT, RANGE_LPS, TRANS_IDX};
 use crate::codecs::bitstream::BitReader;
 
 pub const NUM_CTX: usize = 460;
-/// Coefficient levels beyond this cannot occur in conforming 8-bit streams
-/// (the spec bounds them to 16 bits); damaged data is clamped here.
-pub const MAX_LEVEL: u32 = 1 << 16;
+/// Coefficient levels beyond this cannot occur in conforming streams of
+/// any bit depth (the spec bounds them to 8 + 14 bits); damaged data is
+/// clamped here.
+pub const MAX_LEVEL: u32 = 1 << 22;
 
 /// ctxIdxOffsets (Table 9-34).
 pub mod ctx {
@@ -37,11 +38,16 @@ pub mod ctx {
 	pub const CBF: usize = 85;
 	pub const SIG: usize = 105;
 	pub const LAST: usize = 166;
+	pub const MB_FIELD: usize = 70;
+	pub const SIG_FIELD: usize = 277;
+	pub const LAST_FIELD: usize = 338;
 	pub const ABS: usize = 227;
 	pub const TRANSFORM_8X8: usize = 399;
 	pub const SIG_8X8: usize = 402;
 	pub const LAST_8X8: usize = 417;
 	pub const ABS_8X8: usize = 426;
+	pub const SIG_8X8_FIELD: usize = 436;
+	pub const LAST_8X8_FIELD: usize = 451;
 }
 
 /// Residual block categories (`ctxBlockCat`, Table 9-42).
@@ -64,6 +70,9 @@ pub struct Cabac<'a> {
 	range: u32,
 	offset: u32,
 	states: [u8; NUM_CTX],
+	/// The current macroblock is field-coded (field picture or MBAFF field
+	/// macroblock): coefficients use the field significance contexts.
+	pub field: bool,
 }
 
 impl<'a> Cabac<'a> {
@@ -88,7 +97,7 @@ impl<'a> Cabac<'a> {
 			*state = if pre <= 63 { ((63 - pre) << 1) as u8 } else { (((pre - 64) << 1) | 1) as u8 };
 		}
 		let offset = bs.bits(9);
-		Self { bs, range: 510, offset, states }
+		Self { bs, range: 510, offset, states, field: false }
 	}
 
 	/// `true` once the engine has read past the end of the slice data.
@@ -234,20 +243,27 @@ impl<'a> Cabac<'a> {
 				return 0;
 			}
 		}
-		let (sig_base, last_base, abs_base) = if cat == BlockCat::Luma8x8 {
-			(ctx::SIG_8X8, ctx::LAST_8X8, ctx::ABS_8X8)
-		} else {
-			(ctx::SIG + SIG_OFFSET[c], ctx::LAST + SIG_OFFSET[c], ctx::ABS + ABS_OFFSET[c])
+		let (sig_base, last_base, abs_base) = match (cat == BlockCat::Luma8x8, self.field) {
+			(true, false) => (ctx::SIG_8X8, ctx::LAST_8X8, ctx::ABS_8X8),
+			(true, true) => (ctx::SIG_8X8_FIELD, ctx::LAST_8X8_FIELD, ctx::ABS_8X8),
+			(false, false) => {
+				(ctx::SIG + SIG_OFFSET[c], ctx::LAST + SIG_OFFSET[c], ctx::ABS + ABS_OFFSET[c])
+			}
+			(false, true) => {
+				(ctx::SIG_FIELD + SIG_OFFSET[c], ctx::LAST_FIELD + SIG_OFFSET[c], ctx::ABS + ABS_OFFSET[c])
+			}
 		};
+		let sig8 =
+			if self.field { &super::consts::SIG_8X8_FIELD_CTX } else { &super::consts::SIG_8X8_CTX };
+		// Chroma DC: NumC8x8 = 1 (4:2:0, 4 coefficients) or 2 (4:2:2, 8).
+		let dc_div = (max / 4).max(1);
 		let mut sig = [0u8; 64];
 		let mut count = 0usize;
 		let mut i = 0usize;
 		while i + 1 < max {
 			let (si, li) = match cat {
-				BlockCat::ChromaDc => (i.min(2), i.min(2)),
-				BlockCat::Luma8x8 => {
-					(usize::from(super::consts::SIG_8X8_CTX[i]), usize::from(super::consts::LAST_8X8_CTX[i]))
-				}
+				BlockCat::ChromaDc => ((i / dc_div).min(2), (i / dc_div).min(2)),
+				BlockCat::Luma8x8 => (usize::from(sig8[i]), usize::from(super::consts::LAST_8X8_CTX[i])),
 				_ => (i, i),
 			};
 			if self.decision(sig_base + si) {

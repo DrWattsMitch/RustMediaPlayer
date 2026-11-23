@@ -243,3 +243,184 @@ fn frames_outlive_the_decoder() {
 		assert!(f.data()[..] == want[i * size..(i + 1) * size], "frame {i}");
 	}
 }
+
+/// FNV-1a 64 of the decoded planar output (as `tools/make_h264_fixtures.sh`
+/// computes it from FFmpeg's).
+fn fnv1a(data: &[u8]) -> u64 {
+	data
+		.iter()
+		.fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// Decodes a raw Annex B stream (one packet) with `threads` frame threads.
+fn decode_annex_b(path: &str, threads: usize) -> (Vec<rmp::codecs::h264::DecodedPicture>, u64) {
+	let data = fixture(path);
+	let mut dec = H264DecoderState::with_threads(&[], threads);
+	let mut pictures = dec.decode_packet(&data, None).unwrap();
+	pictures.extend(dec.flush());
+	(pictures, dec.damaged_slices)
+}
+
+struct Expect {
+	path: &'static str,
+	size: (u32, u32),
+	bit_depth: u32,
+	chroma_422: bool,
+	/// FNV-1a of FFmpeg's planar output.
+	hash: u64,
+}
+
+const HIGH_PROFILES: &[Expect] = &[
+	// High 10: CABAC, B-pyramid, explicit weighted prediction, cropping.
+	Expect {
+		path: "h264/h264_high10.264",
+		size: (120, 88),
+		bit_depth: 10,
+		chroma_422: false,
+		hash: 0xccd6_1130_14b4_9b5d,
+	},
+	// High 4:2:2, 10-bit: 2x4 chroma DC (CABAC), 8x16 chroma prediction.
+	Expect {
+		path: "h264/h264_high422_10.264",
+		size: (120, 88),
+		bit_depth: 10,
+		chroma_422: true,
+		hash: 0x900f_a4d8_9b72_df50,
+	},
+	// High 4:2:2, 8-bit CAVLC: the 4:2:2 chroma DC coeff_token tables.
+	Expect {
+		path: "h264/h264_high422_cavlc.264",
+		size: (120, 88),
+		bit_depth: 8,
+		chroma_422: true,
+		hash: 0xb255_576a_a291_506e,
+	},
+];
+
+const INTERLACED: &[Expect] = &[
+	// MBAFF frames (adaptive frame/field pairs), CABAC, B-pyramid, weights.
+	Expect {
+		path: "h264/h264_mbaff.264",
+		size: (128, 96),
+		bit_depth: 8,
+		chroma_422: false,
+		hash: 0xddd0_0037_be5d_2494,
+	},
+	// MBAFF, CAVLC, 4:2:2 10-bit, temporal direct (broadcast contribution).
+	Expect {
+		path: "h264/h264_mbaff_422_10_cavlc.264",
+		size: (128, 96),
+		bit_depth: 10,
+		chroma_422: true,
+		hash: 0x37bd_f980_dae5_9382,
+	},
+	// PAFF field pictures, bottom field first, B fields with temporal direct.
+	Expect {
+		path: "h264/h264_paff_bff.264",
+		size: (128, 96),
+		bit_depth: 8,
+		chroma_422: false,
+		hash: 0x360a_44b6_4bf8_8170,
+	},
+	// MBAFF frames and field pairs referencing each other (colocated
+	// macroblocks across structures).
+	Expect {
+		path: "h264/h264_paff_mbaff_mix.264",
+		size: (128, 96),
+		bit_depth: 8,
+		chroma_422: false,
+		hash: 0xf143_c5ec_ee76_8a2d,
+	},
+];
+
+fn check(e: &Expect) {
+	let (pictures, damaged) = decode_annex_b(e.path, 1);
+	assert_eq!(pictures.len(), 12, "{}", e.path);
+	assert_eq!(damaged, 0, "{}", e.path);
+	let mut out = Vec::new();
+	for p in &pictures {
+		assert_eq!((p.width, p.height), e.size, "{}", e.path);
+		assert_eq!((p.bit_depth, p.chroma_422), (e.bit_depth, e.chroma_422), "{}", e.path);
+		out.extend(p.data());
+	}
+	let bytes = if e.bit_depth > 8 { 2 } else { 1 };
+	let (w, h) = (e.size.0 as usize, e.size.1 as usize);
+	let chroma = if e.chroma_422 { w * h } else { w * h / 2 };
+	assert_eq!(out.len(), 12 * (w * h + chroma) * bytes, "{}", e.path);
+	assert_eq!(fnv1a(&out), e.hash, "{} differs from FFmpeg", e.path);
+}
+
+#[test]
+fn high10_and_high422_are_bit_exact() {
+	HIGH_PROFILES.iter().for_each(check);
+}
+
+#[test]
+fn interlaced_paff_and_mbaff_are_bit_exact() {
+	INTERLACED.iter().for_each(check);
+}
+
+#[test]
+fn interlaced_and_high_bit_depth_frame_threading_is_bit_exact() {
+	for e in HIGH_PROFILES.iter().chain(INTERLACED) {
+		let (serial, _) = decode_annex_b(e.path, 1);
+		let serial: Vec<Vec<u8>> = serial.iter().map(|p| p.data()).collect();
+		for threads in [2, 4] {
+			let (threaded, damaged) = decode_annex_b(e.path, threads);
+			let threaded: Vec<Vec<u8>> = threaded.iter().map(|p| p.data()).collect();
+			assert!(threaded == serial, "{}: {threads} threads differ", e.path);
+			assert_eq!(damaged, 0);
+		}
+	}
+}
+
+/// Through the Decoder trait the frames carry their pixel format.
+#[test]
+fn decoder_trait_reports_depth_and_chroma_format() {
+	use rmp::core::video::PixelFormat;
+	for (path, depth, format) in [
+		("h264/h264_high422_10.264", 10, PixelFormat::YUV422),
+		("h264/h264_mbaff.264", 8, PixelFormat::YUV420),
+	] {
+		let decoder = H264Decoder::new();
+		let id = rmp::core::StreamId(0);
+		let stream = Stream::video(id, 0, 0, "yuv420p", rmp::core::CodecId::new("h264"));
+		let mut state = decoder.create_state(&stream.parameters);
+		let packet = Packet::new(id, fixture(path));
+		let mut frames = decoder.decode(&mut state, packet).unwrap().value;
+		frames.extend(decoder.flush(&mut state).unwrap().value);
+		assert_eq!(frames.len(), 12, "{path}");
+		for f in frames {
+			let Frame::Video(v) = f else { panic!("video expected") };
+			assert_eq!((v.pixel.depth, v.pixel.format), (depth, format), "{path}");
+			let bytes = if depth > 8 { 2 } else { 1 };
+			assert_eq!(v.plane(0).unwrap().row_bytes(), v.width as usize * bytes, "{path}");
+		}
+	}
+}
+
+/// Damaged interlaced and high bit depth streams: no panic, and frame
+/// threads conceal exactly like one thread.
+#[test]
+fn damaged_interlaced_streams_conceal_identically_with_threads() {
+	let mut rng = crate::common::Rng::new(7);
+	for e in HIGH_PROFILES.iter().chain(INTERLACED) {
+		for round in 0..3 {
+			let mut data = fixture(e.path);
+			let n = data.len();
+			for _ in 0..8 + round * 8 {
+				let at = 64 + (rng.next() as usize) % (n - 64);
+				data[at] ^= 1 << (rng.next() % 8);
+			}
+			let run = |threads: usize| {
+				let mut dec = H264DecoderState::with_threads(&[], threads);
+				let mut out: Vec<Vec<u8>> =
+					dec.decode_packet(&data, None).unwrap_or_default().iter().map(|p| p.data()).collect();
+				out.extend(dec.flush().iter().map(|p| p.data()));
+				out
+			};
+			let serial = run(1);
+			assert!(run(3) == serial, "{} round {round}: threads differ", e.path);
+		}
+	}
+}

@@ -193,7 +193,9 @@ Ratios above 1 mean RMP is slower.
 - **HEVC, single thread:** RMP is 1.5–2.2x behind FFmpeg (FFmpeg uses
   hand-written assembly), against 2.3x for RMP's H.264 decoder.
 - **HEVC, auto:** frame threading took the gap from 2.75x to about 1.7x;
-  RMP now scales like FFmpeg. The HEVC rows were re-measured for that
+  RMP now scales like FFmpeg. On a 14-core Apple-silicon Mac (FFmpeg
+  9.0.2) the gap with all cores is 1.0–1.5x, and 10-bit matches FFmpeg on
+  one thread. The HEVC rows were re-measured for that
   change on a noisier VM, so they don't compare one to one with the other
   rows. See `docs/THREADING.md` for the full HEVC threading table.
 
@@ -210,8 +212,8 @@ HEVC speed during this work, on a 1080p clip, single thread:
 ### What's left (HEVC)
 
 1. **Threading** is done (`docs/THREADING.md`). Frame threads are the
-   default and WPP row threads are optional. Neither was measured on more
-   than two vCPUs for this change.
+   default, plus 2 WPP row threads per picture from 8 threads up.
+   `tools/bench_hevc.sh` measures RMP against FFmpeg on any machine.
 2. **Kernels.** Profile of the 4.7 Mb/s clip, single thread, inclusive:
    - inter prediction (MV prediction + MC): about 38%
    - in-loop filters: about 22%, including the SAO band copy
