@@ -4,7 +4,7 @@
 //! result equals filtering the whole picture at once; see
 //! [`PicState::advance`].
 
-use super::ctu::{PicState, chroma_qp};
+use super::ctu::{PicState, chroma_qp_for};
 use super::picture::Plane;
 
 const TC_TABLE: [i32; 54] = [
@@ -73,11 +73,16 @@ impl PicState {
 					}
 				}
 			}
-			// Chroma (4:2:0): edges on the 8x8 chroma grid, bS == 2 only.
-			for c in 1..3 {
+			// Chroma: edges on the 8x8 chroma sample grid, bS == 2 only, in
+			// segments of 4 chroma lines.
+			for c in 1..self.sps.num_comps() {
 				let cs = self.planes[c].stride;
-				let (xs, ys, xstep, ystep) = if dir == 0 { (16, 0, 16, 8) } else { (0, 16, 8, 16) };
+				let (hs, vs) = (self.sps.hshift[c], self.sps.vshift[c]);
+				let (gx, gy) = (8 << hs, 8 << vs);
+				let (xs, ys, xstep, ystep) =
+					if dir == 0 { (gx, 0, gx, 4 << vs) } else { (0, gy, 4 << hs, gy) };
 				let qp_off = if c == 1 { self.pps.cb_qp_offset } else { self.pps.cr_qp_offset };
+				let cf = self.sps.chroma_format_idc;
 				for y in (ys.max(y0)..h).step_by(ystep) {
 					for x in (xs..w).step_by(xstep) {
 						let i4 = (y >> 2) * self.w4 + (x >> 2);
@@ -88,14 +93,14 @@ impl PicState {
 						let (xp, yp) = if dir == 0 { (x - 1, y) } else { (x, y - 1) };
 						let qp = (self.qp_at(xp, yp) + self.qp_at(x, y) + 1) >> 1;
 						let tc_off = self.slice_at(x, y).tc_offset;
-						let qpc = chroma_qp((qp + qp_off).clamp(0, 57));
+						let qpc = chroma_qp_for(cf, (qp + qp_off).clamp(0, 57));
 						let tc = TC_TABLE[(qpc + 2 + tc_off).clamp(0, 53) as usize] << (bd - 8);
 						if tc == 0 {
 							continue;
 						}
 						let (no_p, no_q) = (self.nf(xp, yp), self.nf(x, y));
 						let plane = &mut self.planes[c];
-						let at = plane.idx((x / 2) as isize, (y / 2) as isize);
+						let at = plane.idx((x >> hs) as isize, (y >> vs) as isize);
 						let (xstr, ystr) = if dir == 0 { (1, cs) } else { (cs, 1) };
 						chroma_edge(&mut plane.data, at, xstr, ystr, tc, no_p, no_q, max);
 					}
@@ -167,9 +172,10 @@ impl PicState {
 			if !self.sao[r * cw..(r + 1) * cw].iter().any(|s| s.type_idx[c] != 0) {
 				continue;
 			}
-			let sh = usize::from(c > 0);
+			let (hs, vs) = (self.sps.hshift[c] as usize, self.sps.vshift[c] as usize);
 			let (pw, ph) = (self.planes[c].width, self.planes[c].height);
-			let ctb = (1usize << log2) >> sh;
+			// CTB width and height in this component's samples.
+			let (ctb_w, ctb) = ((1usize << log2) >> hs, (1usize << log2) >> vs);
 			// The deblocked rows y0 - 1 ..= y1 of this band, the rows SAO reads.
 			// Row y0 - 1 has already had SAO applied with the band above, so
 			// it comes from the copy kept then.
@@ -203,9 +209,9 @@ impl PicState {
 				if t == 0 {
 					continue;
 				}
-				let x0 = cx * ctb;
+				let x0 = cx * ctb_w;
 				let y0 = cy * ctb;
-				let x1 = (x0 + ctb).min(pw);
+				let x1 = (x0 + ctb_w).min(pw);
 				let y1 = (y0 + ctb).min(ph);
 				let off = &sao.offset[c];
 				if t == 1 {
@@ -267,7 +273,7 @@ impl PicState {
 							}
 							let dx = if nx < x0 as isize {
 								0
-							} else if nx >= (x0 + ctb) as isize {
+							} else if nx >= (x0 + ctb_w) as isize {
 								2
 							} else {
 								1
@@ -307,7 +313,7 @@ impl PicState {
 					let dst = &mut self.planes[c].data[boff..];
 					for y in y0..y1 {
 						for x in x0..x1 {
-							let (lx, ly) = (x << sh, y << sh);
+							let (lx, ly) = (x << hs, y << vs);
 							if self.no_filter[(ly >> 2) * self.w4 + (lx >> 2)] != 0 {
 								let at = src.idx(x as isize, y as isize);
 								dst[at] = src.data[at];
@@ -567,7 +573,7 @@ impl PicState {
 		if self.rows_final > prev {
 			let last = self.rows_final == ch;
 			for (c, p) in self.planes.iter_mut().enumerate() {
-				let sh = u32::from(c > 0);
+				let sh = self.sps.vshift[c];
 				p.extend_rows((prev << log2) >> sh, (self.rows_final << log2) >> sh);
 				if prev == 0 {
 					p.extend_top();
@@ -596,7 +602,7 @@ impl PicState {
 			if final_now > prev {
 				for c in 0..3 {
 					let (src, dst) = (&self.planes[c], &mut live.planes[c]);
-					let sh = u32::from(c > 0);
+					let sh = self.sps.vshift[c];
 					let y0 = if prev == 0 { -(src.pad as isize) } else { ((prev << log2) >> sh) as isize };
 					let y1 = ((final_now << log2) >> sh).min(src.height) as isize;
 					let r = src.rows_range(y0, y1);

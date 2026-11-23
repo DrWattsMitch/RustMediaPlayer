@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use super::ctu::{PicState, SliceDecoder, SliceRefs};
-use super::picture::{Frame, FrameRef, MvField, PAD_CHROMA, PAD_LUMA, Plane, RefInfo, RefPic};
+use super::picture::{Frame, FrameRef, MvField, RefInfo, RefPic, picture_planes};
 use super::ps::{Layout, MAX_PPS, MAX_SPS, Pps, Sps};
 use super::slice::{self, SliceHeader, SliceType, is_idr, is_irap, nal};
 use super::wpp::{self, Workspaces};
@@ -21,8 +21,11 @@ pub struct OutputPicture {
 	pub width: u32,
 	pub height: u32,
 	pub bit_depth: u32,
-	/// Packed planar 4:2:0: one byte per sample at 8-bit, little-endian
-	/// u16 above.
+	/// chroma_format_idc: 0 monochrome (luma plane only), 1 4:2:0, 2 4:2:2,
+	/// 3 4:4:4.
+	pub chroma_format: u32,
+	/// Packed planar: one byte per sample at 8-bit, little-endian u16
+	/// above.
 	pub data: Vec<u8>,
 	pub pts: Option<Time>,
 	pub keyframe: bool,
@@ -406,7 +409,11 @@ impl HevcDecoderState {
 		let sps = self.sps[pps.sps_id].clone().ok_or(HevcError("hevc: missing sps"))?;
 		let layout = self.layouts[sh.pps_id].clone().ok_or(HevcError("hevc: missing pps layout"))?;
 		if let Some(a) = &self.active_sps {
-			if a.width != sps.width || a.height != sps.height || a.bit_depth != sps.bit_depth {
+			if a.width != sps.width
+				|| a.height != sps.height
+				|| a.bit_depth != sps.bit_depth
+				|| a.chroma_format_idc != sps.chroma_format_idc
+			{
 				// New sequence geometry: output everything first.
 				while self.bump() {}
 				self.dpb.clear();
@@ -585,6 +592,7 @@ impl HevcDecoderState {
 				f.planes[0].width == sps.width as usize
 					&& f.planes[0].height == sps.height as usize
 					&& f.log2_ctb_size == sps.log2_ctb_size
+					&& f.chroma_format == sps.chroma_format_idc
 			});
 			k.map(|k| Box::new(pool.swap_remove(k)))
 		};
@@ -718,11 +726,7 @@ fn blank_frame(sps: &Sps, poc: i32, fill: u16) -> Frame {
 	let (w, h) = (sps.width as usize, sps.height as usize);
 	let w4 = w.div_ceil(4);
 	Frame {
-		planes: [
-			Plane::new(w, h, PAD_LUMA, fill),
-			Plane::new(w / 2, h / 2, PAD_CHROMA, fill),
-			Plane::new(w / 2, h / 2, PAD_CHROMA, fill),
-		],
+		planes: picture_planes(sps, fill),
 		poc,
 		mvf: vec![MvField::default(); w4 * h.div_ceil(4)],
 		w4,
@@ -731,6 +735,7 @@ fn blank_frame(sps: &Sps, poc: i32, fill: u16) -> Frame {
 		log2_ctb_size: sps.log2_ctb_size,
 		ctb_width: sps.ctb_width as usize,
 		bit_depth: sps.bit_depth,
+		chroma_format: sps.chroma_format_idc,
 	}
 }
 
@@ -905,7 +910,15 @@ fn output_picture(
 	let [l, r, t, b] = crop.map(|v| v as usize);
 	let w = f.planes[0].width - l - r;
 	let h = f.planes[0].height - t - b;
-	OutputPicture { width: w as u32, height: h as u32, bit_depth: f.bit_depth, data, pts, keyframe }
+	OutputPicture {
+		width: w as u32,
+		height: h as u32,
+		bit_depth: f.bit_depth,
+		chroma_format: f.chroma_format,
+		data,
+		pts,
+		keyframe,
+	}
 }
 
 /// The cropped samples of a frame, packed planar.
@@ -915,9 +928,17 @@ fn crop_samples(f: &Frame, crop: [u32; 4]) -> Vec<u8> {
 	let w = f.planes[0].width - l - r;
 	let h = f.planes[0].height - t - b;
 	let wide = f.bit_depth > 8;
-	let mut data = Vec::with_capacity(w * h * 3 / 2 * if wide { 2 } else { 1 });
-	for (c, p) in f.planes.iter().enumerate() {
-		let (x0, y0, pw, ph) = if c == 0 { (l, t, w, h) } else { (l / 2, t / 2, w / 2, h / 2) };
+	// Chroma subsampling shifts (the crop is in whole chroma samples).
+	let (hs, vs) = match f.chroma_format {
+		1 => (1, 1),
+		2 => (1, 0),
+		_ => (0, 0),
+	};
+	let ncomp = if f.chroma_format == 0 { 1 } else { 3 };
+	let samples = w * h + (ncomp - 1) * (w >> hs) * (h >> vs);
+	let mut data = Vec::with_capacity(samples * if wide { 2 } else { 1 });
+	for (c, p) in f.planes.iter().enumerate().take(ncomp) {
+		let (x0, y0, pw, ph) = if c == 0 { (l, t, w, h) } else { (l >> hs, t >> vs, w >> hs, h >> vs) };
 		for y in 0..ph {
 			let at = p.idx(x0 as isize, (y0 + y) as isize);
 			let row = &p.data[at..at + pw];

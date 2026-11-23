@@ -65,6 +65,8 @@ pub struct SliceHeader {
 	pub slice_qp: i32,
 	pub cb_qp_offset: i32,
 	pub cr_qp_offset: i32,
+	/// cu_chroma_qp_offset_enabled_flag (range extensions).
+	pub cu_chroma_qp_offset_enabled: bool,
 	pub deblocking_disabled: bool,
 	pub beta_offset: i32,
 	pub tc_offset: i32,
@@ -233,7 +235,9 @@ pub fn parse(
 	let (mut sao_luma, mut sao_chroma) = (false, false);
 	if sps.sao_enabled {
 		sao_luma = bs.bit();
-		sao_chroma = bs.bit();
+		if sps.has_chroma() {
+			sao_chroma = bs.bit();
+		}
 	}
 	let mut num_ref_idx = [0u32; 2];
 	let mut list_entry = [None, None];
@@ -303,6 +307,7 @@ pub fn parse(
 			"hevc: chroma qp offset",
 		)?;
 	}
+	let cu_chroma_qp_offset_enabled = pps.chroma_qp_offset_list_enabled && bs.bit();
 	let mut deblocking_disabled = pps.deblocking_disabled;
 	let mut beta_offset = pps.beta_offset;
 	let mut tc_offset = pps.tc_offset;
@@ -346,6 +351,7 @@ pub fn parse(
 		slice_qp,
 		cb_qp_offset,
 		cr_qp_offset,
+		cu_chroma_qp_offset_enabled,
 		deblocking_disabled,
 		beta_offset,
 		tc_offset,
@@ -406,12 +412,21 @@ fn pred_weight_table(
 ) -> Result<PredWeights, SliceError> {
 	let luma_log2_denom = bs.ue();
 	check(luma_log2_denom <= 7, "hevc: invalid luma weight denominator")?;
-	let chroma_log2_denom = (luma_log2_denom as i32).saturating_add(bs.se()) as u32;
-	check(chroma_log2_denom <= 7, "hevc: invalid chroma weight denominator")?;
+	let chroma = sps.has_chroma();
+	let mut chroma_log2_denom = 0;
+	if chroma {
+		chroma_log2_denom = (luma_log2_denom as i32).saturating_add(bs.se()) as u32;
+		check(chroma_log2_denom <= 7, "hevc: invalid chroma weight denominator")?;
+	}
 	let mut l = [[Weight::default(); 16]; 2];
 	let lists = if slice_type == SliceType::B { 2 } else { 1 };
-	let high = 1 << (sps.bit_depth - 1).min(7); // WpOffsetHalfRangeC (no high precision offsets)
-	let shift = sps.bit_depth - 8;
+	// WpOffsetHalfRange (7-xx): offsets are in sample units with
+	// high_precision_offsets_enabled_flag, else in 8-bit units scaled up.
+	let (half, shift) = if sps.high_precision_offsets {
+		(1i32 << (sps.bit_depth - 1), 0)
+	} else {
+		(128, sps.bit_depth - 8)
+	};
 	for list in 0..lists {
 		let n = num_ref_idx[list] as usize;
 		let mut luma_flags = [false; 16];
@@ -419,8 +434,10 @@ fn pred_weight_table(
 		for f in luma_flags.iter_mut().take(n) {
 			*f = bs.bit();
 		}
-		for f in chroma_flags.iter_mut().take(n) {
-			*f = bs.bit();
+		if chroma {
+			for f in chroma_flags.iter_mut().take(n) {
+				*f = bs.bit();
+			}
 		}
 		for i in 0..n {
 			let w = &mut l[list][i];
@@ -431,7 +448,7 @@ fn pred_weight_table(
 				check((-128..=127).contains(&dw), "hevc: invalid luma weight")?;
 				w.luma_weight += dw;
 				let off = bs.se();
-				check((-128..=127).contains(&off), "hevc: invalid luma offset")?;
+				check((-half..half).contains(&off), "hevc: invalid luma offset")?;
 				w.luma_offset = off << shift;
 			}
 			if chroma_flags[i] {
@@ -440,14 +457,13 @@ fn pred_weight_table(
 					check((-128..=127).contains(&dw), "hevc: invalid chroma weight")?;
 					w.chroma_weight[c] += dw;
 					let doff = bs.se();
-					check((-512..=511).contains(&doff), "hevc: invalid chroma offset")?;
-					let off =
-						(doff - ((128 * w.chroma_weight[c]) >> chroma_log2_denom) + 128).clamp(-128, 127);
+					check((-4 * half..4 * half).contains(&doff), "hevc: invalid chroma offset")?;
+					let off = (doff - ((half * w.chroma_weight[c]) >> chroma_log2_denom) + half)
+						.clamp(-half, half - 1);
 					w.chroma_offset[c] = off << shift;
 				}
 			}
 		}
 	}
-	let _ = high;
 	Ok(PredWeights { luma_log2_denom, chroma_log2_denom, l })
 }

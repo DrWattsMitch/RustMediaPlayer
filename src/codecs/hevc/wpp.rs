@@ -153,9 +153,9 @@ fn cols(pic: &PicState, c0: usize, c1: usize) -> (usize, usize) {
 impl Edge {
 	fn new(pic: &PicState) -> Self {
 		let sps = &*pic.sps;
-		let (w, cw) = (sps.width as usize, sps.ctb_width as usize);
+		let cw = sps.ctb_width as usize;
 		Self {
-			planes: [vec![0; w], vec![0; w / 2], vec![0; w / 2]],
+			planes: [0, 1, 2].map(|c| vec![0; sps.plane_size(c).0]),
 			mvf: vec![MvField::default(); pic.w4],
 			cbf: vec![0; pic.w4],
 			skip: vec![0; sps.min_cb_width as usize],
@@ -185,12 +185,12 @@ impl Edge {
 				grid[at + a..at + b].copy_from_slice(&edge[a..b]);
 			}
 		}
-		for c in 0..3 {
-			let sh = usize::from(c > 0);
+		for c in 0..pic.sps.num_comps() {
+			let (hs, vs) = (pic.sps.hshift[c] as usize, pic.sps.vshift[c] as usize);
 			let p = &mut pic.planes[c];
-			let y = if c == 0 { l.y } else { ((l.y + 1) >> 1) - 1 };
+			let y = ((l.y + 1) >> vs) - 1;
 			let at = p.idx(0, y as isize);
-			mv(&mut self.planes[c], &mut p.data, at, x0 >> sh, x1 >> sh, export);
+			mv(&mut self.planes[c], &mut p.data, at, x0 >> hs, x1 >> hs, export);
 		}
 		let (a4, b4) = (x0 >> 2, x1.div_ceil(4).min(pic.w4));
 		let at4 = l.y4 * pic.w4;
@@ -292,12 +292,12 @@ fn export_column(e: &mut Edge, pic: &PicState, cy: usize, cx: usize) {
 	let lcb = pic.sps.log2_min_cb_size;
 	let mcw = pic.sps.min_cb_width as usize;
 	let cw = pic.sps.ctb_width as usize;
-	for c in 0..3 {
-		let sh = usize::from(c > 0);
+	for c in 0..pic.sps.num_comps() {
+		let (hs, vs) = (pic.sps.hshift[c] as usize, pic.sps.vshift[c] as usize);
 		let p = &pic.planes[c];
-		let y = if c == 0 { l.y } else { ((l.y + 1) >> 1) - 1 };
+		let y = ((l.y + 1) >> vs) - 1;
 		let at = p.idx(0, y as isize);
-		let (a, b) = (x0 >> sh, x1 >> sh);
+		let (a, b) = (x0 >> hs, x1 >> hs);
 		e.planes[c][a..b].copy_from_slice(&p.data[at + a..at + b]);
 	}
 	let (a4, b4) = (x0 >> 2, x1.div_ceil(4).min(pic.w4));
@@ -357,12 +357,12 @@ fn copy_rect<T: Copy>(dst: &mut [T], src: &[T], stride: usize, r: [usize; 4]) {
 fn reset_ctb(pic: &mut PicState, cx: usize, cy: usize) {
 	let r = rect(pic, cy, cx, cx + 1);
 	let mid = 1u16 << (pic.sps.bit_depth - 1);
-	for c in 0..3 {
-		let sh = usize::from(c > 0);
+	for c in 0..pic.sps.num_comps() {
+		let (hs, vs) = (pic.sps.hshift[c] as usize, pic.sps.vshift[c] as usize);
 		let p = &mut pic.planes[c];
-		for y in r.luma[0] >> sh..r.luma[1] >> sh {
+		for y in r.luma[0] >> vs..r.luma[1] >> vs {
 			let at = p.idx(0, y as isize);
-			p.data[at + (r.luma[2] >> sh)..at + (r.luma[3] >> sh)].fill(mid);
+			p.data[at + (r.luma[2] >> hs)..at + (r.luma[3] >> hs)].fill(mid);
 		}
 	}
 	let w4 = pic.w4;
@@ -386,12 +386,12 @@ fn reset_ctb(pic: &mut PicState, cx: usize, cy: usize) {
 /// `decoded` of them completed (the next one may be partial).
 fn merge_row(pic: &mut PicState, ws: &PicState, cy: usize, n: usize, decoded: usize) {
 	let r = rect(pic, cy, 0, n);
-	for c in 0..3 {
-		let sh = usize::from(c > 0);
+	for c in 0..pic.sps.num_comps() {
+		let (hs, vs) = (pic.sps.hshift[c] as usize, pic.sps.vshift[c] as usize);
 		let (d, s) = (&mut pic.planes[c], &ws.planes[c]);
-		for y in r.luma[0] >> sh..r.luma[1] >> sh {
+		for y in r.luma[0] >> vs..r.luma[1] >> vs {
 			let at = d.idx(0, y as isize);
-			let (a, b) = (at + (r.luma[2] >> sh), at + (r.luma[3] >> sh));
+			let (a, b) = (at + (r.luma[2] >> hs), at + (r.luma[3] >> hs));
 			d.data[a..b].copy_from_slice(&s.data[a..b]);
 		}
 	}

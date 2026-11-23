@@ -58,8 +58,10 @@ The decoder supports Main, Main 10 and Main 12 at 4:2:0, including:
 - long-term references and generated missing references
 - `hvcC` and Annex B input, and cropping
 
-Not supported: 4:0:0, 4:2:2 and 4:4:4, and the range, SCC and multi-layer
-extensions. These are rejected with an error.
+The format range extensions (4:0:0, 4:2:2, 4:4:4 and the RExt coding
+tools, up to 12 bits) were added later; see `docs/HEVC_RANGE_EXTENSIONS.md`.
+Not supported: the 16-bit profiles, separate colour planes, and the SCC
+and multi-layer extensions. These are rejected with an error.
 
 | File | Contents |
 |---|---|

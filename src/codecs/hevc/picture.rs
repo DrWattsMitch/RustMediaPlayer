@@ -12,6 +12,21 @@ use crate::codecs::threading::Progress;
 pub const PAD_LUMA: usize = 80;
 pub const PAD_CHROMA: usize = 40;
 
+/// The three planes of a picture of `sps`'s size and chroma format, filled
+/// with `fill`. Monochrome pictures get empty chroma planes. Chroma planes
+/// are padded like luma unless subsampled both ways (a 4:4:4 or 4:2:2
+/// chroma block is as tall, or as wide, as its luma block, and motion
+/// compensation needs the whole block plus its filter taps to fit in the
+/// padding).
+pub fn picture_planes(sps: &super::ps::Sps, fill: u16) -> [Plane; 3] {
+	let plane = |c: usize| {
+		let (w, h) = sps.plane_size(c);
+		let pad = if c == 0 || sps.chroma_format_idc != 1 { PAD_LUMA } else { PAD_CHROMA };
+		if w == 0 { Plane::new(0, 0, 0, fill) } else { Plane::new(w, h, pad, fill) }
+	};
+	[plane(0), plane(1), plane(2)]
+}
+
 /// One plane of samples (8-bit streams use the low 8 bits).
 #[derive(Clone)]
 pub struct Plane {
@@ -134,6 +149,8 @@ pub struct Frame {
 	pub ctb_width: usize,
 	/// Bit depth of the samples.
 	pub bit_depth: u32,
+	/// chroma_format_idc of the planes.
+	pub chroma_format: u32,
 }
 
 /// A picture in the DPB, possibly still being decoded by a picture job on

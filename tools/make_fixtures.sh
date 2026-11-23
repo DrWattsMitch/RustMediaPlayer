@@ -209,6 +209,35 @@ ff -i process/tone_44k_stereo.wav -ar 8000 -ac 1 -f f32le process/tone_8k_mono.f
 # 	-pix_fmt yuv420p10le -x265-params "log-level=error:keyint=10:bframes=2:wpp=1:ctu=16:slices=3:weightb=1" \
 # 	hevc/x265_wpp_ctu16_slices.mkv
 # for n in x265_wpp.mp4 x265_wpp_ctu16_slices.mkv; do ff -threads 1 -i hevc/$n -f framecrc hevc/${n%.*}.framecrc; done
+# Range extensions (docs/HEVC_RANGE_EXTENSIONS.md). FFmpeg 6.1 references, except
+# x265_422_ctu16 and x265_444_odd: x265's own reconstruction (8-bit recon only).
+# ff -f lavfi -i testsrc2=size=160x96:rate=25 -vf noise=alls=8:allf=t,format=gray12le -frames:v 8 -c:v libx265 \
+# 	-x265-params "log-level=error:keyint=8:bframes=3:wpp=1:ref=2" hevc/x265_400_12.mp4
+# ff -f lavfi -i testsrc2=size=192x128:rate=25 -vf noise=alls=8:allf=t,fade=in:0:5,format=yuv422p10le -frames:v 8 \
+# 	-c:v libx265 -x265-params "log-level=error:keyint=8:bframes=3:b-pyramid=1:tskip=1:scaling-list=default:weightb=1:slices=2:amp=1:rd=6" \
+# 	hevc/x265_422_10.mkv
+# ff -f lavfi -i testsrc2=size=128x96:rate=25 -vf noise=alls=8:allf=t,fade=in:0:5,format=yuv444p12le -frames:v 8 \
+# 	-c:v libx265 -x265-params "log-level=error:keyint=8:bframes=2:min-cu-size=8:tskip=1:constrained-intra=1:amp=1:weightp=1:rd=6:tu-intra-depth=3" \
+# 	hevc/x265_444_12.mp4
+# for n in x265_400_12.mp4 x265_422_10.mkv x265_444_12.mp4; do ff -threads 1 -i hevc/$n -f framecrc hevc/${n%.*}.framecrc; done
+# ff -f lavfi -i "testsrc2=size=176x144:rate=25,noise=alls=20:allf=t" -frames:v 10 -pix_fmt yuv422p -f rawvideo /tmp/s422.yuv
+# x265 --input /tmp/s422.yuv --input-res 176x144 --input-csp i422 --fps 25 --frames 10 --ctu 16 --bframes 3 \
+# 	--cu-lossless --rd 6 --recon /tmp/r422.yuv -o /tmp/x422.hevc
+# ff -r 25 -i /tmp/x422.hevc -c copy hevc/x265_422_ctu16.mp4
+# ff -f rawvideo -s 176x144 -pix_fmt yuv422p -r 25 -i /tmp/r422.yuv -f framecrc hevc/x265_422_ctu16.framecrc
+# ff -f lavfi -i "testsrc2=size=131x71:rate=25,noise=alls=12:allf=t" -frames:v 8 -pix_fmt yuv444p -f rawvideo /tmp/s444.yuv
+# x265 --input /tmp/s444.yuv --input-res 131x71 --input-csp i444 --fps 25 --frames 8 --bframes 2 --cu-lossless \
+# 	--rd 6 --wpp --recon /tmp/r444.yuv -o /tmp/x444.hevc
+# ff -r 25 -i /tmp/x444.hevc -c copy hevc/x265_444_odd.mp4
+# ff -f rawvideo -s 131x71 -pix_fmt yuv444p -r 25 -i /tmp/r444.yuv -f framecrc hevc/x265_444_odd.framecrc
+# Synthetic RExt tool streams (all: frames=8 density=0.25 ctb=64 max_tb=32 bytes=700):
+#   rext_444 101 chroma=3 depth=8 scaling=1
+#   rext_444_lossless 102 chroma=3 depth=10 bypass=1 ts_rotation=0 implicit_rdpcm=0 cu_qp_delta=1
+#   rext_422_12 103 chroma=2 depth=12 sao_scale_luma=2 sao_scale_chroma=1 intra_smoothing_disabled=1 log2_max_ts=5
+#   rext_420_10 104 chroma=1 depth=10 cu_qp_delta=1 sign_hiding=0
+#   rext_400_8 105 chroma=0 depth=8 bypass=1 ts_rotation=0 implicit_rdpcm=0
+# python3 tools/hevc_rext_streams.py /tmp/NAME.hevc SEED frames=8 density=0.25 ctb=64 max_tb=32 bytes=700 ARGS...
+# ff -r 25 -i /tmp/NAME.hevc -c copy hevc/NAME.mp4; ff -threads 1 -i /tmp/NAME.hevc -f framecrc hevc/NAME.framecrc
 
 # --- MPEG-TS, HLS and DASH -------------------------------------------------
 # Needs FFmpeg with libx264 and libx265. References are ffprobe dumps with

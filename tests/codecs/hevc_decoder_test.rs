@@ -50,16 +50,30 @@ fn decode(demuxer: &mut dyn Demuxer) -> Vec<VideoFrame> {
 }
 
 fn check(name: &str, frames: &[VideoFrame], size: (u32, u32), depth: u8) {
+	check_format(name, frames, size, depth, PixelFormat::YUV420);
+}
+
+fn check_format(
+	name: &str,
+	frames: &[VideoFrame],
+	size: (u32, u32),
+	depth: u8,
+	format: PixelFormat,
+) {
 	let reference = reference(name);
 	assert_eq!(frames.len(), reference.len(), "{name}: frame count");
 	for (i, (frame, &(bytes, hash))) in frames.iter().zip(&reference).enumerate() {
 		assert_eq!((frame.width, frame.height), size, "{name}");
-		assert_eq!((frame.pixel.format, frame.pixel.depth), (PixelFormat::YUV420, depth));
+		assert_eq!((frame.pixel.format, frame.pixel.depth), (format, depth), "{name}");
 		let data = frame.data();
 		assert_eq!(data.len(), bytes, "{name} frame {i}: size");
 		assert_eq!(adler32(&data), hash, "{name} frame {i} differs from the reference");
 	}
 	assert_eq!(frames[0].keyframe, Keyframe::Key);
+	// Raw x265 streams remuxed by FFmpeg carry no B-frame timestamps.
+	if name.ends_with("_ctu16") || name.ends_with("_odd") {
+		return;
+	}
 	let pts: Vec<_> = frames.iter().map(|f| f.pts.map(|t| t.ticks())).collect();
 	assert!(pts.windows(2).all(|w| w[0] < w[1]), "{name}: pts in presentation order");
 }
@@ -99,7 +113,16 @@ fn hevc_tiles_with_wpp_match_the_encoder() {
 /// Corrupted packets must be reported or concealed, never panic.
 #[test]
 fn damaged_hevc_packets_do_not_panic() {
-	for name in ["hevc/x265_main.mp4", "hevc/x265_tools.mp4", "hevc/kvazaar_tiles_wpp.mp4"] {
+	for name in [
+		"hevc/x265_main.mp4",
+		"hevc/x265_tools.mp4",
+		"hevc/kvazaar_tiles_wpp.mp4",
+		"hevc/x265_422_ctu16.mp4",
+		"hevc/x265_444_12.mp4",
+		"hevc/x265_400_12.mp4",
+		"hevc/rext_444.mp4",
+		"hevc/rext_422_12.mp4",
+	] {
 		for seed in 0..40u32 {
 			let mut d = Mp4Demuxer::new(memory(fixture(name))).unwrap();
 			let stream = d.streams().by_kind(StreamKind::Video)[0].clone();
@@ -134,6 +157,133 @@ fn hevc_wpp_rows_are_bit_exact() {
 fn hevc_wpp_with_slices_and_small_ctbs_is_bit_exact() {
 	let mut d = MkvDemuxer::new(memory(fixture("hevc/x265_wpp_ctu16_slices.mkv"))).unwrap();
 	check("x265_wpp_ctu16_slices", &decode(&mut d), (352, 208), 10);
+}
+
+/// x265 Monochrome 12: 4:0:0, B-frames, WPP.
+#[test]
+fn hevc_monochrome_12_is_bit_exact() {
+	let mut d = Mp4Demuxer::new(memory(fixture("hevc/x265_400_12.mp4"))).unwrap();
+	check_format("x265_400_12", &decode(&mut d), (160, 96), 12, PixelFormat::Gray);
+}
+
+/// x265 Main 4:2:2 10: B-pyramid, transform skip, default scaling lists,
+/// weighted bi-prediction (fade), AMP, two slices.
+#[test]
+fn hevc_422_10_is_bit_exact() {
+	let mut d = MkvDemuxer::new(memory(fixture("hevc/x265_422_10.mkv"))).unwrap();
+	check_format("x265_422_10", &decode(&mut d), (192, 128), 10, PixelFormat::YUV422);
+}
+
+/// x265 4:2:2 with 16x16 CTBs, SAO and lossless CUs. FFmpeg 6.1 differs
+/// from the encoder here (SAO of 4:2:2 chroma at CTB edges, and lossless
+/// chroma it does not restore after SAO), so the reference is the
+/// encoder's own reconstruction.
+#[test]
+fn hevc_422_small_ctbs_match_the_encoder() {
+	let mut d = Mp4Demuxer::new(memory(fixture("hevc/x265_422_ctu16.mp4"))).unwrap();
+	check_format("x265_422_ctu16", &decode(&mut d), (176, 144), 8, PixelFormat::YUV422);
+}
+
+/// x265 Main 4:4:4 12: intra NxN with a chroma mode per block, transform
+/// skip, constrained intra prediction, AMP, weighted prediction.
+#[test]
+fn hevc_444_12_is_bit_exact() {
+	let mut d = Mp4Demuxer::new(memory(fixture("hevc/x265_444_12.mp4"))).unwrap();
+	check_format("x265_444_12", &decode(&mut d), (128, 96), 12, PixelFormat::YUV444);
+}
+
+/// 4:4:4 at an odd size (cropped 131x71) with lossless CUs and WPP;
+/// reference: the encoder's reconstruction.
+#[test]
+fn hevc_444_odd_size_matches_the_encoder() {
+	let mut d = Mp4Demuxer::new(memory(fixture("hevc/x265_444_odd.mp4"))).unwrap();
+	check_format("x265_444_odd", &decode(&mut d), (131, 71), 8, PixelFormat::YUV444);
+}
+
+/// Range extension coding tools, from `tools/hevc_rext_streams.py`
+/// (headers that enable them, random CABAC slice data): cross-component
+/// prediction, implicit and explicit RDPCM, transform skip up to 16x16
+/// with rotation and its own contexts, persistent Rice adaptation, CU
+/// chroma QP offsets, SAO offset scaling, intra smoothing disabled,
+/// lossless. References: FFmpeg.
+#[test]
+fn hevc_range_extension_tools_are_bit_exact() {
+	for (name, depth, format) in [
+		("rext_444", 8, PixelFormat::YUV444),
+		("rext_444_lossless", 10, PixelFormat::YUV444),
+		("rext_422_12", 12, PixelFormat::YUV422),
+		("rext_420_10", 10, PixelFormat::YUV420),
+		("rext_400_8", 8, PixelFormat::Gray),
+	] {
+		let mut d = Mp4Demuxer::new(memory(fixture(&format!("hevc/{name}.mp4")))).unwrap();
+		check_format(name, &decode(&mut d), (64, 64), depth, format);
+	}
+}
+
+/// Profiles beyond 12 bits are refused, not decoded wrongly.
+#[test]
+fn hevc_16_bit_tools_are_rejected() {
+	use rmp::codecs::hevc::ps::Sps;
+	// Main 4:4:4 16 Intra SPS with extended_precision_processing_flag.
+	let mut sps = sps_with_range_extension(0b0_0001_0000);
+	assert!(Sps::parse(&sps).unwrap_err().0.contains("unsupported"));
+	sps = sps_with_range_extension(0b0_0000_0001);
+	assert!(Sps::parse(&sps).unwrap_err().0.contains("unsupported"));
+	sps = sps_with_range_extension(0b1_1100_0110);
+	let sps = Sps::parse(&sps).unwrap();
+	assert!(sps.transform_skip_rotation && sps.implicit_rdpcm && !sps.explicit_rdpcm);
+	assert!(sps.persistent_rice_adaptation && sps.high_precision_offsets);
+	assert_eq!((sps.chroma_format_idc, sps.hshift, sps.vshift), (3, [0; 3], [0; 3]));
+}
+
+/// A 64x64 4:4:4 8-bit SPS whose range extension flags are the 9 low bits
+/// of `flags` (first flag in the highest bit).
+fn sps_with_range_extension(flags: u32) -> Vec<u8> {
+	let mut b = rmp::codecs::bitstream::BitWriter::new();
+	b.put(0x4201, 16); // NAL header: SPS
+	b.put(0, 4);
+	b.put(0, 3);
+	b.put(1, 1);
+	// profile_tier_level: RExt.
+	b.put(4, 8);
+	b.put(1 << 27, 32);
+	b.put(0b1001, 4);
+	b.put(0, 32);
+	b.put(0, 11);
+	b.put(0, 1);
+	b.put(120, 8);
+	b.ue(0);
+	b.ue(3);
+	b.put(0, 1); // separate_colour_plane_flag
+	b.ue(64);
+	b.ue(64);
+	b.put(0, 1);
+	b.ue(0);
+	b.ue(0);
+	b.ue(4);
+	b.put(1, 1);
+	b.ue(0);
+	b.ue(0);
+	b.ue(0);
+	b.ue(0); // min CB 8
+	b.ue(3); // CTB 64
+	b.ue(0); // min TB 4
+	b.ue(3); // max TB 32
+	b.ue(1);
+	b.ue(1);
+	for _ in 0..4 {
+		b.put(0, 1); // scaling lists, AMP, SAO, PCM
+	}
+	b.ue(0); // no short-term RPS
+	b.put(0, 1);
+	b.put(0, 1);
+	b.put(0, 1);
+	b.put(0, 1); // VUI
+	b.put(1, 1); // sps_extension_present_flag
+	b.put(0b1000_0000, 8);
+	b.put(flags, 9);
+	b.rbsp_trailing();
+	b.finish()
 }
 
 fn demuxer_for(name: &str) -> Box<dyn Demuxer> {
@@ -180,13 +330,20 @@ fn decode_threads(name: &str, threads: usize, damage: Option<u32>) -> Vec<(Vec<u
 	})
 }
 
-const ALL_FIXTURES: [&str; 6] = [
+const ALL_FIXTURES: [&str; 13] = [
 	"hevc/x265_main.mp4",
 	"hevc/x265_main10.mkv",
 	"hevc/x265_tools.mp4",
 	"hevc/kvazaar_tiles_wpp.mp4",
 	"hevc/x265_wpp.mp4",
 	"hevc/x265_wpp_ctu16_slices.mkv",
+	"hevc/x265_400_12.mp4",
+	"hevc/x265_422_10.mkv",
+	"hevc/x265_422_ctu16.mp4",
+	"hevc/x265_444_12.mp4",
+	"hevc/x265_444_odd.mp4",
+	"hevc/rext_444.mp4",
+	"hevc/rext_444_lossless.mp4",
 ];
 
 /// Frame (and WPP row) threading never changes the output.

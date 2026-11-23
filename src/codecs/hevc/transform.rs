@@ -189,13 +189,36 @@ pub fn idst4(coeffs: &mut [i32], bit_depth: u32) {
 	}
 }
 
-/// Transform skip (version 1: 4x4 only): `(c << 7)` then the second-stage
-/// rounding shift.
-pub fn transform_skip(coeffs: &mut [i32], n: usize, bit_depth: u32) {
+/// Transform skip (§8.6.4.2): `(c << tsShift)` with tsShift = 5 + log2 of
+/// the size, then the second-stage rounding shift. Results are kept as
+/// 16-bit values, as FFmpeg and HM store them.
+pub fn transform_skip(coeffs: &mut [i32], log2: u32, bit_depth: u32) {
+	let n = 1usize << log2;
 	let shift = 20 - bit_depth;
 	let add = 1 << (shift - 1);
+	let ts_shift = 5 + log2;
 	for c in &mut coeffs[..n * n] {
-		*c = (*c * 128 + add) >> shift;
+		*c = i32::from((((*c << ts_shift) + add) >> shift) as i16);
+	}
+}
+
+/// Residual DPCM (§8.6.8, range extensions): each residual sample adds the
+/// one above (`vertical`) or to its left. Sums wrap to 16 bits as in
+/// FFmpeg (valid streams never get there; HM clips instead).
+pub fn rdpcm(res: &mut [i32], n: usize, vertical: bool) {
+	let wrap = |v: i32| i32::from(v as i16);
+	if vertical {
+		for y in 1..n {
+			for x in 0..n {
+				res[y * n + x] = wrap(res[y * n + x] + res[(y - 1) * n + x]);
+			}
+		}
+	} else {
+		for row in res[..n * n].chunks_exact_mut(n) {
+			for x in 1..n {
+				row[x] = wrap(row[x] + row[x - 1]);
+			}
+		}
 	}
 }
 
@@ -213,6 +236,34 @@ mod tests {
 			idct_dc(&mut b, n, 8);
 			assert_eq!(a, b, "n={n}");
 		}
+	}
+
+	#[test]
+	fn transform_skip_matches_ffmpeg_dequant() {
+		// FFmpeg: shift = 15 - bitDepth - log2; (c + (1 << (shift - 1))) >>
+		// shift, or c << -shift.
+		for bd in [8u32, 10, 12] {
+			for log2 in 2..=5u32 {
+				for c in [-32768i32, -1000, -17, -1, 0, 1, 5, 999, 32767] {
+					let mut v = [c; 1024];
+					transform_skip(&mut v, log2, bd);
+					let s = 15 - bd as i32 - log2 as i32;
+					let want =
+						if s > 0 { (c + (1 << (s - 1))) >> s } else { ((c as i16 as u16) << -s) as i16 as i32 };
+					assert_eq!(v[0], want, "bd {bd} log2 {log2} c {c}");
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn rdpcm_accumulates() {
+		let mut r: Vec<i32> = (1..=16).collect();
+		rdpcm(&mut r, 4, false);
+		assert_eq!(&r[..4], &[1, 3, 6, 10]);
+		let mut r: Vec<i32> = (1..=16).collect();
+		rdpcm(&mut r, 4, true);
+		assert_eq!(&r[12..], &[28, 32, 36, 40]);
 	}
 
 	#[test]

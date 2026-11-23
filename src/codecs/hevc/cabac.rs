@@ -59,6 +59,8 @@ fn tables() -> &'static EngineTables {
 #[derive(Clone)]
 pub struct Contexts {
 	pub states: [u8; NUM_CTX],
+	/// StatCoeff (persistent_rice_adaptation_enabled_flag), §9.3.2.2.
+	pub stat_coeff: [u8; 4],
 }
 
 impl Contexts {
@@ -76,7 +78,7 @@ impl Contexts {
 			}
 			*s = pre as u8;
 		}
-		Self { states }
+		Self { states, stat_coeff: [0; 4] }
 	}
 }
 

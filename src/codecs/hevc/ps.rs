@@ -260,7 +260,14 @@ pub struct Sps {
 	pub id: usize,
 	/// sps_max_sub_layers_minus1 + 1.
 	pub max_sub_layers: u32,
+	/// general_profile_idc (4 and up: range extensions and later).
+	pub profile_idc: u8,
+	/// ChromaArrayType: 0 monochrome, 1 4:2:0, 2 4:2:2, 3 4:4:4.
 	pub chroma_format_idc: u32,
+	/// Chroma subsampling as shifts, per component (0 for luma):
+	/// log2(SubWidthC) and log2(SubHeightC).
+	pub hshift: [u32; 3],
+	pub vshift: [u32; 3],
 	pub width: u32,
 	pub height: u32,
 	/// Conformance window in luma samples: left, right, top, bottom.
@@ -291,6 +298,14 @@ pub struct Sps {
 	pub used_by_curr_pic_lt: Vec<bool>,
 	pub temporal_mvp_enabled: bool,
 	pub strong_intra_smoothing: bool,
+	// sps_range_extension() (§7.3.2.2.2).
+	pub transform_skip_rotation: bool,
+	pub transform_skip_context: bool,
+	pub implicit_rdpcm: bool,
+	pub explicit_rdpcm: bool,
+	pub intra_smoothing_disabled: bool,
+	pub high_precision_offsets: bool,
+	pub persistent_rice_adaptation: bool,
 	// Derived.
 	pub ctb_size: u32,
 	pub ctb_width: u32,
@@ -314,7 +329,17 @@ impl Sps {
 		let id = bs.ue() as usize;
 		check(id < MAX_SPS, "hevc: invalid sps id")?;
 		let chroma_format_idc = bs.ue();
-		check(chroma_format_idc == 1, "hevc: only 4:2:0 is supported")?;
+		check(chroma_format_idc <= 3, "hevc: invalid chroma_format_idc")?;
+		if chroma_format_idc == 3 {
+			// Coding the three colour planes as separate monochrome
+			// pictures; no range extensions profile allows it.
+			check(!bs.bit(), "hevc: unsupported separate colour planes")?;
+		}
+		let (sub_w, sub_h) = match chroma_format_idc {
+			1 => (1, 1),
+			2 => (1, 0),
+			_ => (0, 0),
+		};
 		let width = bs.ue();
 		let height = bs.ue();
 		check(
@@ -323,8 +348,9 @@ impl Sps {
 		)?;
 		let mut crop = [0u32; 4];
 		if bs.bit() {
-			for c in &mut crop {
-				*c = bs.ue().saturating_mul(2);
+			// In chroma samples: SubWidthC / SubHeightC luma samples each.
+			for (i, c) in crop.iter_mut().enumerate() {
+				*c = bs.ue().saturating_mul(1 << if i < 2 { sub_w } else { sub_h });
 			}
 			// As FFmpeg does: a conformance window that leaves no picture is
 			// invalid, so ignore it rather than reject the stream. Sums in u64
@@ -336,8 +362,12 @@ impl Sps {
 		}
 		let bit_depth = bs.ue().saturating_add(8);
 		let bit_depth_chroma = bs.ue().saturating_add(8);
-		check(bit_depth <= 12 && bit_depth == bit_depth_chroma, "hevc: unsupported bit depth")?;
-		let _ = profile;
+		// As FFmpeg: up to 12 bits, and one depth for all components
+		// (monochrome streams may signal any chroma depth).
+		check(
+			bit_depth <= 12 && (chroma_format_idc == 0 || bit_depth == bit_depth_chroma),
+			"hevc: unsupported bit depth",
+		)?;
 		let log2_max_poc_lsb = bs.ue().saturating_add(4);
 		check(log2_max_poc_lsb <= 16, "hevc: invalid poc lsb size")?;
 		let sub_layer_ordering_info = bs.bit();
@@ -385,7 +415,7 @@ impl Sps {
 			pcm_max = pcm_min.saturating_add(bs.ue());
 			pcm_lf = bs.bit();
 			check(
-				pcm_bd <= bit_depth && pcm_max <= 5.min(log2_ctb_size),
+				pcm_bd.max(pcm_bdc) <= bit_depth && pcm_max <= 5.min(log2_ctb_size),
 				"hevc: invalid pcm parameters",
 			)?;
 		}
@@ -409,14 +439,49 @@ impl Sps {
 		}
 		let temporal_mvp_enabled = bs.bit();
 		let strong_intra_smoothing = bs.bit();
-		// VUI and extensions follow; nothing in them affects Main/Main 10
-		// decoding.
+		if bs.bit() {
+			vui(&mut bs, rbsp_bits(rbsp), max_sub_layers_minus1 + 1)?;
+		}
+		let mut rext = [false; 9];
+		if bs.bit() {
+			// sps_extension_present_flag.
+			let range = bs.bit();
+			bs.skip(1 + 1 + 1 + 4); // multilayer, 3D, SCC, 4 bits
+			if range {
+				for f in &mut rext {
+					*f = bs.bit();
+				}
+			}
+			// The rest (multilayer, 3D, SCC) only matters to profiles this
+			// decoder does not support.
+		}
+		let [
+			transform_skip_rotation,
+			transform_skip_context,
+			implicit_rdpcm,
+			explicit_rdpcm,
+			extended_precision,
+			intra_smoothing_disabled,
+			high_precision_offsets,
+			persistent_rice_adaptation,
+			cabac_bypass_alignment,
+		] = rext;
+		// Both belong to the 16-bit profiles (bit depths above 12).
+		check(
+			!extended_precision,
+			"hevc: unsupported extended precision processing (16-bit profiles)",
+		)?;
+		check(!cabac_bypass_alignment, "hevc: unsupported CABAC bypass alignment (16-bit profiles)")?;
 		check(!bs.overrun(), "hevc: truncated sps")?;
 		let ctb_size = 1 << log2_ctb_size;
+		let shifts = |v: u32| if chroma_format_idc == 0 { [0; 3] } else { [0, v, v] };
 		Ok(Self {
 			max_sub_layers: max_sub_layers_minus1 as u32 + 1,
+			profile_idc: profile,
 			id,
 			chroma_format_idc,
+			hshift: shifts(sub_w),
+			vshift: shifts(sub_h),
 			width,
 			height,
 			crop,
@@ -446,6 +511,13 @@ impl Sps {
 			used_by_curr_pic_lt,
 			temporal_mvp_enabled,
 			strong_intra_smoothing,
+			transform_skip_rotation,
+			transform_skip_context,
+			implicit_rdpcm,
+			explicit_rdpcm,
+			intra_smoothing_disabled,
+			high_precision_offsets,
+			persistent_rice_adaptation,
 			ctb_size,
 			ctb_width: width.div_ceil(ctb_size),
 			ctb_height: height.div_ceil(ctb_size),
@@ -455,6 +527,159 @@ impl Sps {
 			min_tb_height: height >> log2_min_tb_size,
 			qp_bd_offset: 6 * (bit_depth as i32 - 8),
 		})
+	}
+}
+
+impl Sps {
+	/// Whether the pictures have chroma planes (ChromaArrayType != 0).
+	#[inline]
+	pub fn has_chroma(&self) -> bool {
+		self.chroma_format_idc != 0
+	}
+
+	/// Number of colour components coded.
+	#[inline]
+	pub fn num_comps(&self) -> usize {
+		if self.has_chroma() { 3 } else { 1 }
+	}
+
+	/// Width and height of component `c`'s plane.
+	#[inline]
+	pub fn plane_size(&self, c: usize) -> (usize, usize) {
+		if c > 0 && !self.has_chroma() {
+			return (0, 0);
+		}
+		((self.width >> self.hshift[c]) as usize, (self.height >> self.vshift[c]) as usize)
+	}
+}
+
+/// Length in bits of an RBSP without its stop bit and trailing zeros
+/// (FFmpeg's `get_bit_length`), for the VUI recovery heuristics.
+fn rbsp_bits(rbsp: &[u8]) -> usize {
+	match rbsp.iter().rposition(|&b| b != 0) {
+		Some(i) => i * 8 + 7 - rbsp[i].trailing_zeros() as usize,
+		None => 0,
+	}
+}
+
+/// `hrd_parameters()` (Annex E.2.2), skipped.
+fn hrd(bs: &mut BitReader, common: bool, max_sub_layers: usize) -> PsResult<()> {
+	let (mut nal, mut vcl, mut sub_pic) = (false, false, false);
+	if common {
+		nal = bs.bit();
+		vcl = bs.bit();
+		if nal || vcl {
+			sub_pic = bs.bit();
+			if sub_pic {
+				bs.skip(8 + 5 + 1 + 5);
+			}
+			bs.skip(4 + 4);
+			if sub_pic {
+				bs.skip(4);
+			}
+			bs.skip(5 + 5 + 5);
+		}
+	}
+	for _ in 0..max_sub_layers {
+		let fixed_general = bs.bit();
+		let fixed_cvs = fixed_general || bs.bit();
+		let mut low_delay = false;
+		if fixed_cvs {
+			bs.ue(); // elemental_duration_in_tc_minus1
+		} else {
+			low_delay = bs.bit();
+		}
+		let mut cpb_cnt = 1;
+		if !low_delay {
+			cpb_cnt = bs.ue() + 1;
+			check(cpb_cnt <= 32, "hevc: invalid cpb count")?;
+		}
+		for present in [nal, vcl] {
+			if present {
+				for _ in 0..cpb_cnt {
+					bs.ue();
+					bs.ue();
+					if sub_pic {
+						bs.ue();
+						bs.ue();
+					}
+					bs.skip(1);
+				}
+			}
+		}
+	}
+	Ok(())
+}
+
+/// `vui_parameters()` (Annex E.2.1), skipped up to the SPS extension, with
+/// FFmpeg's recovery for streams that use an older draft layout (no
+/// default display window; timing info right after the field flags).
+fn vui(bs: &mut BitReader, rbsp_bits: usize, max_sub_layers: usize) -> PsResult<()> {
+	let left = |bs: &BitReader| rbsp_bits as isize - bs.pos() as isize;
+	if bs.bit() {
+		// aspect_ratio_info_present_flag
+		if bs.bits(8) == 255 {
+			bs.skip(32);
+		}
+	}
+	if bs.bit() {
+		bs.skip(1); // overscan_appropriate_flag
+	}
+	if bs.bit() {
+		// video_signal_type_present_flag
+		bs.skip(3 + 1);
+		if bs.bit() {
+			bs.skip(24);
+		}
+	}
+	if bs.bit() {
+		bs.ue();
+		bs.ue();
+	}
+	bs.skip(3); // neutral_chroma, field_seq, frame_field_info
+	let backup = bs.clone();
+	// default_display_window_flag (FFmpeg ignores the window by default).
+	let window = if left(bs) >= 68 && bs.peek(21) == 0x10_0000 { false } else { bs.bit() };
+	if window {
+		for _ in 0..4 {
+			bs.ue();
+		}
+	}
+	let mut alt = false;
+	loop {
+		if bs.bit() {
+			// vui_timing_info_present_flag
+			if left(bs) < 66 && !alt {
+				*bs = backup.clone();
+				alt = true;
+				continue;
+			}
+			bs.skip(64);
+			if bs.bit() {
+				bs.ue();
+			}
+			if bs.bit() {
+				hrd(bs, true, max_sub_layers)?;
+			}
+		}
+		if bs.bit() {
+			// bitstream_restriction_flag
+			if left(bs) < 8 && !alt {
+				*bs = backup.clone();
+				alt = true;
+				continue;
+			}
+			bs.skip(3);
+			for _ in 0..5 {
+				bs.ue();
+			}
+		}
+		if left(bs) < 1 && !alt {
+			*bs = backup.clone();
+			alt = true;
+			continue;
+		}
+		return Ok(());
 	}
 }
 
@@ -495,6 +720,17 @@ pub struct Pps {
 	pub lists_modification_present: bool,
 	pub log2_parallel_merge_level: u32,
 	pub slice_header_extension_present: bool,
+	// pps_range_extension() (§7.3.2.3.2).
+	pub log2_max_transform_skip_size: u32,
+	pub cross_component_prediction: bool,
+	pub chroma_qp_offset_list_enabled: bool,
+	pub diff_cu_chroma_qp_offset_depth: u32,
+	/// chroma_qp_offset_list_len_minus1 + 1 entries of `cb/cr_qp_offset_list`.
+	pub chroma_qp_offset_list_len: usize,
+	pub cb_qp_offset_list: [i32; 6],
+	pub cr_qp_offset_list: [i32; 6],
+	pub log2_sao_offset_scale_luma: u32,
+	pub log2_sao_offset_scale_chroma: u32,
 	// Explicit tile layout (in CTBs) as signalled; resolved against an SPS
 	// by [`Pps::layout`].
 	num_tile_columns: u32,
@@ -599,20 +835,58 @@ impl Pps {
 		let log2_parallel_merge_level = bs.ue().saturating_add(2);
 		check(log2_parallel_merge_level <= sps.log2_ctb_size, "hevc: invalid merge level")?;
 		let slice_header_extension_present = bs.bit();
+		let mut log2_max_transform_skip_size = 2;
+		let mut cross_component_prediction = false;
+		let mut chroma_qp_offset_list_enabled = false;
+		let mut diff_cu_chroma_qp_offset_depth = 0;
+		let mut chroma_qp_offset_list_len = 0;
+		let mut cb_qp_offset_list = [0; 6];
+		let mut cr_qp_offset_list = [0; 6];
+		let mut log2_sao_offset_scale_luma = 0;
+		let mut log2_sao_offset_scale_chroma = 0;
 		if bs.bit() {
-			// pps_range_extension etc.: only relevant to RExt profiles.
 			let range = bs.bit();
-			let _multilayer = bs.bit();
-			let _3d = bs.bit();
-			let _scc = bs.bit();
-			let _other = bs.bits(4);
-			if range {
-				let log2_max_ts = if transform_skip_enabled { bs.ue().saturating_add(2) } else { 2 };
-				let cross_component = bs.bit();
-				let chroma_qp_offset_list = bs.bit();
+			bs.skip(1 + 1 + 1 + 4); // multilayer, 3D, SCC, 4 bits
+			// As FFmpeg: the range extension is read for RExt profiles only.
+			if range && sps.profile_idc >= 4 {
+				if transform_skip_enabled {
+					log2_max_transform_skip_size = bs.ue().saturating_add(2);
+					check(
+						log2_max_transform_skip_size <= sps.log2_max_tb_size,
+						"hevc: invalid transform skip size",
+					)?;
+				}
+				cross_component_prediction = bs.bit();
 				check(
-					log2_max_ts == 2 && !cross_component && !chroma_qp_offset_list,
-					"hevc: range extension tools are not supported",
+					!cross_component_prediction || sps.chroma_format_idc == 3,
+					"hevc: cross-component prediction needs 4:4:4",
+				)?;
+				chroma_qp_offset_list_enabled = bs.bit();
+				if chroma_qp_offset_list_enabled {
+					diff_cu_chroma_qp_offset_depth = bs.ue();
+					check(
+						diff_cu_chroma_qp_offset_depth <= sps.log2_ctb_size - sps.log2_min_cb_size,
+						"hevc: invalid chroma qp offset depth",
+					)?;
+					let n = bs.ue() as usize + 1;
+					check(n <= 6, "hevc: invalid chroma qp offset list")?;
+					chroma_qp_offset_list_len = n;
+					for i in 0..n {
+						cb_qp_offset_list[i] = bs.se();
+						cr_qp_offset_list[i] = bs.se();
+						check(
+							(-12..=12).contains(&cb_qp_offset_list[i])
+								&& (-12..=12).contains(&cr_qp_offset_list[i]),
+							"hevc: invalid chroma qp offset list",
+						)?;
+					}
+				}
+				log2_sao_offset_scale_luma = bs.ue();
+				log2_sao_offset_scale_chroma = bs.ue();
+				let max = sps.bit_depth.saturating_sub(10);
+				check(
+					log2_sao_offset_scale_luma <= max && log2_sao_offset_scale_chroma <= max,
+					"hevc: invalid sao offset scale",
 				)?;
 			}
 		}
@@ -652,6 +926,15 @@ impl Pps {
 			lists_modification_present,
 			log2_parallel_merge_level,
 			slice_header_extension_present,
+			log2_max_transform_skip_size,
+			cross_component_prediction,
+			chroma_qp_offset_list_enabled,
+			diff_cu_chroma_qp_offset_depth,
+			chroma_qp_offset_list_len,
+			cb_qp_offset_list,
+			cr_qp_offset_list,
+			log2_sao_offset_scale_luma,
+			log2_sao_offset_scale_chroma,
 			num_tile_columns,
 			num_tile_rows,
 		})

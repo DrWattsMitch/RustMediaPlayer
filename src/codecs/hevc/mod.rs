@@ -15,10 +15,18 @@
 //! * `wpp` — WPP slice segments decoded row by row from their entry
 //!   points, on several threads.
 //!
-//! Supported: Main, Main 10 (and Main 12) 4:2:0 — tiles, WPP, dependent
-//! slices, AMP, SAO, scaling lists, PCM, transform skip, lossless
-//! (transquant bypass), weighted prediction, long-term references.
-//! Not supported: 4:0:0/4:2:2/4:4:4, range/SCC/multilayer extensions.
+//! Supported: Main, Main 10 and the format range extensions profiles up to
+//! 12 bits — 4:0:0, 4:2:0, 4:2:2 and 4:4:4 (Main 12, Main 4:2:2 10/12,
+//! Main 4:4:4 8/10/12, Monochrome 8/12 and their Intra variants) with the
+//! range extension tools (cross-component prediction, implicit and explicit
+//! RDPCM, extended transform skip with rotation and its own contexts,
+//! persistent Rice adaptation, CU chroma QP offsets, intra smoothing
+//! disabled, high-precision weighted prediction offsets, SAO offset
+//! scaling) — plus tiles, WPP, dependent slices, AMP, SAO, scaling lists,
+//! PCM, lossless (transquant bypass), weighted prediction and long-term
+//! references.
+//! Not supported: 16-bit profiles (extended precision, CABAC bypass
+//! alignment), separate colour planes, SCC and multi-layer extensions.
 
 #![allow(clippy::needless_range_loop)]
 
@@ -47,7 +55,7 @@ use crate::message::{Message, Result};
 
 /// [`core::Decoder`] for `hevc`: one access unit per packet (`hvcC`
 /// length-prefixed or Annex B), pictures out in display order as planar
-/// YUV 4:2:0, 8-bit or 16-bit little-endian samples.
+/// YUV 4:2:0, 4:2:2, 4:4:4 or gray, 8-bit or 16-bit little-endian samples.
 #[derive(Debug, Clone, Default)]
 pub struct HevcDecoder;
 
@@ -61,7 +69,13 @@ fn to_frames(video: &mut VideoState, pictures: Vec<OutputPicture>) -> Vec<Frame>
 	pictures
 		.into_iter()
 		.map(|p| {
-			let pixel = video::Pixel { depth: p.bit_depth as u8, format: video::PixelFormat::YUV420 };
+			let format = match p.chroma_format {
+				0 => video::PixelFormat::Gray,
+				2 => video::PixelFormat::YUV422,
+				3 => video::PixelFormat::YUV444,
+				_ => video::PixelFormat::YUV420,
+			};
+			let pixel = video::Pixel { depth: p.bit_depth as u8, format };
 			video.width = p.width;
 			video.height = p.height;
 			video.pixel = pixel.clone();
