@@ -43,7 +43,7 @@ Global options:
 
 Stream options:
   -an | -vn | -sn       drop audio / video / subtitles
-  -c:a <codec|copy>     audio codec: aac, flac, pcm_s16le, pcm_s24le, pcm_f32le, ...
+  -c:a <codec|copy>     audio codec: aac, opus, flac, pcm_s16le, pcm_s24le, pcm_f32le, ...
   -c:v <codec|copy>     video codec: h264, rawvideo or copy
   -c:s copy             copy subtitles (Matroska, WebM, HLS/WebVTT, SRT, ASS)
   -c copy               copy every stream
@@ -55,10 +55,14 @@ Stream options:
                         lipshitz (noise shaped, 44.1/48 kHz), none (FFmpeg's)
   -dither_scale <x>     dither noise level, 0-8 (default 1)
   -compression_level n  FLAC level 0-12 (default 5)
-  -b:a <rate>           AAC bit rate, e.g. 128k (default 64k per channel)
+  -b:a <rate>           AAC / Opus bit rate, e.g. 128k (default 64k per channel)
   -b:v <rate>           H.264 average bit rate, e.g. 2M
   -qp <0-51>            H.264 constant quantiser (default 23)
   -g <frames>           H.264 keyframe interval (default 250)
+  -profile:v <p>        H.264 profile: high (default: CABAC, B pictures, 8x8 transform,
+                        trellis), main, or baseline (CAVLC, no B pictures)
+  -bf <0-8>             H.264 most consecutive B pictures (default 3; 0 for baseline)
+  -refs <1-16>          H.264 reference pictures (default 3; 1 for baseline)
   -s <W>x<H>            output picture size
   -pix_fmt <name>       yuv420p, yuv422p, yuv444p, yuv420p10le, gray, rgb24, nv12, ...
   -sws_flags <filter>   point, bilinear, bicubic (default), lanczos

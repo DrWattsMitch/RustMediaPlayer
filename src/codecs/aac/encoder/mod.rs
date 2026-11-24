@@ -29,14 +29,23 @@
 //! samples, so an MP4 edit list (or a decoder honouring `encoder_delay`)
 //! gives back exactly the input length.
 //!
-//! Not used (all optional encoder tools): TNS, PNS, intensity stereo,
-//! pulses, KBD windows.
+//! Two optional tools are on by default (FFmpeg's encoder uses both):
+//!
+//! * **TNS** ([`tns`]): per window, an LPC filter across frequency whose
+//!   prediction gain shows an uneven temporal envelope; the residual is
+//!   coded and the decoder's synthesis filter shapes the noise in time.
+//! * **PNS**: noise-like bands above 4 kHz that would be coded coarsely
+//!   anyway (or dropped) are sent as an energy only (codebook 13); the
+//!   decoder fills them with noise of that energy (§4.6.13).
+//!
+//! Not used: intensity stereo, pulses, KBD windows.
 
 mod psy;
 mod quant;
+mod tns;
 
 use super::config::{AOT_AAC_LC, AacConfig, ElementKind, SAMPLE_RATES};
-use super::ics::WindowSequence;
+use super::ics::{NOISE_BT, WindowSequence};
 use crate::codecs::bitstream::BitWriter;
 use crate::codecs::dsp::{Complex, Mdct};
 use crate::codecs::pcm::convert::for_each_sample;
@@ -58,6 +67,17 @@ pub const ENCODER_DELAY: u32 = 1024;
 const NEEDED: usize = 3 * FRAME;
 /// Bits a decoder buffers per channel (§4.5.3.2).
 const MAX_CHANNEL_BITS: usize = 6144;
+/// PNS only above this frequency (FFmpeg's `NOISE_LOW_LIMIT`).
+const PNS_LOW_HZ: f32 = 4000.0;
+/// Spectral flatness (of line-pair energies) above which a band counts as
+/// noise. White noise measures about 0.56, a tone close to 0.
+const PNS_FLATNESS: f32 = 0.35;
+/// A band is replaced by noise when its energy is less than this many times
+/// the noise the rate loop allows in it (under about 9 dB SNR).
+const PNS_MAX_SNR: f32 = 8.0;
+/// First noise energy: a 9-bit value relative to `global_gain - 90`.
+const NOISE_OFFSET: i32 = 90;
+const NOISE_PRE: i32 = 256;
 
 /// FFmpeg's default bit rate: 64 kb/s per channel (128 kb/s stereo).
 pub fn default_bitrate(channels: u8) -> u32 {
@@ -133,6 +153,13 @@ pub struct AacEncoderState {
 	offset_db: f32,
 	long: BandModel,
 	short: BandModel,
+	/// Temporal noise shaping (default on).
+	pub tns: bool,
+	/// Perceptual noise substitution (default on).
+	pub pns: bool,
+	/// Windows coded with a TNS filter and bands coded as noise so far.
+	pub tns_windows: u64,
+	pub noise_bands: u64,
 }
 
 /// Analysis and quantisation results for one channel of the current frame.
@@ -155,6 +182,12 @@ struct ChannelFrame {
 	coded: Vec<bool>,
 	q: Vec<i32>,
 	cbs: Vec<u8>,
+	tns: tns::Tns,
+	/// Bands that may be replaced by noise (frequency, flatness, not M/S).
+	pns_ok: Vec<bool>,
+	/// Bands sent as noise (codebook 13) and their noise energies.
+	noise: Vec<bool>,
+	nsf: Vec<i32>,
 }
 
 impl ChannelFrame {
@@ -213,6 +246,10 @@ impl AacEncoderState {
 			offset_db: 0.0,
 			long: BandModel::new(rate_index, sample_rate, false),
 			short: BandModel::new(rate_index, sample_rate, true),
+			tns: true,
+			pns: true,
+			tns_windows: 0,
+			noise_bands: 0,
 		})
 	}
 
@@ -275,8 +312,29 @@ impl AacEncoderState {
 			};
 			let cutoff =
 				if element.kind == ElementKind::Lfe { self.cutoff_lfe } else { self.cutoff_long };
-			let mut frames: Vec<ChannelFrame> =
-				spectra.iter().map(|s| self.analyse(s, seq, grouping, cutoff)).collect();
+			let lfe = element.kind == ElementKind::Lfe;
+			let mut frames: Vec<ChannelFrame> = spectra
+				.iter()
+				.map(|s| {
+					let short = seq == WindowSequence::EightShort;
+					let model = if short { &self.short } else { &self.long };
+					let mut residual = *s;
+					let tns = if self.tns && !lfe {
+						let bands = band_limit(model.offsets, short, cutoff);
+						tns::analyse(
+							&mut residual,
+							short,
+							model.offsets,
+							bands,
+							self.rate_index,
+							self.sample_rate,
+						)
+					} else {
+						tns::Tns { short, windows: vec![None; if short { 8 } else { 1 }] }
+					};
+					self.analyse(s, &residual, tns, seq, grouping, cutoff, self.pns && !lfe)
+				})
+				.collect();
 			if let [l, r] = frames.as_mut_slice() {
 				mid_side(l, r);
 			}
@@ -313,6 +371,12 @@ impl AacEncoderState {
 		self.offset_db = offset;
 
 		let data = self.write_frame(&chans);
+		for ch in &chans {
+			self.tns_windows += ch.tns.windows.iter().filter(|w| w.is_some()).count() as u64;
+			self.noise_bands += (0..ch.bands.len())
+				.filter(|&b| ch.cbs[b] == NOISE_BT && b % ch.max_sfb < ch.coded_sfb)
+				.count() as u64;
+		}
 		self.reservoir = (self.reservoir + avg - (data.len() * 8) as f32).clamp(0.0, capacity);
 		for buf in &mut self.input {
 			buf.drain(..FRAME);
@@ -323,12 +387,21 @@ impl AacEncoderState {
 
 	/// Band energies and thresholds of one channel, regrouped into
 	/// bitstream order.
+	///
+	/// Thresholds come from the spectrum `spec`; the coded coefficients
+	/// from `coded` (the TNS residual, or `spec` itself). Where a TNS filter
+	/// runs, its synthesis amplifies the residual's noise by about the
+	/// prediction gain, so those thresholds are divided by it.
+	#[allow(clippy::too_many_arguments)]
 	fn analyse(
 		&self,
 		spec: &[f32; FRAME],
+		coded: &[f32; FRAME],
+		tns: tns::Tns,
 		seq: WindowSequence,
 		grouping: u8,
 		cutoff: usize,
+		pns: bool,
 	) -> ChannelFrame {
 		let short = seq == WindowSequence::EightShort;
 		let model = if short { &self.short } else { &self.long };
@@ -338,7 +411,13 @@ impl AacEncoderState {
 		} else {
 			(vec![1], 1, FRAME, cutoff)
 		};
-		let max_sfb = (0..model.bands()).filter(|&b| usize::from(offsets[b]) < line_cut).count().max(1);
+		let max_sfb = band_limit(offsets, short, cutoff);
+		debug_assert!(max_sfb <= model.bands() && line_cut > 0);
+		let hz_per_line = self.sample_rate as f32 / 2.0 / win_len as f32;
+		// PNS is off for a channel whose frame uses TNS: the decoder would
+		// filter the noise too.
+		let pns = pns && !tns.present();
+		let mut pns_ok = Vec::with_capacity(groups.len() * max_sfb);
 		let mut coef = Vec::with_capacity(FRAME);
 		let mut bands = Vec::with_capacity(groups.len() * max_sfb);
 		let mut energy = vec![0.0f32; model.bands()];
@@ -354,6 +433,13 @@ impl AacEncoderState {
 					energy[b] = spec_w[lo..hi].iter().map(|v| v * v).sum();
 				}
 				model.thresholds(&energy, &mut thr);
+				if let Some(f) = &tns.windows[w] {
+					for b in 0..max_sfb {
+						if usize::from(offsets[b]) >= f.start {
+							thr[b] /= f.gain;
+						}
+					}
+				}
 				for b in 0..max_sfb {
 					genergy[b] += energy[b];
 					gthr[b] += thr[b];
@@ -363,8 +449,11 @@ impl AacEncoderState {
 				let (lo, hi) = (usize::from(offsets[b]), usize::from(offsets[b + 1]));
 				let start = coef.len();
 				for w in window..window + glen {
-					coef.extend_from_slice(&spec[w * win_len + lo..w * win_len + hi]);
+					coef.extend_from_slice(&coded[w * win_len + lo..w * win_len + hi]);
 				}
+				pns_ok.push(
+					pns && lo as f32 * hz_per_line >= PNS_LOW_HZ && flatness(&coef[start..]) >= PNS_FLATNESS,
+				);
 				bands.push(BandStats {
 					start,
 					end: coef.len(),
@@ -392,6 +481,10 @@ impl AacEncoderState {
 			coded: vec![false; n],
 			q: vec![0; len],
 			cbs: vec![0; n],
+			tns,
+			pns_ok,
+			noise: vec![false; n],
+			nsf: vec![0; n],
 		}
 	}
 
@@ -465,6 +558,19 @@ impl AacEncoderState {
 			for b in 0..ch.bands.len() {
 				let stats = ch.bands[b];
 				let allowed = allowance.of(stats.threshold);
+				// PNS: an audible noise-like band that would get under
+				// about 9 dB SNR (or nothing) is sent as its energy.
+				ch.noise[b] =
+					ch.pns_ok[b] && stats.energy > stats.threshold && stats.energy < PNS_MAX_SNR * allowed;
+				if ch.noise[b] {
+					let glen = ch.groups[b / ch.max_sfb];
+					let per_window = stats.energy / glen as f32;
+					ch.nsf[b] = (2.0 * per_window.log2()).round().clamp(-100.0, 155.0) as i32;
+					ch.coded[b] = false;
+					let range = ch.band(b);
+					ch.q[range].fill(0);
+					continue;
+				}
 				match quant::choose_sf(&ch.coef, &ch.x34, &stats, allowed, &mut ch.q) {
 					Some(sf) => {
 						ch.sf[b] = sf;
@@ -478,6 +584,7 @@ impl AacEncoderState {
 				}
 			}
 			constrain_scalefactors(ch);
+			constrain_noise(ch);
 		}
 		// Elements: CPEs share max_sfb.
 		let mut bits = 0;
@@ -658,6 +765,9 @@ fn mid_side(l: &mut ChannelFrame, r: &mut ChannelFrame) {
 		let pe_ms = psy::perceptual_entropy(em, t, width) + psy::perceptual_entropy(es, t, width);
 		if pe_ms < pe_lr {
 			l.ms[b] = true;
+			// The decoder skips M/S in noise bands, so M/S bands stay coded.
+			l.pns_ok[b] = false;
+			r.pns_ok[b] = false;
 			for i in range {
 				let (a, c) = (l.coef[i], r.coef[i]);
 				l.coef[i] = 0.5 * (a + c);
@@ -718,7 +828,8 @@ fn last_coded_band(ch: &ChannelFrame) -> usize {
 	let mut last = 0;
 	for g in 0..ch.groups.len() {
 		for sfb in 0..ch.max_sfb {
-			if ch.coded[g * ch.max_sfb + sfb] {
+			let i = g * ch.max_sfb + sfb;
+			if ch.coded[i] || ch.noise[i] {
 				last = last.max(sfb + 1);
 			}
 		}
@@ -733,8 +844,22 @@ fn choose_codebooks(ch: &mut ChannelFrame) {
 		let costs: Vec<[u32; 12]> = (0..ch.coded_sfb)
 			.map(|sfb| quant::codebook_costs(&ch.q[ch.band(base + sfb)], ch.coded[base + sfb]))
 			.collect();
-		let cbs = quant::section(&costs, len_bits);
-		ch.cbs[base..base + ch.coded_sfb].copy_from_slice(&cbs);
+		// Noise bands are sections of their own (codebook 13); the bands
+		// between them are sectioned optimally.
+		let mut sfb = 0;
+		while sfb < ch.coded_sfb {
+			if ch.noise[base + sfb] {
+				ch.cbs[base + sfb] = NOISE_BT;
+				sfb += 1;
+				continue;
+			}
+			let start = sfb;
+			while sfb < ch.coded_sfb && !ch.noise[base + sfb] {
+				sfb += 1;
+			}
+			let cbs = quant::section(&costs[start..sfb], len_bits);
+			ch.cbs[base + start..base + sfb].copy_from_slice(&cbs);
+		}
 		for sfb in ch.coded_sfb..ch.max_sfb {
 			ch.cbs[base + sfb] = 0;
 		}
@@ -744,8 +869,61 @@ fn choose_codebooks(ch: &mut ChannelFrame) {
 fn global_gain(ch: &ChannelFrame) -> i32 {
 	(0..ch.groups.len())
 		.flat_map(|g| (0..ch.coded_sfb).map(move |sfb| g * ch.max_sfb + sfb))
-		.find(|&i| ch.cbs[i] != 0)
+		.find(|&i| is_spectral(ch.cbs[i]))
 		.map_or(quant::SF_OFFSET, |i| ch.sf[i])
+}
+
+fn is_spectral(cb: u8) -> bool {
+	(1..=11).contains(&cb)
+}
+
+/// Bands coded for a window type and line cutoff (at least one).
+fn band_limit(offsets: &[u16], short: bool, cutoff: usize) -> usize {
+	let line_cut = if short { cutoff.div_ceil(8) } else { cutoff };
+	(0..offsets.len() - 1).filter(|&b| usize::from(offsets[b]) < line_cut).count().max(1)
+}
+
+/// Spectral flatness (geometric over arithmetic mean) of the energies of
+/// adjacent line pairs: about 0.56 for white noise, near 0 for tones.
+fn flatness(x: &[f32]) -> f32 {
+	let pairs = x.len() / 2;
+	if pairs < 2 {
+		return 0.0;
+	}
+	let (mut log_sum, mut sum) = (0.0f64, 0.0f64);
+	for p in x.chunks_exact(2) {
+		let e = f64::from(p[0] * p[0] + p[1] * p[1]) + 1e-3;
+		log_sum += e.ln();
+		sum += e;
+	}
+	let n = pairs as f64;
+	((log_sum / n).exp() / (sum / n)) as f32
+}
+
+/// Keeps the noise-energy chain codable: the first noise band is a 9-bit
+/// offset from `global_gain - 90`, the rest differences within ±60.
+fn constrain_noise(ch: &mut ChannelFrame) {
+	let mut prev: Option<i32> = None;
+	let base = global_gain_of(ch) - NOISE_OFFSET;
+	for b in 0..ch.bands.len() {
+		if !ch.noise[b] {
+			continue;
+		}
+		let v = match prev {
+			None => ch.nsf[b].clamp(base - NOISE_PRE, base + NOISE_PRE - 1),
+			Some(p) => ch.nsf[b].clamp(p - quant::MAX_SF_DIFF, p + quant::MAX_SF_DIFF),
+		}
+		.clamp(-100, 155);
+		ch.nsf[b] = v;
+		prev = Some(v);
+	}
+}
+
+/// `global_gain` before codebooks are chosen: the first coded spectral
+/// band's scalefactor (the same band [`global_gain`] finds once sections
+/// exist, since every coded band gets a spectral codebook).
+fn global_gain_of(ch: &ChannelFrame) -> i32 {
+	(0..ch.bands.len()).find(|&i| ch.coded[i]).map_or(quant::SF_OFFSET, |i| ch.sf[i])
 }
 
 fn ics_info_bits(ch: &ChannelFrame) -> usize {
@@ -779,14 +957,24 @@ fn ics_bits(ch: &ChannelFrame, common_window: bool) -> usize {
 	if !common_window {
 		bits += ics_info_bits(ch);
 	}
+	if ch.tns.present() {
+		bits += ch.tns.bits();
+	}
 	let mut last = global_gain(ch);
+	let mut noise: Option<i32> = None;
 	for g in 0..ch.groups.len() {
 		let base = g * ch.max_sfb;
 		bits += quant::section_bits(&ch.cbs[base..base + ch.coded_sfb], ch.len_bits()) as usize;
 		for sfb in 0..ch.coded_sfb {
 			let i = base + sfb;
 			let cb = ch.cbs[i];
-			if cb != 0 {
+			if cb == NOISE_BT {
+				bits += match noise {
+					None => 9,
+					Some(p) => quant::sf_diff_bits(ch.nsf[i] - p) as usize,
+				};
+				noise = Some(ch.nsf[i]);
+			} else if cb != 0 {
 				bits += quant::sf_diff_bits(ch.sf[i] - last) as usize;
 				last = ch.sf[i];
 				bits += quant::band_bits(cb, &ch.q[ch.band(i)]) as usize;
@@ -838,20 +1026,32 @@ fn write_ics(w: &mut BitWriter, ch: &ChannelFrame, common_window: bool) {
 		quant::write_sections(w, &ch.cbs[base..base + ch.coded_sfb], ch.len_bits());
 	}
 	let mut last = gain;
+	let mut noise: Option<i32> = None;
 	for g in 0..ch.groups.len() {
 		for sfb in 0..ch.coded_sfb {
 			let i = g * ch.max_sfb + sfb;
-			if ch.cbs[i] != 0 {
+			if ch.cbs[i] == NOISE_BT {
+				match noise {
+					None => w.put((ch.nsf[i] - (gain - NOISE_OFFSET) + NOISE_PRE) as u32, 9),
+					Some(p) => quant::write_sf_diff(w, ch.nsf[i] - p),
+				}
+				noise = Some(ch.nsf[i]);
+			} else if ch.cbs[i] != 0 {
 				quant::write_sf_diff(w, ch.sf[i] - last);
 				last = ch.sf[i];
 			}
 		}
 	}
-	w.put(0, 3); // pulse_data_present, tns_data_present, gain_control_data_present
+	w.bit(false); // pulse_data_present
+	w.bit(ch.tns.present());
+	if ch.tns.present() {
+		ch.tns.write(w);
+	}
+	w.bit(false); // gain_control_data_present
 	for g in 0..ch.groups.len() {
 		for sfb in 0..ch.coded_sfb {
 			let i = g * ch.max_sfb + sfb;
-			if ch.cbs[i] != 0 {
+			if is_spectral(ch.cbs[i]) {
 				quant::write_band(w, ch.cbs[i], &ch.q[ch.band(i)]);
 			}
 		}
@@ -1013,7 +1213,20 @@ mod tests {
 		bitrate: u32,
 		input: &[Vec<f32>],
 	) -> (AacEncoderState, Vec<Vec<u8>>) {
+		encode_with(rate, channels, bitrate, input, true, true)
+	}
+
+	fn encode_with(
+		rate: u32,
+		channels: u8,
+		bitrate: u32,
+		input: &[Vec<f32>],
+		tns: bool,
+		pns: bool,
+	) -> (AacEncoderState, Vec<Vec<u8>>) {
 		let mut enc = AacEncoderState::new(rate, channels, bitrate).expect("config");
+		enc.tns = tns;
+		enc.pns = pns;
 		let n = input[0].len();
 		for c in 0..usize::from(channels) {
 			enc.input[c].extend_from_slice(&input[c]);
@@ -1120,5 +1333,135 @@ mod tests {
 			let snr = snr_db(&input[c], &out[c][1024..1024 + n]);
 			assert!(c == 3 || snr > want, "channel {c}: {snr}");
 		}
+	}
+
+	/// Deterministic white noise in [-1, 1).
+	fn noise(n: usize, seed: u32) -> Vec<f32> {
+		let mut r = seed;
+		(0..n)
+			.map(|_| {
+				r = r.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+				(r >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+			})
+			.collect()
+	}
+
+	/// Pitch pulses (a 2 kHz resonance struck 125 times a second): the
+	/// temporal envelope inside each long frame is very uneven.
+	fn pulses(n: usize) -> Vec<f32> {
+		let period = 44_100 / 125;
+		(0..n)
+			.map(|i| {
+				let t = (i % period) as f32;
+				14000.0 * (-t / 40.0).exp() * (t * 2.0 * std::f32::consts::PI * 2000.0 / 44_100.0).sin()
+			})
+			.collect()
+	}
+
+	#[test]
+	fn tns_filters_pulses_and_decodes_exactly() {
+		let n = 44_100;
+		let x = pulses(n);
+		// High rate: the decoder's synthesis must invert the residual.
+		let (enc, frames) = encode_with(44_100, 1, 256_000, std::slice::from_ref(&x), true, false);
+		assert!(enc.tns_windows as usize > frames.len() / 2, "{} of {}", enc.tns_windows, frames.len());
+		let out = decode_all(&enc.audio_specific_config(), &frames, 1);
+		let snr = snr_db(&x, &out[0][1024..1024 + n]);
+		assert!(snr > 25.0, "{snr}");
+	}
+
+	#[test]
+	fn tns_moves_noise_out_of_the_gaps() {
+		// At a low rate the coding noise follows the pulse envelope with
+		// TNS, instead of filling the quiet part of each period.
+		let n = 44_100;
+		let x = pulses(n);
+		let period = 44_100 / 125;
+		let gap_noise = |tns: bool| {
+			let (enc, frames) = encode_with(44_100, 1, 48_000, std::slice::from_ref(&x), tns, false);
+			let out = decode_all(&enc.audio_specific_config(), &frames, 1);
+			let mut e = 0.0f64;
+			for i in 2048..n - 2048 {
+				if i % period > period / 2 {
+					let d = f64::from(out[0][1024 + i] - x[i]);
+					e += d * d;
+				}
+			}
+			e
+		};
+		let (with, without) = (gap_noise(true), gap_noise(false));
+		assert!(with < 0.7 * without, "with {with:.3e} without {without:.3e}");
+	}
+
+	/// Energy of MDCT lines `lo..hi` of `x`, and of `x - y` (the error),
+	/// summed over long frames.
+	fn band_energy(x: &[f32], y: &[f32], lo: usize, hi: usize) -> (f64, f64, f64) {
+		let fb = filterbank();
+		let (mut ex, mut ey, mut err) = (0.0f64, 0.0f64, 0.0f64);
+		for start in (0..x.len().saturating_sub(2 * FRAME)).step_by(FRAME) {
+			let a = transform(fb, &x[start..start + 2 * FRAME], WindowSequence::OnlyLong);
+			let b = transform(fb, &y[start..start + 2 * FRAME], WindowSequence::OnlyLong);
+			for k in lo..hi {
+				ex += f64::from(a[k]) * f64::from(a[k]);
+				ey += f64::from(b[k]) * f64::from(b[k]);
+				err += f64::from(a[k] - b[k]) * f64::from(a[k] - b[k]);
+			}
+		}
+		(ex, ey, err)
+	}
+
+	#[test]
+	fn pns_keeps_noise_energy_and_frees_bits() {
+		let n = 44_100;
+		let x: Vec<f32> = noise(n, 7).iter().map(|v| 6000.0 * v).collect();
+		let run = |pns: bool| {
+			let (enc, frames) = encode_with(44_100, 1, 48_000, std::slice::from_ref(&x), false, pns);
+			let out = decode_all(&enc.audio_specific_config(), &frames, 1);
+			let y = &out[0][1024..1024 + n];
+			// 5-14 kHz (MDCT lines 232-650): energy kept.
+			let (ex, ey, _) = band_energy(&x, y, 232, 650);
+			// Below 3.9 kHz (lines 0-180): waveform SNR.
+			let (sig, _, err) = band_energy(&x, y, 0, 180);
+			let bits: usize = frames.iter().map(|f| f.len() * 8).sum();
+			let rate = bits as f64 * 44_100.0 / (frames.len() * FRAME) as f64;
+			(enc.noise_bands, 10.0 * (ey / ex).log10(), 10.0 * (sig / err).log10(), rate)
+		};
+		let (bands, high_db, low_snr, rate) = run(true);
+		let (none, _, low_snr_off, _) = run(false);
+		assert_eq!(none, 0);
+		assert!(bands > 100, "{bands}");
+		assert!(high_db.abs() < 1.5, "high band {high_db:.2} dB");
+		// The bits PNS saves on the noise bands go to the coded ones.
+		assert!(low_snr > low_snr_off + 2.0, "{low_snr:.2} vs {low_snr_off:.2} dB");
+		assert!(rate < 48_000.0 * 1.05, "{rate}");
+	}
+
+	#[test]
+	fn pns_stays_off_for_tones_and_high_rates() {
+		let n = 22_050;
+		// Faded in and out so the ends aren't broadband clicks.
+		let fade = |i: usize| (i.min(n - 1 - i) as f32 / 2048.0).min(1.0);
+		let tone: Vec<f32> = (0..n).map(|i| 8000.0 * fade(i) * (i as f32 * 0.9).sin()).collect();
+		let (enc, _) = encode_all(44_100, 1, 48_000, &[tone]);
+		assert_eq!(enc.noise_bands, 0);
+		let x: Vec<f32> = noise(n, 3).iter().map(|v| 6000.0 * v).collect();
+		let (enc, frames) = encode_all(44_100, 1, 256_000, std::slice::from_ref(&x));
+		assert_eq!(enc.noise_bands, 0);
+		let out = decode_all(&enc.audio_specific_config(), &frames, 1);
+		assert!(snr_db(&x, &out[0][1024..1024 + n]) > 15.0);
+	}
+
+	#[test]
+	fn stereo_pns_and_tns_decode() {
+		let n = 30_000;
+		let a: Vec<f32> = noise(n, 11).iter().map(|v| 5000.0 * v).collect();
+		let b: Vec<f32> = pulses(n).iter().zip(noise(n, 5)).map(|(p, q)| p + 2000.0 * q).collect();
+		let (enc, frames) = encode_all(44_100, 2, 64_000, &[a, b]);
+		assert!(enc.noise_bands > 0 && enc.tns_windows > 0);
+		let out = decode_all(&enc.audio_specific_config(), &frames, 2);
+		assert_eq!(out[0].len(), frames.len() * FRAME);
+		let bits: usize = frames.iter().map(|f| f.len() * 8).sum();
+		let rate = bits as f64 * 44_100.0 / (frames.len() * FRAME) as f64;
+		assert!(rate < 64_000.0 * 1.05, "{rate}");
 	}
 }

@@ -1,29 +1,43 @@
 //! Macroblock analysis, coding and reconstruction (ISO/IEC 14496-10 §7.3.5
 //! syntax, written instead of read).
 //!
-//! Every candidate is coded for real: prediction, transform, quantisation,
-//! reconstruction with the decoder's own `recon` functions, and CAVLC into
-//! a scratch writer. The macroblock type is then chosen by rate-distortion
-//! cost `SSD + λ·bits` (x264's `--subme 7`-style final decision, without
-//! trellis), so the choice always reflects what will actually be sent.
+//! Every candidate is coded for real: prediction, transform, quantisation
+//! (deadzone, or trellis with CABAC), reconstruction with the decoder's own
+//! `recon` functions, and pricing of its syntax with the active entropy
+//! coder ([`super::syntax::MbWriter`] into a scratch CAVLC writer or the
+//! CABAC cost model). The macroblock type is chosen by rate-distortion
+//! cost `SSD + λ·bits` (x264's `--subme 7`-style final decision), so the
+//! choice always reflects what will actually be sent.
 //!
-//! Neighbour derivations (availability, intra-mode prediction, nC, motion
-//! vector prediction, P_Skip motion) mirror `h264::mb` / `h264::inter`
-//! clause for clause; the encoder's reconstruction must equal a decoder's.
+//! Candidates:
+//!
+//! * intra: Intra16x16 (4 modes), Intra4x4 and, with the 8x8 transform,
+//!   Intra8x8 (9 modes per block, mode by SATD + mode bits);
+//! * P: P_Skip, P_L0 16x16, 16x8, 8x16 and 8x8, each partition with its
+//!   own reference picture from list 0;
+//! * B: B_Skip and B_Direct_16x16 (spatial direct), B 16x16 / 16x8 / 8x16
+//!   with L0, L1 or bi-prediction per partition;
+//! * inter residuals with the 4x4 or the 8x8 transform, by RD.
+//!
+//! Neighbour derivations (availability, intra-mode prediction, motion
+//! vector prediction, P_Skip and direct motion) mirror `h264::mb` and
+//! `h264::inter` clause for clause; the encoder's reconstruction must equal
+//! a decoder's.
 
+use super::cabac::{Bins, CabacCost, CabacWriter};
 use super::me::{self, Padded};
-use super::transform::{Quant, decimate_score, fdct4, hadamard2, hadamard4, satd4};
-use super::vlc::{cbp_code, write_block};
+use super::syntax::{MbSyn, MbWriter, Nbr, SliceKind, SynType, b_mb_type, parts};
+use super::transform::{
+	Quant, decimate_score, decimate_score64, fdct4, fdct8, hadamard2, hadamard4, satd4, trellis_cabac,
+};
 use crate::codecs::bitstream::{BitWriter, se_bits, ue_bits};
-use crate::codecs::h264::consts::{BLK_XY, ZIGZAG_4X4, chroma_qp};
+use crate::codecs::h264::cabac::BlockCat;
+use crate::codecs::h264::consts::{BLK_XY, ZIGZAG_4X4, ZIGZAG_8X8, chroma_qp};
 use crate::codecs::h264::decode::Frame;
-use crate::codecs::h264::mb::{MbInfo, MbKind, Residual, blk_index};
+use crate::codecs::h264::dpb::MbMotion;
+use crate::codecs::h264::mb::{MbInfo, MbKind, Pred, Residual, Shape, blk_index};
 use crate::codecs::h264::params::Dequant;
 use crate::codecs::h264::recon::{self, Avail, Plane, Weighting};
-
-/// Identity of the single reference picture in `MbInfo::ref_id` (only
-/// compared within one picture by the deblocking filter).
-const REF_ID: u32 = 1;
 
 /// Source picture, padded to whole macroblocks.
 #[derive(Debug, Clone)]
@@ -36,34 +50,19 @@ pub struct Source {
 /// A decoded (deblocked) reference picture.
 #[derive(Debug)]
 pub struct Reference {
+	/// Identity used in `MbInfo::ref_id` (non-zero, unique per picture).
+	pub id: u32,
+	pub poc: i32,
 	pub y: Plane,
 	pub cb: Plane,
 	pub cr: Plane,
 	pub padded: Padded,
 	pub half: me::HalfPel,
+	/// Motion of every macroblock (the colocated data of direct mode).
+	pub motion: Vec<MbMotion>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Shape {
-	S16x16,
-	S16x8,
-	S8x16,
-	S8x8,
-}
-
-impl Shape {
-	/// Partitions as (x4, y4, w4, h4).
-	fn parts(self) -> &'static [(usize, usize, usize, usize)] {
-		match self {
-			Shape::S16x16 => &[(0, 0, 4, 4)],
-			Shape::S16x8 => &[(0, 0, 4, 2), (0, 2, 4, 2)],
-			Shape::S8x16 => &[(0, 0, 2, 4), (2, 0, 2, 4)],
-			Shape::S8x8 => &[(0, 0, 2, 2), (2, 0, 2, 2), (0, 2, 2, 2), (2, 2, 2, 2)],
-		}
-	}
-}
-
-/// Motion-vector neighbour (8.4.1.3.2), list 0 only.
+/// Motion-vector neighbour (8.4.1.3.2).
 #[derive(Debug, Clone, Copy)]
 struct Nb {
 	avail: bool,
@@ -80,99 +79,202 @@ fn median(a: i16, b: i16, c: i16) -> i16 {
 /// A fully coded macroblock candidate.
 struct Coded {
 	info: MbInfo,
-	bits: BitWriter,
+	syn: MbSyn,
+	res: Box<Residual>,
 	ssd: u64,
 	/// Reconstructed samples: 256 luma, 64 Cb, 64 Cr.
 	recon: Box<[u8; 384]>,
+	/// Bits of its syntax with the active entropy coder.
+	bits: f64,
+}
+
+/// Motion of one inter partition.
+#[derive(Debug, Clone, Copy)]
+struct PartMotion {
+	pred: Pred,
+	refs: [i8; 2],
+	mvs: [[i16; 2]; 2],
+}
+
+/// The entropy coder of the slice.
+pub enum SliceOut {
+	Cavlc(BitWriter),
+	Cabac(Box<CabacWriter>),
+}
+
+/// Coding tools and parameters of one picture.
+pub struct PicParams<'a> {
+	pub kind: SliceKind,
+	pub l0: Vec<&'a Reference>,
+	pub l1: Vec<&'a Reference>,
+	pub qp: i32,
+	pub transform_8x8: bool,
+	pub trellis: bool,
+	/// Largest vertical motion (in luma samples) the level allows.
+	pub max_mv_y: i32,
 }
 
 /// Per-picture encoding context.
 pub struct PicEncoder<'a> {
 	pub src: &'a Source,
 	pub f: &'a mut Frame,
-	pub reference: Option<&'a Reference>,
+	pub p: PicParams<'a>,
 	pub dq: &'a Dequant,
-	pub qp: i32,
+	qp: i32,
 	qpc: i32,
 	/// λ for SATD-domain decisions and λ² for SSD-domain RD.
 	lambda: u32,
 	lambda2: f64,
-	/// Largest vertical motion (in luma samples) the level allows.
-	max_mv_y: i32,
-	pub w: BitWriter,
+	pub out: SliceOut,
 	skip_run: u32,
 	mbx: usize,
 	mby: usize,
 	/// Statistics for the caller.
+	pub stats: MbStats,
+}
+
+/// Macroblock counts of one picture.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MbStats {
+	pub intra: u32,
+	pub intra8x8: u32,
 	pub skipped: u32,
-	pub intra_mbs: u32,
+	/// Inter macroblocks with the 8x8 transform.
+	pub inter8x8: u32,
+	/// Inter macroblocks with a reference index above 0.
+	pub multi_ref: u32,
+	/// Macroblocks with a bi-predicted or list-1 partition.
+	pub list1: u32,
+	pub direct: u32,
 }
 
 impl<'a> PicEncoder<'a> {
 	pub fn new(
 		src: &'a Source,
 		f: &'a mut Frame,
-		reference: Option<&'a Reference>,
+		p: PicParams<'a>,
 		dq: &'a Dequant,
-		qp: i32,
-		max_mv_y: i32,
-		w: BitWriter,
+		out: SliceOut,
 	) -> Self {
+		let qp = p.qp;
 		// x264's lambda tables: λ = 2^((qp-12)/6), λ² = 0.85·2^((qp-12)/3).
 		let lf = 2f64.powf(f64::from(qp - 12) / 6.0);
 		Self {
 			src,
 			f,
-			reference,
+			p,
 			dq,
 			qp,
 			qpc: i32::from(chroma_qp(qp, 0, 0)),
 			lambda: lf.round().max(1.0) as u32,
 			lambda2: 0.85 * lf * lf,
-			max_mv_y,
-			w,
+			out,
 			skip_run: 0,
 			mbx: 0,
 			mby: 0,
-			skipped: 0,
-			intra_mbs: 0,
+			stats: MbStats::default(),
 		}
 	}
 
-	/// Codes every macroblock of the picture (one slice) into `self.w`.
+	fn cabac(&self) -> bool {
+		matches!(self.out, SliceOut::Cabac(_))
+	}
+
+	/// Codes every macroblock of the picture (one slice) into `self.out`.
 	pub fn encode_slice(&mut self) {
-		let p_slice = self.reference.is_some();
+		let total = self.f.mb_w * self.f.mb_h;
 		for mby in 0..self.f.mb_h {
 			for mbx in 0..self.f.mb_w {
 				self.mbx = mbx;
 				self.mby = mby;
-				let best = if p_slice { self.decide_p() } else { self.decide_i() };
-				self.commit(best, p_slice);
+				let best = match self.p.kind {
+					SliceKind::I => self.best_intra(),
+					SliceKind::P => self.decide_p(),
+					SliceKind::B => self.decide_b(),
+				};
+				let last = mby * self.f.mb_w + mbx + 1 == total;
+				self.commit(best, last);
 			}
 		}
-		if p_slice && self.skip_run > 0 {
-			self.w.ue(self.skip_run);
+		if let SliceOut::Cavlc(w) = &mut self.out {
+			if self.p.kind != SliceKind::I && self.skip_run > 0 {
+				w.ue(self.skip_run);
+			}
 		}
 	}
 
-	fn commit(&mut self, c: Coded, p_slice: bool) {
+	fn writer(&self) -> MbWriter<'_> {
+		MbWriter {
+			nb: self.nbr(),
+			slice: self.p.kind,
+			num_ref: [self.p.l0.len(), self.p.l1.len()],
+			pps_8x8: self.p.transform_8x8,
+		}
+	}
+
+	fn nbr(&self) -> Nbr<'_> {
+		Nbr { mbs: &self.f.mbs, mb_w: self.f.mb_w, mb_h: self.f.mb_h, mbx: self.mbx, mby: self.mby }
+	}
+
+	fn commit(&mut self, c: Coded, last: bool) {
 		let (px, py) = (self.mbx * 16, self.mby * 16);
 		self.put_recon(&c.recon, px, py);
 		let addr = self.mby * self.f.mb_w + self.mbx;
-		if c.info.is_intra() {
-			self.intra_mbs += 1;
-		}
-		if c.info.kind == MbKind::PSkip {
-			self.skip_run += 1;
-			self.skipped += 1;
-		} else {
-			if p_slice {
-				self.w.ue(self.skip_run);
-				self.skip_run = 0;
+		let skip = c.info.is_skip();
+		let st = &mut self.stats;
+		st.intra += u32::from(c.info.is_intra());
+		st.intra8x8 += u32::from(c.info.kind == MbKind::I8x8);
+		st.skipped += u32::from(skip);
+		st.inter8x8 += u32::from(c.info.kind == MbKind::Inter && c.info.t8x8);
+		st.multi_ref +=
+			u32::from(!c.info.is_intra() && c.info.ref_idx.iter().flatten().any(|&r| r > 0));
+		st.list1 += u32::from(!c.info.is_intra() && c.info.ref_idx[1].iter().any(|&r| r >= 0));
+		st.direct += u32::from(c.info.direct16);
+		// Written with the neighbours as they stand (this macroblock not
+		// yet stored), as a decoder parses it.
+		let mut out = std::mem::replace(&mut self.out, SliceOut::Cavlc(BitWriter::new()));
+		match &mut out {
+			SliceOut::Cavlc(w) => {
+				if skip {
+					self.skip_run += 1;
+				} else {
+					if self.p.kind != SliceKind::I {
+						w.ue(self.skip_run);
+						self.skip_run = 0;
+					}
+					self.writer().cavlc(w, &c.info, &c.syn, &c.res);
+				}
 			}
-			self.w.append(&c.bits);
+			SliceOut::Cabac(cw) => {
+				self.writer().cabac(cw.as_mut(), &c.info, &c.syn, &c.res);
+				if !last {
+					cw.terminate(false);
+				}
+			}
 		}
+		self.out = out;
 		self.f.mbs[addr] = c.info;
+	}
+
+	/// Bits of a candidate's syntax with the active entropy coder.
+	fn price(&self, info: &MbInfo, syn: &MbSyn, res: &Residual) -> f64 {
+		match &self.out {
+			SliceOut::Cavlc(_) => {
+				if info.is_skip() {
+					return 0.0;
+				}
+				let mut w = BitWriter::new();
+				self.writer().cavlc(&mut w, info, syn, res);
+				// The skip run before a coded macroblock.
+				let run = if self.p.kind == SliceKind::I { 0 } else { ue_bits(self.skip_run) };
+				f64::from(w.bits() as u32 + run)
+			}
+			SliceOut::Cabac(cw) => {
+				let mut c = CabacCost::new(cw.states());
+				self.writer().cabac(&mut c, info, syn, res);
+				c.bits()
+			}
+		}
 	}
 
 	// -----------------------------------------------------------------------
@@ -197,34 +299,6 @@ impl<'a> PicEncoder<'a> {
 		self.nb_mb(dx, dy).map(|m| (m, idx))
 	}
 
-	fn nb_chroma<'b>(
-		&'b self,
-		cur: &'b MbInfo,
-		comp: usize,
-		x2: i32,
-		y2: i32,
-	) -> Option<(&'b MbInfo, usize)> {
-		let (dx, dy) = (x2.div_euclid(2), y2.div_euclid(2));
-		let idx = 16 + 8 * comp + (y2.rem_euclid(2) * 2 + x2.rem_euclid(2)) as usize;
-		if dx == 0 && dy == 0 {
-			return Some((cur, idx));
-		}
-		self.nb_mb(dx, dy).map(|m| (m, idx))
-	}
-
-	fn nc_luma(&self, cur: &MbInfo, x4: i32, y4: i32) -> i32 {
-		let get = |n: Option<(&MbInfo, usize)>| n.map(|(m, i)| i32::from(m.nnz[i]));
-		combine_nc(get(self.nb4(cur, x4 - 1, y4)), get(self.nb4(cur, x4, y4 - 1)))
-	}
-
-	fn nc_chroma(&self, cur: &MbInfo, comp: usize, x2: i32, y2: i32) -> i32 {
-		let get = |n: Option<(&MbInfo, usize)>| n.map(|(m, i)| i32::from(m.nnz[i]));
-		combine_nc(
-			get(self.nb_chroma(cur, comp, x2 - 1, y2)),
-			get(self.nb_chroma(cur, comp, x2, y2 - 1)),
-		)
-	}
-
 	/// [left, top, top-right, top-left] macroblock availability.
 	fn mb_avail(&self) -> [bool; 4] {
 		[
@@ -235,8 +309,9 @@ impl<'a> PicEncoder<'a> {
 		]
 	}
 
-	/// Intra 4x4 neighbour availability (as the decoder's `block_avail`).
-	fn block_avail(x4: usize, y4: usize, mb: [bool; 4]) -> Avail {
+	/// Intra 4x4 / 8x8 neighbour availability (the decoder's
+	/// `block_avail`; `size` 1 or 2 in 4x4 units).
+	fn block_avail(x4: usize, y4: usize, size: usize, mb: [bool; 4]) -> Avail {
 		let [l, t, tr, tl] = mb;
 		let left = if x4 > 0 { true } else { l };
 		let top = if y4 > 0 { true } else { t };
@@ -246,7 +321,7 @@ impl<'a> PicEncoder<'a> {
 			(true, false) => t,
 			(false, false) => tl,
 		};
-		let rx = x4 + 1;
+		let rx = x4 + size;
 		let top_right = if y4 == 0 {
 			if rx < 4 { t } else { tr }
 		} else if rx >= 4 {
@@ -257,11 +332,11 @@ impl<'a> PicEncoder<'a> {
 		Avail { left, top, top_right, top_left }
 	}
 
-	/// Predicted Intra_4x4 mode (8.3.1.1).
-	fn predicted_intra4(&self, cur: &MbInfo, x4: usize, y4: usize) -> u8 {
+	/// Predicted Intra_4x4 / Intra_8x8 mode (8.3.1.1, 8.3.2.1).
+	fn predicted_intra(&self, cur: &MbInfo, x4: usize, y4: usize) -> u8 {
 		let mode_of = |n: Option<(&MbInfo, usize)>| -> Option<u8> {
 			let (m, idx) = n?;
-			Some(if m.kind == MbKind::I4x4 { m.ipred[idx] } else { 2 })
+			Some(if matches!(m.kind, MbKind::I4x4 | MbKind::I8x8) { m.ipred[idx] } else { 2 })
 		};
 		let (x, y) = (x4 as i32, y4 as i32);
 		match (mode_of(self.nb4(cur, x - 1, y)), mode_of(self.nb4(cur, x, y - 1))) {
@@ -270,7 +345,7 @@ impl<'a> PicEncoder<'a> {
 		}
 	}
 
-	fn mv_nb(&self, cur: &MbInfo, x: i32, y: i32, px: usize, py: usize) -> Nb {
+	fn mv_nb(&self, cur: &MbInfo, list: usize, x: i32, y: i32, px: usize, py: usize) -> Nb {
 		if (0..4).contains(&x)
 			&& (0..4).contains(&y)
 			&& blk_index(x as usize, y as usize) >= blk_index(px, py)
@@ -286,42 +361,46 @@ impl<'a> PicEncoder<'a> {
 				if m.is_intra() {
 					return Nb { avail: true, ref_idx: -1, mv: [0, 0] };
 				}
-				let r = m.ref_idx[0][(idx / 8) * 2 + (idx % 4) / 2];
+				let r = m.ref_idx[list][(idx / 8) * 2 + (idx % 4) / 2];
 				if r < 0 {
 					Nb { avail: true, ref_idx: -1, mv: [0, 0] }
 				} else {
-					Nb { avail: true, ref_idx: r, mv: m.mv[0][idx] }
+					Nb { avail: true, ref_idx: r, mv: m.mv[list][idx] }
 				}
 			}
 		}
 	}
 
-	/// Motion vector predictor for a list-0 partition with ref_idx 0.
+	/// Motion vector predictor (8.4.1.3) for a partition of list `list`
+	/// with reference `ref_idx`.
+	#[allow(clippy::too_many_arguments)]
 	fn predict_mv(
 		&self,
 		cur: &MbInfo,
+		list: usize,
 		x4: usize,
 		y4: usize,
 		w4: usize,
+		ref_idx: i8,
 		shape: Shape,
 		part: usize,
 	) -> [i16; 2] {
 		let (x, y) = (x4 as i32, y4 as i32);
-		let a = self.mv_nb(cur, x - 1, y, x4, y4);
-		let b = self.mv_nb(cur, x, y - 1, x4, y4);
-		let mut c = self.mv_nb(cur, x + w4 as i32, y - 1, x4, y4);
+		let a = self.mv_nb(cur, list, x - 1, y, x4, y4);
+		let b = self.mv_nb(cur, list, x, y - 1, x4, y4);
+		let mut c = self.mv_nb(cur, list, x + w4 as i32, y - 1, x4, y4);
 		if !c.avail {
-			c = self.mv_nb(cur, x - 1, y - 1, x4, y4);
+			c = self.mv_nb(cur, list, x - 1, y - 1, x4, y4);
 		}
 		match (shape, part) {
-			(Shape::S16x8, 0) if b.ref_idx == 0 => return b.mv,
-			(Shape::S16x8, 1) if a.ref_idx == 0 => return a.mv,
-			(Shape::S8x16, 0) if a.ref_idx == 0 => return a.mv,
-			(Shape::S8x16, 1) if c.ref_idx == 0 => return c.mv,
+			(Shape::S16x8, 0) if b.ref_idx == ref_idx => return b.mv,
+			(Shape::S16x8, 1) if a.ref_idx == ref_idx => return a.mv,
+			(Shape::S8x16, 0) if a.ref_idx == ref_idx => return a.mv,
+			(Shape::S8x16, 1) if c.ref_idx == ref_idx => return c.mv,
 			_ => {}
 		}
 		let (b, c) = if !b.avail && !c.avail && a.avail { (a, a) } else { (b, c) };
-		match [a.ref_idx == 0, b.ref_idx == 0, c.ref_idx == 0] {
+		match [a.ref_idx == ref_idx, b.ref_idx == ref_idx, c.ref_idx == ref_idx] {
 			[true, false, false] => a.mv,
 			[false, true, false] => b.mv,
 			[false, false, true] => c.mv,
@@ -332,13 +411,72 @@ impl<'a> PicEncoder<'a> {
 	/// P_Skip motion (8.4.1.1).
 	fn skip_mv(&self) -> [i16; 2] {
 		let cur = MbInfo::default();
-		let a = self.mv_nb(&cur, -1, 0, 0, 0);
-		let b = self.mv_nb(&cur, 0, -1, 0, 0);
+		let a = self.mv_nb(&cur, 0, -1, 0, 0, 0);
+		let b = self.mv_nb(&cur, 0, 0, -1, 0, 0);
 		let zero = !a.avail
 			|| !b.avail
 			|| (a.ref_idx == 0 && a.mv == [0, 0])
 			|| (b.ref_idx == 0 && b.mv == [0, 0]);
-		if zero { [0, 0] } else { self.predict_mv(&cur, 0, 0, 4, Shape::S16x16, 0) }
+		if zero { [0, 0] } else { self.predict_mv(&cur, 0, 0, 0, 4, 0, Shape::S16x16, 0) }
+	}
+
+	/// Spatial direct prediction (8.4.1.2.2) of the whole macroblock with
+	/// `direct_8x8_inference_flag`, into `cur`'s references and vectors.
+	fn predict_direct(&self, cur: &mut MbInfo) {
+		let mut refs = [-1i8; 2];
+		let mut mvp = [[0i16; 2]; 2];
+		for (list, r) in refs.iter_mut().enumerate() {
+			let a = self.mv_nb(cur, list, -1, 0, 0, 0);
+			let b = self.mv_nb(cur, list, 0, -1, 0, 0);
+			let mut c = self.mv_nb(cur, list, 4, -1, 0, 0);
+			if !c.avail {
+				c = self.mv_nb(cur, list, -1, -1, 0, 0);
+			}
+			let min_pos = |x: i8, y: i8| if x >= 0 && y >= 0 { x.min(y) } else { x.max(y) };
+			*r = min_pos(a.ref_idx, min_pos(b.ref_idx, c.ref_idx));
+		}
+		let direct_zero = refs[0] < 0 && refs[1] < 0;
+		if direct_zero {
+			refs = [0, 0];
+		} else {
+			for list in 0..2 {
+				if refs[list] >= 0 {
+					mvp[list] = self.predict_mv(cur, list, 0, 0, 4, refs[list], Shape::S16x16, 0);
+				}
+			}
+		}
+		let addr = self.mby * self.f.mb_w + self.mbx;
+		let col = self.p.l1.first().and_then(|r| r.motion.get(addr)).copied().unwrap_or_default();
+		for b8 in 0..4 {
+			let (bx, by) = ((b8 % 2) * 2, (b8 / 2) * 2);
+			for list in 0..2 {
+				cur.ref_idx[list][b8] = if refs[list] >= 0 { refs[list] } else { -1 };
+			}
+			for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+				let idx = (by + dy) * 4 + bx + dx;
+				// direct_8x8_inference: the corner block of the 8x8.
+				let (xc, yc) = (((bx + dx) / 2) * 3, ((by + dy) / 2) * 3);
+				let blk = yc * 4 + xc;
+				let cb8 = (yc / 2) * 2 + xc / 2;
+				let col_zero = !col.intra && {
+					let (l, r) = if col.ref_idx[0][cb8] >= 0 {
+						(0, col.ref_idx[0][cb8])
+					} else {
+						(1, col.ref_idx[1][cb8])
+					};
+					let mv = col.mv[l][blk];
+					r == 0 && (-1..=1).contains(&mv[0]) && (-1..=1).contains(&mv[1])
+				};
+				for list in 0..2 {
+					cur.mv[list][idx] = if refs[list] < 0 || direct_zero || (refs[list] == 0 && col_zero) {
+						[0, 0]
+					} else {
+						mvp[list]
+					};
+					cur.mvd[list][idx] = [0, 0];
+				}
+			}
+		}
 	}
 
 	// -----------------------------------------------------------------------
@@ -358,6 +496,22 @@ impl<'a> PicEncoder<'a> {
 			}
 		}
 		d
+	}
+
+	fn diff8(&self, x: usize, y: usize) -> [i32; 64] {
+		let (s, r) = (&self.src.y, &self.f.y);
+		let mut d = [0i32; 64];
+		for j in 0..8 {
+			for i in 0..8 {
+				let k = (y + j) * s.width + x + i;
+				d[j * 8 + i] = i32::from(s.data[k]) - i32::from(r.data[k]);
+			}
+		}
+		d
+	}
+
+	fn satd8(&self, x: usize, y: usize) -> u32 {
+		(0..4).map(|q| satd4(&self.diff4(0, x + (q % 2) * 4, y + (q / 2) * 4))).sum()
 	}
 
 	fn ssd(&self) -> u64 {
@@ -412,43 +566,125 @@ impl<'a> PicEncoder<'a> {
 		let mut info = MbInfo { slice: 1, kind, ipred: [2; 16], ..MbInfo::default() };
 		info.qp = self.qp as i8;
 		info.qpc = [self.qpc as i8; 2];
-		if kind == MbKind::I4x4 || kind == MbKind::I16x16 {
-			info.ref_idx = [[-1; 4]; 2];
-		} else {
-			info.ref_idx = [[0; 4], [-1; 4]];
-			info.ref_id = [[REF_ID; 4], [0; 4]];
-		}
+		info.ref_idx = [[-1; 4]; 2];
 		info
 	}
 
-	fn finish(&self, info: MbInfo, bits: BitWriter) -> Coded {
-		Coded { info, bits, ssd: self.ssd(), recon: self.take_recon() }
+	fn finish(&self, info: MbInfo, syn: MbSyn, res: Box<Residual>) -> Coded {
+		let bits = self.price(&info, &syn, &res);
+		Coded { info, syn, res, ssd: self.ssd(), recon: self.take_recon(), bits }
 	}
 
-	fn rd_cost(&self, c: &Coded, extra_bits: usize) -> f64 {
-		c.ssd as f64 + self.lambda2 * (c.bits.bits() + extra_bits) as f64
+	fn rd_cost(&self, c: &Coded) -> f64 {
+		c.ssd as f64 + self.lambda2 * c.bits
+	}
+
+	/// Trellis λ: 1/256 bit in units of squared level error at `qp`.
+	fn trellis_lambda(&self, qp: i32) -> f64 {
+		let step = 0.625 * 2f64.powf(f64::from(qp) / 6.0);
+		self.lambda2 / (step * step) / 256.0
+	}
+
+	fn trellis_on(&self) -> bool {
+		self.p.trellis && self.cabac()
+	}
+
+	/// Quantises a 4x4 block (raster) from `start`: trellis with CABAC
+	/// when enabled, deadzone otherwise. `cbf_inc` prices the block's
+	/// coded_block_flag in the trellis.
+	#[allow(clippy::too_many_arguments)]
+	fn quant4(
+		&self,
+		coef: &mut [i32; 16],
+		quant: &Quant,
+		qp: i32,
+		start: usize,
+		cat: BlockCat,
+		cbf_inc: usize,
+	) {
+		let SliceOut::Cabac(cw) = &self.out else {
+			quant.block4(coef, start == 1);
+			return;
+		};
+		if !self.p.trellis {
+			quant.block4(coef, start == 1);
+			return;
+		}
+		let n = 16 - start;
+		let mut z = [0f64; 16];
+		for k in 0..n {
+			let pos = usize::from(ZIGZAG_4X4[k + start]);
+			z[k] = quant.real4(coef[pos], pos);
+		}
+		let mut lv = [0i32; 16];
+		trellis_cabac(&z[..n], cat, Some(cbf_inc), cw.states(), self.trellis_lambda(qp), &mut lv);
+		for k in 0..n {
+			coef[usize::from(ZIGZAG_4X4[k + start])] = lv[k];
+		}
+	}
+
+	fn quant8(&self, coef: &mut [i32; 64], quant: &Quant) {
+		let SliceOut::Cabac(cw) = &self.out else {
+			quant.block8(coef);
+			return;
+		};
+		if !self.p.trellis {
+			quant.block8(coef);
+			return;
+		}
+		let mut z = [0f64; 64];
+		for (k, zk) in z.iter_mut().enumerate() {
+			let pos = usize::from(ZIGZAG_8X8[k]);
+			*zk = quant.real8(coef[pos], pos);
+		}
+		let mut lv = [0i32; 64];
+		trellis_cabac(&z, BlockCat::Luma8x8, None, cw.states(), self.trellis_lambda(self.qp), &mut lv);
+		for k in 0..64 {
+			coef[usize::from(ZIGZAG_8X8[k])] = lv[k];
+		}
+	}
+
+	/// Approximate coded_block_flag ctxIdxInc of a luma 4x4 block while
+	/// the macroblock is being built (its cbp counted as all set).
+	fn cbf_inc_luma(&self, info: &MbInfo, x4: usize, y4: usize) -> usize {
+		if !self.trellis_on() {
+			return 0;
+		}
+		let mut tmp = *info;
+		tmp.cbp |= 15;
+		self.writer().cbf_luma_inc(&tmp, x4 as i32, y4 as i32)
 	}
 
 	// -----------------------------------------------------------------------
 	// Residual coding shared by every macroblock type
 
 	/// Chroma prediction is in the frame: transform, quantise and
-	/// reconstruct both components; sets `cbp` bits 4-5 and `nnz[16..]`.
+	/// reconstruct both components; sets `cbp` bits 4-5, `dc_cbf` bits 1-2
+	/// and `nnz[16..]`.
 	fn code_chroma(&mut self, info: &mut MbInfo, res: &mut Residual, intra: bool) {
 		let (cx, cy) = (self.mbx * 8, self.mby * 8);
 		let quant = Quant::new(self.qpc, intra);
 		let mut any_dc = false;
 		let mut any_ac = false;
 		let mut ac_nnz = [[0u8; 4]; 2];
+		let trellis = self.trellis_on();
 		for c in 0..2 {
 			let mut dc = [0i32; 4];
 			for blk in 0..4 {
 				let d = self.diff4(c + 1, cx + (blk % 2) * 4, cy + (blk / 2) * 4);
 				let mut coef = fdct4(&d);
 				dc[blk] = coef[0];
-				quant.block4(&mut coef, true);
+				let inc = if trellis {
+					let mut tmp = *info;
+					tmp.cbp |= 0x20;
+					self.writer().cbf_chroma_ac_inc(&tmp, c, (blk % 2) as i32, (blk / 2) as i32)
+				} else {
+					0
+				};
+				self.quant4(&mut coef, &quant, self.qpc, 1, BlockCat::ChromaAc, inc);
 				coef[0] = 0;
 				res.chroma_ac[c][blk] = coef;
+				info.nnz[16 + 8 * c + blk] = coef.iter().filter(|&&v| v != 0).count() as u8;
 			}
 			let mut dcq = hadamard2(&dc);
 			any_dc |= quant.dc(&mut dcq);
@@ -475,7 +711,11 @@ impl<'a> PicEncoder<'a> {
 			0
 		};
 		info.cbp |= cbp_c << 4;
+		info.dc_cbf &= 1;
 		for c in 0..2 {
+			if cbp_c != 0 && res.chroma_dc[c][..4].iter().any(|&v| v != 0) {
+				info.dc_cbf |= 2 << c;
+			}
 			for blk in 0..4 {
 				info.nnz[16 + 8 * c + blk] = if cbp_c == 2 { ac_nnz[c][blk] } else { 0 };
 				if cbp_c != 2 {
@@ -484,6 +724,7 @@ impl<'a> PicEncoder<'a> {
 			}
 		}
 		if cbp_c == 0 {
+			res.chroma_dc = [[0; 8]; 2];
 			return;
 		}
 		// Reconstruct exactly as the decoder does.
@@ -506,20 +747,24 @@ impl<'a> PicEncoder<'a> {
 		}
 	}
 
-	/// Inter luma residual: transform, quantise (with x264-style
-	/// decimation) and reconstruct. Sets `cbp` bits 0-3 and `nnz[..16]`.
+	/// Inter luma residual with the 4x4 transform (with x264-style
+	/// decimation). Sets `cbp` bits 0-3 and `nnz[..16]`.
 	fn code_inter_luma(&mut self, info: &mut MbInfo, res: &mut Residual) {
 		let (px, py) = (self.mbx * 16, self.mby * 16);
 		let quant = Quant::new(self.qp, false);
 		let mut scores = [0u32; 4];
-		for raster in 0..16 {
-			let (x4, y4) = (raster % 4, raster / 4);
+		for blk in 0..16 {
+			let (x4, y4) = (usize::from(BLK_XY[blk].0), usize::from(BLK_XY[blk].1));
+			let raster = y4 * 4 + x4;
 			let mut coef = fdct4(&self.diff4(0, px + x4 * 4, py + y4 * 4));
-			quant.block4(&mut coef, false);
+			let inc = self.cbf_inc_luma(info, x4, y4);
+			self.quant4(&mut coef, &quant, self.qp, 0, BlockCat::Luma4x4, inc);
 			res.luma[raster] = coef;
+			info.nnz[raster] = coef.iter().filter(|&&v| v != 0).count() as u8;
 			scores[(y4 / 2) * 2 + x4 / 2] += decimate_score(&scan_full(&coef));
 		}
 		let total: u32 = scores.iter().map(|&s| s.min(9)).sum();
+		info.cbp &= !15;
 		for raster in 0..16 {
 			let (x4, y4) = (raster % 4, raster / 4);
 			let b8 = (y4 / 2) * 2 + x4 / 2;
@@ -542,40 +787,57 @@ impl<'a> PicEncoder<'a> {
 		}
 	}
 
-	/// `residual()` for the macroblock (7.3.5.3), CAVLC.
-	fn write_residual(&self, w: &mut BitWriter, info: &MbInfo, res: &Residual) {
-		let i16 = info.kind == MbKind::I16x16;
-		if i16 {
-			let nc = self.nc_luma(info, 0, 0);
-			write_block(w, nc, &scan_full(&res.dc));
-		}
-		for b8 in 0..4usize {
-			if info.cbp & (1 << b8) == 0 {
-				continue;
+	/// `nnz` of an 8x8-transform block as the decoder records it: the
+	/// block's count in all four 4x4 entries with CABAC, the count of each
+	/// interleaved 4x4 sub-block with CAVLC.
+	fn set_nnz8(&self, info: &mut MbInfo, b8: usize, coef: &[i32; 64]) {
+		let (x4, y4) = ((b8 % 2) * 2, (b8 / 2) * 2);
+		if self.cabac() {
+			let n = coef.iter().filter(|&&v| v != 0).count() as u8;
+			for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+				info.nnz[(y4 + dy) * 4 + x4 + dx] = n;
 			}
+		} else {
 			for i in 0..4 {
-				let (x4, y4) = (usize::from(BLK_XY[b8 * 4 + i].0), usize::from(BLK_XY[b8 * 4 + i].1));
-				let raster = y4 * 4 + x4;
-				let nc = self.nc_luma(info, x4 as i32, y4 as i32);
-				if i16 {
-					write_block(w, nc, &scan_ac(&res.luma[raster]));
-				} else {
-					write_block(w, nc, &scan_full(&res.luma[raster]));
-				}
+				let (bx, by) = (usize::from(BLK_XY[b8 * 4 + i].0), usize::from(BLK_XY[b8 * 4 + i].1));
+				let n = (0..16).filter(|&k| coef[usize::from(ZIGZAG_8X8[4 * k + i])] != 0).count() as u8;
+				info.nnz[by * 4 + bx] = n;
 			}
 		}
-		let cbp_c = info.cbp >> 4;
-		if cbp_c != 0 {
-			for c in 0..2 {
-				write_block(w, -1, &res.chroma_dc[c][..4]);
+	}
+
+	/// Inter luma residual with the 8x8 transform (x264 decimation of 8x8
+	/// blocks). Sets `t8x8`, `cbp` bits 0-3 and `nnz[..16]`.
+	fn code_inter_luma8(&mut self, info: &mut MbInfo, res: &mut Residual) {
+		let (px, py) = (self.mbx * 16, self.mby * 16);
+		let quant = Quant::new(self.qp, false);
+		info.t8x8 = true;
+		let mut scores = [0u32; 4];
+		for b8 in 0..4 {
+			let mut coef = fdct8(&self.diff8(px + (b8 % 2) * 8, py + (b8 / 2) * 8));
+			self.quant8(&mut coef, &quant);
+			let scan: [i32; 64] = std::array::from_fn(|k| coef[usize::from(ZIGZAG_8X8[k])]);
+			scores[b8] = decimate_score64(&scan);
+			res.luma8[b8] = coef;
+		}
+		let total: u32 = scores.iter().map(|&s| s.min(9)).sum();
+		info.cbp &= !15;
+		for b8 in 0..4 {
+			if scores[b8] < 4 || total < 6 {
+				res.luma8[b8] = [0; 64];
+			}
+			let coef = res.luma8[b8];
+			self.set_nnz8(info, b8, &coef);
+			if coef.iter().any(|&v| v != 0) {
+				info.cbp |= 1 << b8;
 			}
 		}
-		if cbp_c == 2 {
-			for c in 0..2 {
-				for blk in 0..4 {
-					let nc = self.nc_chroma(info, c, (blk % 2) as i32, (blk / 2) as i32);
-					write_block(w, nc, &scan_ac(&res.chroma_ac[c][blk]));
-				}
+		let scale = &self.dq.l8[1][(self.qp % 6) as usize];
+		for b8 in 0..4 {
+			if info.cbp & (1 << b8) != 0 {
+				let mut block = res.luma8[b8];
+				recon::dequant8(&mut block, self.qp, scale, 8);
+				recon::idct8_add(&mut self.f.y.d8(), px + (b8 % 2) * 8, py + (b8 / 2) * 8, &block);
 			}
 		}
 	}
@@ -634,21 +896,26 @@ impl<'a> PicEncoder<'a> {
 		best
 	}
 
-	fn encode_i16(&mut self, mode: u8, chroma: u8, p_slice: bool) -> Coded {
+	fn encode_i16(&mut self, mode: u8, chroma: u8) -> Coded {
 		let (px, py) = (self.mbx * 16, self.mby * 16);
 		let mb = self.mb_avail();
 		let av = Avail { left: mb[0], top: mb[1], top_right: false, top_left: mb[3] };
 		let mut info = self.base_info(MbKind::I16x16);
-		let mut res = Residual::default();
+		let mut res = Box::<Residual>::default();
 		recon::pred_block(&mut self.f.y.d8(), px, py, 16, 16, mode, av, false);
 		let quant = Quant::new(self.qp, true);
 		let mut dc = [0i32; 16];
 		let mut any_ac = false;
-		for raster in 0..16 {
-			let mut coef = fdct4(&self.diff4(0, px + (raster % 4) * 4, py + (raster / 4) * 4));
+		for blk in 0..16 {
+			let (x4, y4) = (usize::from(BLK_XY[blk].0), usize::from(BLK_XY[blk].1));
+			let raster = y4 * 4 + x4;
+			let mut coef = fdct4(&self.diff4(0, px + x4 * 4, py + y4 * 4));
 			dc[raster] = coef[0];
-			any_ac |= quant.block4(&mut coef, true);
+			let inc = self.cbf_inc_luma(&info, x4, y4);
+			self.quant4(&mut coef, &quant, self.qp, 1, BlockCat::LumaAc, inc);
 			coef[0] = 0;
+			info.nnz[raster] = coef.iter().filter(|&&v| v != 0).count() as u8;
+			any_ac |= info.nnz[raster] != 0;
 			res.luma[raster] = coef;
 		}
 		let mut dcq = hadamard4(&dc);
@@ -680,39 +947,45 @@ impl<'a> PicEncoder<'a> {
 		self.predict_chroma(chroma, av);
 		info.chroma_pred = chroma;
 		self.code_chroma(&mut info, &mut res, true);
-
-		let mut w = BitWriter::new();
-		let cbp_c = u32::from(info.cbp >> 4);
-		let mb_type = 1 + u32::from(mode) + 4 * cbp_c + if cbp_l != 0 { 12 } else { 0 };
-		w.ue(mb_type + if p_slice { 5 } else { 0 });
-		w.ue(u32::from(chroma));
-		w.se(0); // mb_qp_delta
-		self.write_residual(&mut w, &info, &res);
-		self.finish(info, w)
+		self.finish(info, MbSyn::new(SynType::I16x16 { pred: mode }), res)
 	}
 
-	fn encode_i4(&mut self, chroma: u8, p_slice: bool) -> Coded {
+	/// Mode-signalling cost in bits of `mode` against the predicted mode.
+	fn mode_bits(mode: u8, pred_mode: u8) -> u32 {
+		if mode == pred_mode { 1 } else { 4 }
+	}
+
+	fn rem_of(mode: u8, pred_mode: u8) -> i8 {
+		if mode == pred_mode {
+			-1
+		} else if mode < pred_mode {
+			mode as i8
+		} else {
+			mode as i8 - 1
+		}
+	}
+
+	fn encode_i4(&mut self, chroma: u8) -> Coded {
 		let (px, py) = (self.mbx * 16, self.mby * 16);
 		let mb = self.mb_avail();
 		let mut info = self.base_info(MbKind::I4x4);
-		let mut res = Residual::default();
+		let mut syn = MbSyn::new(SynType::I4x4);
+		let mut res = Box::<Residual>::default();
 		let quant = Quant::new(self.qp, true);
 		let scale = &self.dq.l4[0][(self.qp % 6) as usize];
-		let mut mode_bits = BitWriter::new();
 		for blk in 0..16 {
 			let (x4, y4) = (usize::from(BLK_XY[blk].0), usize::from(BLK_XY[blk].1));
 			let raster = y4 * 4 + x4;
 			let (x, y) = (px + x4 * 4, py + y4 * 4);
-			let av = Self::block_avail(x4, y4, mb);
-			let pred_mode = self.predicted_intra4(&info, x4, y4);
+			let av = Self::block_avail(x4, y4, 1, mb);
+			let pred_mode = self.predicted_intra(&info, x4, y4);
 			let mut best = (u32::MAX, 2u8);
 			for mode in 0..9u8 {
 				if !intra4_mode_ok(mode, av) {
 					continue;
 				}
 				recon::pred4x4(&mut self.f.y.d8(), x, y, mode, av);
-				let bits = if mode == pred_mode { 1 } else { 4 };
-				let cost = satd4(&self.diff4(0, x, y)) + self.lambda * bits;
+				let cost = satd4(&self.diff4(0, x, y)) + self.lambda * Self::mode_bits(mode, pred_mode);
 				if cost < best.0 {
 					best = (cost, mode);
 				}
@@ -720,14 +993,10 @@ impl<'a> PicEncoder<'a> {
 			let mode = best.1;
 			recon::pred4x4(&mut self.f.y.d8(), x, y, mode, av);
 			info.ipred[raster] = mode;
-			if mode == pred_mode {
-				mode_bits.bit(true);
-			} else {
-				mode_bits.bit(false);
-				mode_bits.put(u32::from(if mode < pred_mode { mode } else { mode - 1 }), 3);
-			}
+			syn.intra_rem[blk] = Self::rem_of(mode, pred_mode);
 			let mut coef = fdct4(&self.diff4(0, x, y));
-			quant.block4(&mut coef, false);
+			let inc = self.cbf_inc_luma(&info, x4, y4);
+			self.quant4(&mut coef, &quant, self.qp, 0, BlockCat::Luma4x4, inc);
 			res.luma[raster] = coef;
 			let n = coef.iter().filter(|&&v| v != 0).count() as u8;
 			info.nnz[raster] = n;
@@ -742,69 +1011,132 @@ impl<'a> PicEncoder<'a> {
 		self.predict_chroma(chroma, av);
 		info.chroma_pred = chroma;
 		self.code_chroma(&mut info, &mut res, true);
-
-		let mut w = BitWriter::new();
-		w.ue(if p_slice { 5 } else { 0 });
-		w.append(&mode_bits);
-		w.ue(u32::from(chroma));
-		w.ue(cbp_code(info.cbp, true));
-		if info.cbp != 0 {
-			w.se(0);
-		}
-		self.write_residual(&mut w, &info, &res);
-		self.finish(info, w)
+		self.finish(info, syn, res)
 	}
 
-	/// Best intra candidate (I16x16 or I4x4) by RD cost.
-	fn best_intra(&mut self, p_slice: bool) -> Coded {
+	fn encode_i8(&mut self, chroma: u8) -> Coded {
+		let (px, py) = (self.mbx * 16, self.mby * 16);
+		let mb = self.mb_avail();
+		let mut info = self.base_info(MbKind::I8x8);
+		info.t8x8 = true;
+		let mut syn = MbSyn::new(SynType::I8x8);
+		let mut res = Box::<Residual>::default();
+		let quant = Quant::new(self.qp, true);
+		let scale = &self.dq.l8[0][(self.qp % 6) as usize];
+		for b8 in 0..4 {
+			let (x4, y4) = ((b8 % 2) * 2, (b8 / 2) * 2);
+			let (x, y) = (px + x4 * 4, py + y4 * 4);
+			let av = Self::block_avail(x4, y4, 2, mb);
+			let pred_mode = self.predicted_intra(&info, x4, y4);
+			let mut best = (u32::MAX, 2u8);
+			for mode in 0..9u8 {
+				if !intra4_mode_ok(mode, av) {
+					continue;
+				}
+				recon::pred8x8l(&mut self.f.y.d8(), x, y, mode, av);
+				let cost = self.satd8(x, y) + self.lambda * Self::mode_bits(mode, pred_mode);
+				if cost < best.0 {
+					best = (cost, mode);
+				}
+			}
+			let mode = best.1;
+			recon::pred8x8l(&mut self.f.y.d8(), x, y, mode, av);
+			for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+				info.ipred[(y4 + dy) * 4 + x4 + dx] = mode;
+			}
+			syn.intra_rem[b8] = Self::rem_of(mode, pred_mode);
+			let mut coef = fdct8(&self.diff8(x, y));
+			self.quant8(&mut coef, &quant);
+			res.luma8[b8] = coef;
+			self.set_nnz8(&mut info, b8, &coef);
+			if coef.iter().any(|&v| v != 0) {
+				info.cbp |= 1 << b8;
+				let mut block = coef;
+				recon::dequant8(&mut block, self.qp, scale, 8);
+				recon::idct8_add(&mut self.f.y.d8(), x, y, &block);
+			}
+		}
+		let av = Avail { left: mb[0], top: mb[1], top_right: false, top_left: mb[3] };
+		self.predict_chroma(chroma, av);
+		info.chroma_pred = chroma;
+		self.code_chroma(&mut info, &mut res, true);
+		self.finish(info, syn, res)
+	}
+
+	/// Best intra candidate (I16x16, I4x4 or I8x8) by RD cost.
+	fn best_intra(&mut self) -> Coded {
 		let mb = self.mb_avail();
 		let av = Avail { left: mb[0], top: mb[1], top_right: false, top_left: mb[3] };
 		let chroma = self.choose_chroma_mode(av);
 		let (mode, _) = self.choose_i16_mode(av);
-		let i16 = self.encode_i16(mode, chroma, p_slice);
-		let i4 = self.encode_i4(chroma, p_slice);
-		if self.rd_cost(&i4, 0) < self.rd_cost(&i16, 0) { i4 } else { i16 }
-	}
-
-	fn decide_i(&mut self) -> Coded {
-		self.best_intra(false)
+		let mut best = self.encode_i16(mode, chroma);
+		let i4 = self.encode_i4(chroma);
+		if self.rd_cost(&i4) < self.rd_cost(&best) {
+			best = i4;
+		}
+		if self.p.transform_8x8 {
+			let i8 = self.encode_i8(chroma);
+			if self.rd_cost(&i8) < self.rd_cost(&best) {
+				best = i8;
+			}
+		}
+		best
 	}
 
 	// -----------------------------------------------------------------------
-	// Inter
+	// Inter prediction
 
-	/// Motion-compensates partition (x4, y4, w4, h4) with `mv` into the frame.
-	fn mc_part(&mut self, x4: usize, y4: usize, w4: usize, h4: usize, mv: [i16; 2]) {
-		let Some(r) = self.reference else { return };
+	fn list(&self, l: usize) -> &[&'a Reference] {
+		if l == 0 { &self.p.l0 } else { &self.p.l1 }
+	}
+
+	/// Motion-compensates rectangle (x4, y4, w4, h4) from `info`'s
+	/// references and vectors into the frame (the decoder's `mc_rect`).
+	fn mc_rect(&mut self, info: &MbInfo, x4: usize, y4: usize, w4: usize, h4: usize) {
+		let idx = y4 * 4 + x4;
+		let b8 = (idx / 8) * 2 + (idx % 4) / 2;
+		let refs = [info.ref_idx[0][b8], info.ref_idx[1][b8]];
 		let (bw, bh) = (w4 * 4, h4 * 4);
 		let px = self.mbx * 16 + x4 * 4;
 		let py = self.mby * 16 + y4 * 4;
-		let (mx, my) = (i32::from(mv[0]), i32::from(mv[1]));
-		let mut luma = [0u8; 256];
-		recon::mc_luma(
-			&r.y.s8(),
-			px as i32 + (mx >> 2),
-			py as i32 + (my >> 2),
-			mx & 3,
-			my & 3,
-			bw,
-			bh,
-			&mut luma,
-		);
+		let mut luma = [[0u8; 256]; 2];
+		let mut chroma = [[[0u8; 64]; 2]; 2];
+		for list in 0..2 {
+			if refs[list] < 0 {
+				continue;
+			}
+			let Some(r) = self.list(list).get(refs[list] as usize).copied() else { continue };
+			let mv = info.mv[list][idx];
+			let (mx, my) = (i32::from(mv[0]), i32::from(mv[1]));
+			recon::mc_luma(
+				&r.y.s8(),
+				px as i32 + (mx >> 2),
+				py as i32 + (my >> 2),
+				mx & 3,
+				my & 3,
+				bw,
+				bh,
+				&mut luma[list],
+			);
+			let (cx, cy) = ((px / 2) as i32 + (mx >> 3), (py / 2) as i32 + (my >> 3));
+			for (c, rp) in [&r.cb, &r.cr].into_iter().enumerate() {
+				recon::mc_chroma(&rp.s8(), cx, cy, mx & 7, my & 7, bw / 2, bh / 2, &mut chroma[c][list]);
+			}
+		}
+		let (l0, l1) = (&luma[0][..bw * bh], &luma[1][..bw * bh]);
 		recon::store_prediction(
 			&mut self.f.y.d8(),
 			px,
 			py,
 			bw,
 			bh,
-			Some(&luma[..bw * bh]),
-			None,
+			(refs[0] >= 0).then_some(l0),
+			(refs[1] >= 0).then_some(l1),
 			Weighting::Default,
 		);
-		let (cx, cy) = ((px / 2) as i32 + (mx >> 3), (py / 2) as i32 + (my >> 3));
-		for (c, rp) in [&r.cb, &r.cr].into_iter().enumerate() {
-			let mut chroma = [0u8; 64];
-			recon::mc_chroma(&rp.s8(), cx, cy, mx & 7, my & 7, bw / 2, bh / 2, &mut chroma);
+		for c in 0..2 {
+			let n = bw * bh / 4;
+			let (l0, l1) = (&chroma[c][0][..n], &chroma[c][1][..n]);
 			let plane = if c == 0 { &mut self.f.cb } else { &mut self.f.cr };
 			recon::store_prediction(
 				&mut plane.d8(),
@@ -812,247 +1144,16 @@ impl<'a> PicEncoder<'a> {
 				py / 2,
 				bw / 2,
 				bh / 2,
-				Some(&chroma[..bw * bh / 4]),
-				None,
+				(refs[0] >= 0).then_some(l0),
+				(refs[1] >= 0).then_some(l1),
 				Weighting::Default,
 			);
 		}
 	}
 
-	fn encode_skip(&mut self) -> Coded {
-		let mv = self.skip_mv();
-		let mut info = self.base_info(MbKind::PSkip);
-		info.mv[0] = [mv; 16];
-		self.mc_part(0, 0, 4, 4, mv);
-		self.finish(info, BitWriter::new())
-	}
-
-	/// Codes an inter macroblock with one motion vector per 8x8 block.
-	fn encode_inter(&mut self, shape: Shape, mvs: [[i16; 2]; 4]) -> Coded {
-		let mut info = self.base_info(MbKind::Inter);
-		let mut mvds = Vec::with_capacity(4);
-		for (part, &(x4, y4, w4, h4)) in shape.parts().iter().enumerate() {
-			let mv = mvs[(y4 / 2) * 2 + x4 / 2];
-			let mvp = self.predict_mv(&info, x4, y4, w4, shape, part);
-			let mvd = [i32::from(mv[0]) - i32::from(mvp[0]), i32::from(mv[1]) - i32::from(mvp[1])];
-			mvds.push(mvd);
-			for y in y4..y4 + h4 {
-				for x in x4..x4 + w4 {
-					info.mv[0][y * 4 + x] = mv;
-					info.mvd[0][y * 4 + x] =
-						[mvd[0].unsigned_abs().min(255) as u8, mvd[1].unsigned_abs().min(255) as u8];
-				}
-			}
-			self.mc_part(x4, y4, w4, h4, mv);
-		}
-		let mut res = Residual::default();
-		self.code_inter_luma(&mut info, &mut res);
-		self.code_chroma(&mut info, &mut res, false);
-
-		let mut w = BitWriter::new();
-		w.ue(match shape {
-			Shape::S16x16 => 0,
-			Shape::S16x8 => 1,
-			Shape::S8x16 => 2,
-			Shape::S8x8 => 3,
-		});
-		if shape == Shape::S8x8 {
-			for _ in 0..4 {
-				w.ue(0); // sub_mb_type P_L0_8x8
-			}
-		}
-		for mvd in &mvds {
-			w.se(mvd[0]);
-			w.se(mvd[1]);
-		}
-		w.ue(cbp_code(info.cbp, false));
-		if info.cbp != 0 {
-			w.se(0);
-		}
-		self.write_residual(&mut w, &info, &res);
-		self.finish(info, w)
-	}
-
-	fn mv_bits(mv: [i32; 2], mvp: [i16; 2]) -> u32 {
-		se_bits(mv[0] - i32::from(mvp[0])) + se_bits(mv[1] - i32::from(mvp[1]))
-	}
-
-	/// Diamond integer search followed by half- and quarter-sample
-	/// refinement (x264 `--me dia --subme 7`-like). Returns the vector (in
-	/// quarter samples) and its SATD + λ·bits cost.
-	fn search(
-		&self,
-		x4: usize,
-		y4: usize,
-		bw: usize,
-		bh: usize,
-		mvp: [i16; 2],
-		extra: &[[i16; 2]],
-	) -> ([i16; 2], u32) {
-		let Some(r) = self.reference else { return ([0, 0], u32::MAX) };
-		let (px, py) = (self.mbx * 16 + x4 * 4, self.mby * 16 + y4 * 4);
-		let lambda = self.lambda;
-		let max_y = self.max_mv_y;
-		let in_range = |mx: i32, my: i32| {
-			r.padded.fits(px as i32 + mx, py as i32 + my, bw, bh) && my.abs() <= max_y && mx.abs() <= 2040
-		};
-		let int_cost = |mx: i32, my: i32| -> u32 {
-			r.padded.sad(&self.src.y, px, py, px as i32 + mx, py as i32 + my, bw, bh)
-				+ lambda * Self::mv_bits([mx * 4, my * 4], mvp)
-		};
-		// Starting point: the best of the predictor, zero and the extra
-		// candidates (rounded to whole samples).
-		let mut best = (u32::MAX, 0i32, 0i32);
-		let round = |v: i16| (i32::from(v) + 2) >> 2;
-		let mut starts = vec![[round(mvp[0]), round(mvp[1])], [0, 0]];
-		starts.extend(extra.iter().map(|m| [round(m[0]), round(m[1])]));
-		for s in starts {
-			if in_range(s[0], s[1]) {
-				let c = int_cost(s[0], s[1]);
-				if c < best.0 {
-					best = (c, s[0], s[1]);
-				}
-			}
-		}
-		if best.0 == u32::MAX {
-			return ([0, 0], u32::MAX);
-		}
-		// Large then small diamond until the centre wins.
-		for step in [4i32, 2, 1] {
-			for _ in 0..64 {
-				let (c0, cx, cy) = best;
-				let mut moved = false;
-				for (dx, dy) in [(step, 0), (-step, 0), (0, step), (0, -step)] {
-					let (mx, my) = (cx + dx, cy + dy);
-					if in_range(mx, my) {
-						let c = int_cost(mx, my);
-						if c < best.0 {
-							best = (c, mx, my);
-							moved = true;
-						}
-					}
-				}
-				if !moved || best.0 == c0 {
-					break;
-				}
-			}
-		}
-		// Sub-sample refinement on SATD of the real interpolation.
-		let mut q = [best.1 * 4, best.2 * 4];
-		let cost = |mv: [i32; 2]| {
-			me::satd_mv(&r.padded, &r.half, &self.src.y, px, py, bw, bh, mv)
-				+ lambda * Self::mv_bits(mv, mvp)
-		};
-		let mut qcost = cost(q);
-		for step in [2, 1] {
-			let centre = q;
-			for (dx, dy) in [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
-				let mv = [centre[0] + dx * step, centre[1] + dy * step];
-				if mv[1].abs() > max_y * 4
-					|| !r.padded.fits(
-						px as i32 + (mv[0] >> 2) - 3,
-						py as i32 + (mv[1] >> 2) - 3,
-						bw + 6,
-						bh + 6,
-					) {
-					continue;
-				}
-				let c = cost(mv);
-				if c < qcost {
-					qcost = c;
-					q = mv;
-				}
-			}
-		}
-		([q[0] as i16, q[1] as i16], qcost)
-	}
-
-	/// Motion search for a partitioning: one vector per partition, each
-	/// predicted from the ones before it. Returns vectors per 8x8 block
-	/// and the SATD + λ·bits cost.
-	fn search_shape(&self, shape: Shape, seed: &[[i16; 2]]) -> ([[i16; 2]; 4], u32) {
-		let mut info = self.base_info(MbKind::Inter);
-		let mut mvs = [[0i16; 2]; 4];
-		let header = match shape {
-			Shape::S16x16 => 1,
-			Shape::S16x8 | Shape::S8x16 => 3,
-			Shape::S8x8 => 5 + 4,
-		};
-		let mut total = self.lambda * header;
-		for (part, &(x4, y4, w4, h4)) in shape.parts().iter().enumerate() {
-			let mvp = self.predict_mv(&info, x4, y4, w4, shape, part);
-			let (mv, cost) = self.search(x4, y4, w4 * 4, h4 * 4, mvp, seed);
-			if cost == u32::MAX {
-				return (mvs, u32::MAX);
-			}
-			total = total.saturating_add(cost);
-			for y in y4..y4 + h4 {
-				for x in x4..x4 + w4 {
-					info.mv[0][y * 4 + x] = mv;
-				}
-			}
-			for y in (y4..y4 + h4).step_by(2) {
-				for x in (x4..x4 + w4).step_by(2) {
-					mvs[(y / 2) * 2 + x / 2] = mv;
-				}
-			}
-		}
-		(mvs, total)
-	}
-
-	fn decide_p(&mut self) -> Coded {
-		// Skip first: if its residual would quantise away, take it.
-		let skip = self.encode_skip();
-		let skip_mv = skip.info.mv[0][0];
-		if self.skip_is_free() {
-			return skip;
-		}
-		let mut seeds = vec![skip_mv];
-		if let Some(m) = self.nb_mb(0, -1).filter(|m| !m.is_intra()) {
-			seeds.push(m.mv[0][12]);
-		}
-		if let Some(m) = self.nb_mb(-1, 0).filter(|m| !m.is_intra()) {
-			seeds.push(m.mv[0][3]);
-		}
-		let (mvs16, cost16) = self.search_shape(Shape::S16x16, &seeds);
-		let mut best_shape = (Shape::S16x16, mvs16, cost16);
-		// Smaller partitions only when the 16x16 match is poor.
-		if cost16 != u32::MAX && cost16 > 24 * self.lambda + 256 {
-			seeds.push(mvs16[0]);
-			for shape in [Shape::S8x8, Shape::S16x8, Shape::S8x16] {
-				let (mvs, cost) = self.search_shape(shape, &seeds);
-				if cost < best_shape.2 {
-					best_shape = (shape, mvs, cost);
-				}
-			}
-		}
-		let mut best = skip;
-		let mut best_cost = self.rd_cost(&best, 0) + self.lambda2;
-		if best_shape.2 != u32::MAX {
-			let inter = self.encode_inter(best_shape.0, best_shape.1);
-			let c = self.rd_cost(&inter, 1);
-			if c < best_cost {
-				best = inter;
-				best_cost = c;
-			}
-		}
-		// Intra when its SATD estimate competes with the inter match.
-		let mb = self.mb_avail();
-		let av = Avail { left: mb[0], top: mb[1], top_right: false, top_left: mb[3] };
-		let (_, i16_satd) = self.choose_i16_mode(av);
-		if best_shape.2 == u32::MAX || i16_satd + 6 * self.lambda < best_shape.2 + best_shape.2 / 4 {
-			let intra = self.best_intra(true);
-			let c = self.rd_cost(&intra, 1);
-			if c < best_cost {
-				best = intra;
-			}
-		}
-		best
-	}
-
-	/// Whether the P_Skip prediction (already in the frame) leaves a
-	/// residual that quantises to nothing after decimation, so skipping
-	/// loses nothing a coded macroblock would keep.
+	/// Whether the prediction in the frame leaves a residual that
+	/// quantises to nothing after decimation, so skipping loses nothing a
+	/// coded macroblock would keep.
 	fn skip_is_free(&self) -> bool {
 		let (px, py) = (self.mbx * 16, self.mby * 16);
 		let quant = Quant::new(self.qp, false);
@@ -1083,14 +1184,482 @@ impl<'a> PicEncoder<'a> {
 		}
 		true
 	}
-}
 
-fn combine_nc(a: Option<i32>, b: Option<i32>) -> i32 {
-	match (a, b) {
-		(Some(a), Some(b)) => (a + b + 1) >> 1,
-		(Some(a), None) => a,
-		(None, Some(b)) => b,
-		(None, None) => 0,
+	fn encode_p_skip(&mut self) -> Coded {
+		let mv = self.skip_mv();
+		let mut info = self.base_info(MbKind::PSkip);
+		info.ref_idx = [[0; 4], [-1; 4]];
+		info.mv[0] = [mv; 16];
+		self.set_ref_ids(&mut info);
+		self.mc_rect(&info, 0, 0, 4, 4);
+		self.finish(info, MbSyn::new(SynType::PSkip), Box::default())
+	}
+
+	/// B_Skip (`skip`) or B_Direct_16x16 with a residual.
+	fn encode_direct(&mut self, skip: bool, t8: bool) -> Coded {
+		let mut info = self.base_info(if skip { MbKind::BSkip } else { MbKind::Inter });
+		info.direct16 = true;
+		info.direct8 = 0xF;
+		self.predict_direct(&mut info);
+		self.set_ref_ids(&mut info);
+		for b8 in 0..4 {
+			self.mc_rect(&info, (b8 % 2) * 2, (b8 / 2) * 2, 2, 2);
+		}
+		if skip {
+			return self.finish(info, MbSyn::new(SynType::BSkip), Box::default());
+		}
+		let mut res = Box::<Residual>::default();
+		self.code_residual_inter(&mut info, &mut res, t8);
+		self.finish(info, MbSyn::new(SynType::BDirect), res)
+	}
+
+	/// `ref_id` of every 8x8 block: the referenced picture's identity.
+	fn set_ref_ids(&self, info: &mut MbInfo) {
+		for list in 0..2 {
+			for b8 in 0..4 {
+				let r = info.ref_idx[list][b8];
+				info.ref_id[list][b8] =
+					if r < 0 { 0 } else { self.list(list).get(r as usize).map_or(0, |p| p.id) };
+			}
+		}
+	}
+
+	fn code_residual_inter(&mut self, info: &mut MbInfo, res: &mut Residual, t8: bool) {
+		if t8 {
+			self.code_inter_luma8(info, res);
+		} else {
+			self.code_inter_luma(info, res);
+		}
+		self.code_chroma(info, res, false);
+		if info.cbp & 15 == 0 {
+			// transform_size_8x8_flag is only sent with luma coefficients.
+			info.t8x8 = false;
+		}
+	}
+
+	/// Codes an inter macroblock of type `t` whose partitions (of
+	/// `shape`) have the given motion; `t8` selects the 8x8 transform.
+	fn encode_inter(&mut self, t: SynType, shape: Shape, pm: &[PartMotion], t8: bool) -> Coded {
+		let mut info = self.base_info(MbKind::Inter);
+		let mut syn = MbSyn::new(t);
+		let ps = parts(shape);
+		// References first (all lists), as they are parsed.
+		for (p, &(x4, y4, w4, h4)) in ps.iter().enumerate() {
+			for list in 0..2 {
+				if pm[p].pred.uses(list) {
+					for y in (y4..y4 + h4).step_by(2) {
+						for x in (x4..x4 + w4).step_by(2) {
+							info.ref_idx[list][(y / 2) * 2 + x / 2] = pm[p].refs[list];
+						}
+					}
+					syn.ref_idx[list][p] = pm[p].refs[list];
+				}
+			}
+		}
+		for list in 0..2 {
+			for (p, &(x4, y4, w4, h4)) in ps.iter().enumerate() {
+				if !pm[p].pred.uses(list) {
+					continue;
+				}
+				let mv = pm[p].mvs[list];
+				let mvp = self.predict_mv(&info, list, x4, y4, w4, pm[p].refs[list], shape, p);
+				let mvd = [i32::from(mv[0]) - i32::from(mvp[0]), i32::from(mv[1]) - i32::from(mvp[1])];
+				syn.mvd[list][p] = mvd;
+				for y in y4..y4 + h4 {
+					for x in x4..x4 + w4 {
+						info.mv[list][y * 4 + x] = mv;
+						info.mvd[list][y * 4 + x] =
+							[mvd[0].unsigned_abs().min(255) as u8, mvd[1].unsigned_abs().min(255) as u8];
+					}
+				}
+			}
+		}
+		self.set_ref_ids(&mut info);
+		for &(x4, y4, w4, h4) in ps {
+			self.mc_rect(&info, x4, y4, w4, h4);
+		}
+		let mut res = Box::<Residual>::default();
+		self.code_residual_inter(&mut info, &mut res, t8);
+		self.finish(info, syn, res)
+	}
+
+	/// The better of the 4x4- and (when enabled) 8x8-transform codings.
+	fn encode_inter_best(&mut self, t: SynType, shape: Shape, pm: &[PartMotion]) -> Coded {
+		let c4 = self.encode_inter(t, shape, pm, false);
+		if !self.p.transform_8x8 || c4.info.cbp & 15 == 0 {
+			return c4;
+		}
+		let c8 = self.encode_inter(t, shape, pm, true);
+		if self.rd_cost(&c8) < self.rd_cost(&c4) { c8 } else { c4 }
+	}
+
+	fn ref_bits(&self, list: usize, r: i8) -> u32 {
+		match self.list(list).len() {
+			0 | 1 => 0,
+			2 => 1,
+			_ => ue_bits(r as u32),
+		}
+	}
+
+	fn mv_bits(mv: [i32; 2], mvp: [i16; 2]) -> u32 {
+		se_bits(mv[0] - i32::from(mvp[0])) + se_bits(mv[1] - i32::from(mvp[1]))
+	}
+
+	/// Diamond integer search followed by half- and quarter-sample
+	/// refinement (x264 `--me dia --subme 7`-like) in reference `r`.
+	/// Returns the vector (in quarter samples) and its SATD + λ·bits cost.
+	#[allow(clippy::too_many_arguments)]
+	fn search(
+		&self,
+		r: &Reference,
+		x4: usize,
+		y4: usize,
+		bw: usize,
+		bh: usize,
+		mvp: [i16; 2],
+		extra: &[[i16; 2]],
+	) -> ([i16; 2], u32) {
+		let (px, py) = (self.mbx * 16 + x4 * 4, self.mby * 16 + y4 * 4);
+		let lambda = self.lambda;
+		let max_y = self.p.max_mv_y;
+		let in_range = |mx: i32, my: i32| {
+			r.padded.fits(px as i32 + mx, py as i32 + my, bw, bh) && my.abs() <= max_y && mx.abs() <= 2040
+		};
+		let int_cost = |mx: i32, my: i32| -> u32 {
+			r.padded.sad(&self.src.y, px, py, px as i32 + mx, py as i32 + my, bw, bh)
+				+ lambda * Self::mv_bits([mx * 4, my * 4], mvp)
+		};
+		let mut best = (u32::MAX, 0i32, 0i32);
+		let round = |v: i16| (i32::from(v) + 2) >> 2;
+		let mut starts = vec![[round(mvp[0]), round(mvp[1])], [0, 0]];
+		starts.extend(extra.iter().map(|m| [round(m[0]), round(m[1])]));
+		for s in starts {
+			if in_range(s[0], s[1]) {
+				let c = int_cost(s[0], s[1]);
+				if c < best.0 {
+					best = (c, s[0], s[1]);
+				}
+			}
+		}
+		if best.0 == u32::MAX {
+			return ([0, 0], u32::MAX);
+		}
+		for step in [4i32, 2, 1] {
+			for _ in 0..64 {
+				let (c0, cx, cy) = best;
+				let mut moved = false;
+				for (dx, dy) in [(step, 0), (-step, 0), (0, step), (0, -step)] {
+					let (mx, my) = (cx + dx, cy + dy);
+					if in_range(mx, my) {
+						let c = int_cost(mx, my);
+						if c < best.0 {
+							best = (c, mx, my);
+							moved = true;
+						}
+					}
+				}
+				if !moved || best.0 == c0 {
+					break;
+				}
+			}
+		}
+		let mut q = [best.1 * 4, best.2 * 4];
+		let cost = |mv: [i32; 2]| {
+			me::satd_mv(&r.padded, &r.half, &self.src.y, px, py, bw, bh, mv)
+				+ lambda * Self::mv_bits(mv, mvp)
+		};
+		let mut qcost = cost(q);
+		for step in [2, 1] {
+			let centre = q;
+			for (dx, dy) in [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
+				let mv = [centre[0] + dx * step, centre[1] + dy * step];
+				if mv[1].abs() > max_y * 4
+					|| !r.padded.fits(
+						px as i32 + (mv[0] >> 2) - 3,
+						py as i32 + (mv[1] >> 2) - 3,
+						bw + 6,
+						bh + 6,
+					) {
+					continue;
+				}
+				let c = cost(mv);
+				if c < qcost {
+					qcost = c;
+					q = mv;
+				}
+			}
+		}
+		([q[0] as i16, q[1] as i16], qcost)
+	}
+
+	/// Prediction samples of a block from `r` with `mv` (stride `bw`).
+	#[allow(clippy::too_many_arguments)]
+	fn pred_block(
+		&self,
+		r: &Reference,
+		x4: usize,
+		y4: usize,
+		bw: usize,
+		bh: usize,
+		mv: [i16; 2],
+		out: &mut [u8],
+	) {
+		let (px, py) = (self.mbx * 16 + x4 * 4, self.mby * 16 + y4 * 4);
+		let (mx, my) = (i32::from(mv[0]), i32::from(mv[1]));
+		recon::mc_luma(
+			&r.y.s8(),
+			px as i32 + (mx >> 2),
+			py as i32 + (my >> 2),
+			mx & 3,
+			my & 3,
+			bw,
+			bh,
+			out,
+		);
+	}
+
+	/// SATD of the bi-prediction (rounded average) of two blocks.
+	#[allow(clippy::too_many_arguments)]
+	fn bi_satd(
+		&self,
+		r0: &Reference,
+		mv0: [i16; 2],
+		r1: &Reference,
+		mv1: [i16; 2],
+		x4: usize,
+		y4: usize,
+		bw: usize,
+		bh: usize,
+	) -> u32 {
+		let (mut a, mut b) = ([0u8; 256], [0u8; 256]);
+		self.pred_block(r0, x4, y4, bw, bh, mv0, &mut a);
+		self.pred_block(r1, x4, y4, bw, bh, mv1, &mut b);
+		for i in 0..bw * bh {
+			a[i] = ((u16::from(a[i]) + u16::from(b[i]) + 1) >> 1) as u8;
+		}
+		me::satd_block(&self.src.y, self.mbx * 16 + x4 * 4, self.mby * 16 + y4 * 4, &a, bw, bh)
+	}
+
+	/// Best motion of partition `part` of `shape` from list `list`, over
+	/// the reference indices `refs`. `info` holds the motion of earlier
+	/// partitions (for prediction). Returns (ref, mv, cost).
+	fn search_part(
+		&self,
+		info: &MbInfo,
+		list: usize,
+		shape: Shape,
+		part: usize,
+		refs: &[i8],
+		seeds: &[[i16; 2]],
+	) -> (i8, [i16; 2], u32) {
+		let (x4, y4, w4, h4) = parts(shape)[part];
+		let mut best = (0i8, [0i16; 2], u32::MAX);
+		for &r in refs {
+			let Some(rf) = self.list(list).get(r as usize).copied() else { continue };
+			let mvp = self.predict_mv(info, list, x4, y4, w4, r, shape, part);
+			let (mv, cost) = self.search(rf, x4, y4, w4 * 4, h4 * 4, mvp, seeds);
+			let cost = cost.saturating_add(self.lambda * self.ref_bits(list, r));
+			if cost < best.2 {
+				best = (r, mv, cost);
+			}
+		}
+		best
+	}
+
+	/// Records a partition's motion in `info` (for the next partition's
+	/// prediction).
+	fn note_part(info: &mut MbInfo, shape: Shape, part: usize, list: usize, r: i8, mv: [i16; 2]) {
+		let (x4, y4, w4, h4) = parts(shape)[part];
+		for y in y4..y4 + h4 {
+			for x in x4..x4 + w4 {
+				info.mv[list][y * 4 + x] = mv;
+			}
+		}
+		for y in (y4..y4 + h4).step_by(2) {
+			for x in (x4..x4 + w4).step_by(2) {
+				info.ref_idx[list][(y / 2) * 2 + x / 2] = r;
+			}
+		}
+	}
+
+	/// L0-only motion search for every partition of `shape`.
+	fn search_p_shape(
+		&self,
+		shape: Shape,
+		refs: &[i8],
+		seeds: &[[i16; 2]],
+	) -> (Vec<PartMotion>, u32) {
+		let mut info = self.base_info(MbKind::Inter);
+		let header = match shape {
+			Shape::S16x16 => 1,
+			Shape::S16x8 | Shape::S8x16 => 3,
+			Shape::S8x8 => 5 + 4,
+		};
+		let mut total = self.lambda * header;
+		let mut out = Vec::new();
+		for part in 0..parts(shape).len() {
+			let (r, mv, cost) = self.search_part(&info, 0, shape, part, refs, seeds);
+			if cost == u32::MAX {
+				return (out, u32::MAX);
+			}
+			total = total.saturating_add(cost);
+			Self::note_part(&mut info, shape, part, 0, r, mv);
+			out.push(PartMotion { pred: Pred::L0, refs: [r, -1], mvs: [mv, [0, 0]] });
+		}
+		(out, total)
+	}
+
+	fn seeds(&self, first: [i16; 2]) -> Vec<[i16; 2]> {
+		let mut seeds = vec![first];
+		if let Some(m) = self.nb_mb(0, -1).filter(|m| !m.is_intra()) {
+			seeds.push(m.mv[0][12]);
+		}
+		if let Some(m) = self.nb_mb(-1, 0).filter(|m| !m.is_intra()) {
+			seeds.push(m.mv[0][3]);
+		}
+		seeds
+	}
+
+	/// Intra when its SATD estimate competes with the inter match.
+	fn try_intra(&mut self, best: Coded, inter_satd: u32) -> Coded {
+		let mb = self.mb_avail();
+		let av = Avail { left: mb[0], top: mb[1], top_right: false, top_left: mb[3] };
+		let (_, i16_satd) = self.choose_i16_mode(av);
+		if inter_satd == u32::MAX || i16_satd + 6 * self.lambda < inter_satd + inter_satd / 4 {
+			let intra = self.best_intra();
+			if self.rd_cost(&intra) < self.rd_cost(&best) {
+				return intra;
+			}
+		}
+		best
+	}
+
+	fn decide_p(&mut self) -> Coded {
+		let skip = self.encode_p_skip();
+		let skip_mv = skip.info.mv[0][0];
+		if self.skip_is_free() {
+			return skip;
+		}
+		let mut seeds = self.seeds(skip_mv);
+		let all_refs: Vec<i8> = (0..self.p.l0.len() as i8).collect();
+		let (pm16, cost16) = self.search_p_shape(Shape::S16x16, &all_refs, &seeds);
+		let mut best_shape = (Shape::S16x16, pm16, cost16);
+		// Smaller partitions only when the 16x16 match is poor; they try
+		// the 16x16 winner's reference and the nearest one.
+		if cost16 != u32::MAX && cost16 > 24 * self.lambda + 256 {
+			let r16 = best_shape.1[0].refs[0];
+			let mut refs = vec![r16];
+			if r16 != 0 {
+				refs.push(0);
+			}
+			seeds.push(best_shape.1[0].mvs[0]);
+			for shape in [Shape::S8x8, Shape::S16x8, Shape::S8x16] {
+				let (pm, cost) = self.search_p_shape(shape, &refs, &seeds);
+				if cost < best_shape.2 {
+					best_shape = (shape, pm, cost);
+				}
+			}
+		}
+		let mut best = skip;
+		if best_shape.2 != u32::MAX {
+			let inter = self.encode_inter_best(SynType::P(best_shape.0), best_shape.0, &best_shape.1);
+			if self.rd_cost(&inter) < self.rd_cost(&best) {
+				best = inter;
+			}
+		}
+		self.try_intra(best, best_shape.2)
+	}
+
+	/// Best of L0, L1 and bi-prediction for every partition of `shape`.
+	fn search_b_shape(
+		&self,
+		shape: Shape,
+		refs0: &[i8],
+		seeds: &[[i16; 2]],
+	) -> (Vec<PartMotion>, u32) {
+		let mut info = self.base_info(MbKind::Inter);
+		let header = if shape == Shape::S16x16 { 3 } else { 6 };
+		let mut total = self.lambda * header;
+		let mut out = Vec::new();
+		let refs1: Vec<i8> = (0..self.p.l1.len() as i8).take(1).collect();
+		for part in 0..parts(shape).len() {
+			let (x4, y4, w4, h4) = parts(shape)[part];
+			let (r0, mv0, c0) = self.search_part(&info, 0, shape, part, refs0, seeds);
+			let (r1, mv1, c1) = self.search_part(&info, 1, shape, part, &refs1, seeds);
+			if c0 == u32::MAX && c1 == u32::MAX {
+				return (out, u32::MAX);
+			}
+			let mut choice = if c0 <= c1 {
+				(PartMotion { pred: Pred::L0, refs: [r0, -1], mvs: [mv0, [0, 0]] }, c0)
+			} else {
+				(PartMotion { pred: Pred::L1, refs: [-1, r1], mvs: [[0, 0], mv1] }, c1)
+			};
+			if c0 != u32::MAX && c1 != u32::MAX {
+				let (f0, f1) = (self.p.l0[r0 as usize], self.p.l1[r1 as usize]);
+				let mvp0 = self.predict_mv(&info, 0, x4, y4, w4, r0, shape, part);
+				let mvp1 = self.predict_mv(&info, 1, x4, y4, w4, r1, shape, part);
+				let bits = Self::mv_bits([i32::from(mv0[0]), i32::from(mv0[1])], mvp0)
+					+ Self::mv_bits([i32::from(mv1[0]), i32::from(mv1[1])], mvp1)
+					+ self.ref_bits(0, r0)
+					+ self.ref_bits(1, r1);
+				let cb = self.bi_satd(f0, mv0, f1, mv1, x4, y4, w4 * 4, h4 * 4) + self.lambda * (bits + 1);
+				if cb < choice.1 {
+					choice = (PartMotion { pred: Pred::Bi, refs: [r0, r1], mvs: [mv0, mv1] }, cb);
+				}
+			}
+			let pm = choice.0;
+			for list in 0..2 {
+				if pm.pred.uses(list) {
+					Self::note_part(&mut info, shape, part, list, pm.refs[list], pm.mvs[list]);
+				}
+			}
+			total = total.saturating_add(choice.1);
+			out.push(pm);
+		}
+		(out, total)
+	}
+
+	fn decide_b(&mut self) -> Coded {
+		// Direct prediction first: B_Skip when its residual vanishes.
+		let skip = self.encode_direct(true, false);
+		if self.skip_is_free() {
+			return skip;
+		}
+		let mut best = skip;
+		let direct = self.encode_direct(false, false);
+		let direct_luma = direct.info.cbp & 15 != 0;
+		if self.rd_cost(&direct) < self.rd_cost(&best) {
+			best = direct;
+		}
+		if self.p.transform_8x8 && direct_luma {
+			let d8 = self.encode_direct(false, true);
+			if self.rd_cost(&d8) < self.rd_cost(&best) {
+				best = d8;
+			}
+		}
+		let seeds = self.seeds([0, 0]);
+		let refs0: Vec<i8> = (0..self.p.l0.len() as i8).collect();
+		let (pm16, cost16) = self.search_b_shape(Shape::S16x16, &refs0, &seeds);
+		let mut best_shape = (Shape::S16x16, pm16, cost16);
+		if cost16 != u32::MAX && cost16 > 24 * self.lambda + 256 {
+			let r16 = best_shape.1[0].refs[0].max(0);
+			let refs = vec![r16];
+			for shape in [Shape::S16x8, Shape::S8x16] {
+				let (pm, cost) = self.search_b_shape(shape, &refs, &seeds);
+				if cost < best_shape.2 {
+					best_shape = (shape, pm, cost);
+				}
+			}
+		}
+		if best_shape.2 != u32::MAX {
+			let pm = best_shape.1.clone();
+			let t = b_mb_type(best_shape.0, pm[0].pred, pm.get(1).map_or(pm[0].pred, |p| p.pred));
+			let inter = self.encode_inter_best(SynType::B(t), best_shape.0, &pm);
+			if self.rd_cost(&inter) < self.rd_cost(&best) {
+				best = inter;
+			}
+		}
+		self.try_intra(best, best_shape.2)
 	}
 }
 

@@ -17,7 +17,7 @@ decoders are how the encoders are tested.
 
 | Area | Capability | Entry point |
 | --- | --- | --- |
-| **AAC-LC encoder** | Mono to 7.1 (channel configurations 1-7), every standard rate 8-96 kHz. Block switching with one frame of lookahead, sine-window MDCT, psychoacoustic thresholds, per-band M/S, scalefactor rate loop, optimal Huffman sectioning, bit reservoir. Raw access units plus a 2-byte AudioSpecificConfig. | `codecs::aac::AacEncoder` |
+| **AAC-LC encoder** | Mono to 7.1 (channel configurations 1-7), every standard rate 8-96 kHz. Block switching with one frame of lookahead, sine-window MDCT, psychoacoustic thresholds, TNS, PNS, per-band M/S, scalefactor rate loop, optimal Huffman sectioning, bit reservoir. Raw access units plus a 2-byte AudioSpecificConfig. | `codecs::aac::AacEncoder` |
 | **H.264 encoder** | Constrained Baseline: CAVLC, IDR + P pictures, one reference, Intra16x16 / Intra4x4, P_Skip and P_L0 16x16 / 16x8 / 8x16 / 8x8, quarter-sample motion, deblocking, frame cropping. Constant QP or average bit rate. `avcC` extradata, 4-byte length-prefixed NAL units. | `codecs::h264::H264Encoder` |
 | **Shared bitstream** | MSB-first `BitWriter` with Exp-Golomb codes and exact bit counts. | `codecs::bitstream::BitWriter` |
 | **Shared DSP** | Forward MDCT through the existing half-length DCT-IV. | `codecs::dsp::Mdct` |
@@ -192,6 +192,70 @@ entropy is lower than L/R's. Both thresholds are set to half the lower L/R
 threshold, because noise in M and S adds up in each output channel.
 `ms_mask_present` is 0, 1 or 2, whichever is exact.
 
+### 3.6 Temporal noise shaping (`tns.rs`)
+
+TNS runs per window, after the MDCT and before M/S (the decoder undoes
+them in the opposite order: M/S, then TNS).
+
+- **Region.** One filter per window, from 1275 Hz (long) or 2750 Hz
+  (short) up to the lower of Table 4.155's `tns_max_bands` and the
+  bandwidth (3GPP TS 26.403 `tnsStartFreq`).
+- **Filter.** Levinson-Durbin on a Gaussian lag-windowed autocorrelation
+  of the region. Order 12 for long windows and 7 for short ones (the
+  AAC-LC maximums), capped at one tap per 8 lines.
+- **Decision.** The filter is used when the prediction gain is at least
+  1.4 (FFmpeg's `TNS_GAIN_THRESHOLD_LOW`). Steady tones measure close to
+  1; pitch pulses and transients measure much higher.
+- **Coefficients.** The reflection coefficients are quantised with 4-bit
+  resolution by the inverse of `decode_tns`'s arcsine steps. Trailing
+  zero coefficients are dropped, and `coef_compress` is used when every
+  index fits in 3 bits.
+- **Residual.** The residual is computed with the *dequantised*
+  coefficients (`parcor_to_lpc` is shared with the decoder), so the
+  decoder's all-pole filter inverts it exactly.
+- **Direction.** The filter always runs upwards. The decoder clips the
+  region at its `max_sfb`, which can be lower than the encoder's band
+  limit when the top bands quantise to nothing. An upward filter gives
+  the same values on any prefix of the region, so the clipping never
+  changes the reconstruction.
+- **Thresholds.** Masking thresholds come from the original spectrum.
+  Inside the filtered region they are divided by the measured prediction
+  gain, because the synthesis filter amplifies the residual's noise by
+  about that much.
+
+### 3.7 Perceptual noise substitution
+
+PNS is decided per band inside the rate loop (`quantise_all`), so it
+follows the bit rate.
+
+- **Which bands.** A band is sent as noise (codebook 13) when all of these
+  hold:
+  - it starts at or above 4 kHz (FFmpeg's `NOISE_LOW_LIMIT`);
+  - it is noise-like: the spectral flatness of its line-pair energies is
+    at least 0.35 (white noise measures about 0.56, tones close to 0);
+  - it is audible (energy above its masking threshold);
+  - it would be coded at under about 9 dB SNR at the current offset:
+    energy below 8 times the allowed noise.
+
+  At high rates the allowed noise is small, so PNS switches itself off.
+- **Energy.** The noise energy is `round(2·log2(E / group_len))`, which
+  is the decoder's per-window normalisation (`dequantise`).
+  `constrain_noise` keeps the chain codable: the first value is a 9-bit
+  offset from `global_gain − 90`, and each later one a difference within
+  ±60.
+- **Sections.** Noise bands are sections of their own. The trellis
+  sections the runs of spectral bands between them.
+- **Exclusions.**
+  - Bands coded with M/S. RMP's and FFmpeg's decoders skip M/S on noise
+    bands, so a noise band next to an M/S-coded spectral band in the other
+    channel would decode wrongly.
+  - Channel-frames that use TNS, because the synthesis filter would colour
+    the noise.
+  - The LFE channel.
+
+`AacEncoderState::tns` and `::pns` switch the tools off (both are on by
+default). `tns_windows` and `noise_bands` count how often each was used.
+
 ---
 
 ## 4. H.264 in detail
@@ -326,6 +390,10 @@ Also checked:
 - Silence, full-scale noise and square waves, DC and a lone click all
   encode and decode cleanly.
 - A second AAC generation lines up with the first at zero lag.
+- With TNS and PNS on (pink noise plus a 220 Hz tone, stereo, 48 and
+  96 kb/s), FFmpeg's decode matches RMP's to within 1 LSB. The two
+  decoders share the PNS noise generator, so this also shows FFmpeg reads
+  the noise energies and TNS filters the same way.
 
 ### 6.2 H.264
 
@@ -363,7 +431,15 @@ x264's Baseline `medium`. §7 lists what x264 does that RMP doesn't yet.
 **Tests:**
 
 - In-crate: `aac::encoder` round trips through RMP's decoder (stereo SNR,
-  bit rate, transients forcing short windows with no pre-echo, 5.1);
+  bit rate, transients forcing short windows with no pre-echo, 5.1). Also:
+  - TNS: the decoder's synthesis inverts the residual, including on a
+    clipped prefix. At 256 kb/s pitch pulses decode above 25 dB SNR with
+    TNS in most windows. At 48 kb/s TNS cuts the noise in the quiet half
+    of each pitch period by more than 30%. A steady tone gets no filter.
+  - PNS: white noise at 48 kb/s keeps its 5-14 kHz energy within 1.5 dB,
+    and the bits saved raise the SNR below 4 kHz by more than 2 dB. No
+    noise bands are used for a tone or at 256 kb/s.
+  - Stereo frames with both tools decode within the rate budget;
   quantiser, sectioning and escape bit counts against the writer; the
   MDCT against the direct formula.
 - `h264::encoder::tests`:
@@ -392,7 +468,7 @@ cargo clippy --all-targets -- -D warnings && cargo fmt --check
 
 | Limitation | Where to start |
 | --- | --- |
-| AAC: no TNS, PNS, intensity stereo or KBD windows. FFmpeg's encoder uses TNS and PNS by default; RMP's SNR is still higher, but PNS and TNS mainly help perceptually at low rates. | Signal in `write_ics` (the flags are written as 0 today). The decoder's `ics.rs` already parses all of them, so its tests can validate each tool. |
+| AAC: no intensity stereo or KBD windows. TNS uses one filter per window and PNS doesn't use correlated noise for M/S bands. | Intensity: codebooks 14/15 in the sectioning next to PNS's codebook 13. The decoder's `ics.rs` already parses all of them, so its tests can validate each tool. |
 | AAC: no HE-AAC (SBR/PS), no 960-sample frames, no 6.1 (7 channels needs a PCE). | SBR: a QMF bank plus envelope estimation, signalled in a FIL element. |
 | H.264: no B-frames, CABAC, 8x8 transform or multiple references (Main/High profile tools). They are worth roughly 15-30% bit rate. | CABAC: invert `h264::cabac` (the context tables are shared). B-frames: a reorder queue in `H264EncoderState` and direct prediction mirrored from `inter.rs`. |
 | H.264: no trellis quantisation, psy-RD, adaptive quantisation or lookahead (mb-tree). This is most of the gap to x264 in §6.2. | `transform::Quant` (trellis), `PicEncoder::new` (per-macroblock QP offsets need `mb_qp_delta`). |
@@ -403,15 +479,16 @@ cargo clippy --all-targets -- -D warnings && cargo fmt --check
 
 ## 8. How to build on this
 
-### Add an AAC tool (e.g. TNS)
+### Add an AAC tool (e.g. intensity stereo)
 
-1. Run the analysis per channel after the MDCT, before `analyse` (LPC over
-   the spectrum, then reflection coefficients quantised as in `decode_tns`).
-2. Filter the spectrum, store the filter in `ChannelFrame`, and add its
-   bits in `ics_bits`.
-3. Write `tns_data_present` and the data in `write_ics`.
-4. Check that RMP's and FFmpeg's decoders both decode it cleanly and that
-   SNR on transients doesn't drop.
+TNS (`tns.rs`) and PNS (§3.6, §3.7) were added this way:
+
+1. Decide per band or window, after the MDCT (TNS, before `analyse`) or
+   in the rate loop (PNS, in `quantise_all`).
+2. Store the decision in `ChannelFrame`, and add its bits in `ics_bits`.
+3. Write it in `write_ics`.
+4. Check that RMP's and FFmpeg's decoders both decode it cleanly, and that
+   the signal the tool targets improves.
 
 ### Add an H.264 feature
 

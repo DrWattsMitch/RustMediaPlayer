@@ -1,4 +1,4 @@
-//! AAC and H.264 encoders end to end: transcode a fixture, read the result
+//! AAC, Opus and H.264 encoders end to end: transcode a fixture, read the result
 //! back with RMP's demuxers and decoders, and compare with the source.
 
 use rmp::codecs::aac::AacEncoder;
@@ -83,23 +83,98 @@ fn aac_transcode_round_trips() {
 	assert!(bytes * 8.0 / 3.0 < 160_000.0 * 1.1, "{bytes}");
 }
 
+/// Opus (CELT) through Ogg and WebM: RMP's demuxers and decoder read it
+/// back close to a 48 kHz copy of the source.
+#[test]
+fn opus_transcode_round_trips() {
+	let dir = tempfile::tempdir().unwrap();
+	let src = fixture("wav/wav_stereo_44k_mix_sample.wav");
+	let wav48 = dir.path().join("src48.wav");
+	let to48 = Options { sample_rate: Some(48_000), ..Options::default() };
+	transcode(&src, wav48.to_str().unwrap(), &to48).unwrap();
+	let (reference, _, _) = decode(wav48.to_str().unwrap(), StreamKind::Audio);
+	let reference = s16(&reference);
+	for name in ["out.opus", "out.webm"] {
+		let out = dir.path().join(name);
+		let options = Options { audio_bitrate: Some(128_000), ..Options::default() };
+		let summary = transcode(wav48.to_str().unwrap(), out.to_str().unwrap(), &options).unwrap();
+		assert!(summary.streams[0].contains("-> opus"), "{:?}", summary.streams);
+		let (decoded, keys, stream) = decode(out.to_str().unwrap(), StreamKind::Audio);
+		assert_eq!(stream.parameters.codec.id, "opus");
+		assert_eq!(rmp::codecs::opus::pre_skip(&stream.parameters.extradata), Some(120));
+		assert!(keys.iter().all(|&k| k));
+		// The Opus decoder outputs interleaved f32; compare in s16 units.
+		let decoded: Vec<f64> = decoded
+			.chunks_exact(4)
+			.map(|c| f64::from(f32::from_le_bytes([c[0], c[1], c[2], c[3]])) * 32768.0)
+			.collect();
+		// Align (the decoder may or may not have dropped the pre-skip).
+		let best = (0..=480)
+			.step_by(2)
+			.filter(|&o| decoded.len() >= o + reference.len())
+			.map(|o| snr(&reference, &decoded[o..o + reference.len()]))
+			.fold(f64::MIN, f64::max);
+		assert!(best > 12.0, "{name}: SNR {best:.1} dB");
+		let bytes = std::fs::metadata(&out).unwrap().len() as f64;
+		assert!(bytes * 8.0 / 3.0 < 128_000.0 * 1.1, "{name}: {bytes} bytes");
+	}
+}
+
 #[test]
 fn h264_transcode_round_trips() {
+	use rmp::codecs::h264::encoder::Profile;
+	// (profile, avcC profile_idc and constraint flags)
+	for (profile, avcc) in
+		[(None, [100, 0x00]), (Some(Profile::Main), [77, 0x40]), (Some(Profile::Baseline), [66, 0xC0])]
+	{
+		let dir = tempfile::tempdir().unwrap();
+		let out = dir.path().join("out.mp4");
+		let src = fixture("y4m/yuv420p_34x18.y4m");
+		let options = Options {
+			video_codec: Some("h264".into()),
+			qp: Some(18),
+			gop: Some(2),
+			profile,
+			..Options::default()
+		};
+		transcode(&src, out.to_str().unwrap(), &options).unwrap();
+
+		let (reference, _, _) = decode(&src, StreamKind::Video);
+		let (decoded, keys, stream) = decode(out.to_str().unwrap(), StreamKind::Video);
+		assert_eq!(stream.parameters.codec.id, "h264");
+		assert_eq!((stream.parameters.width, stream.parameters.height), (Some(34), Some(18)));
+		assert_eq!(&stream.parameters.extradata[1..3], &avcc, "{profile:?}");
+		assert_eq!(decoded.len(), reference.len(), "{profile:?}");
+		assert_eq!(keys, (0..keys.len()).map(|i| i % 2 == 0).collect::<Vec<_>>());
+		let mse: f64 = reference
+			.iter()
+			.zip(&decoded)
+			.map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+			.sum::<f64>()
+			/ reference.len() as f64;
+		let psnr = 10.0 * (255.0f64.powi(2) / mse.max(1e-9)).log10();
+		assert!(psnr > 38.0, "{profile:?}: PSNR {psnr:.1} dB");
+	}
+}
+
+/// High profile with B pictures: every frame survives the lookahead and
+/// reordering through MP4 (decode times derived by the muxer).
+#[test]
+fn h264_b_frames_through_mp4() {
 	let dir = tempfile::tempdir().unwrap();
 	let out = dir.path().join("out.mp4");
-	let src = fixture("y4m/yuv420p_34x18.y4m");
-	let options =
-		Options { video_codec: Some("h264".into()), qp: Some(18), gop: Some(2), ..Options::default() };
-	transcode(&src, out.to_str().unwrap(), &options).unwrap();
-
+	let src = fixture("mp4/h264_high_tools.mp4");
+	let options = Options {
+		video_codec: Some("h264".into()),
+		qp: Some(20),
+		no_audio: true,
+		..Options::default()
+	};
+	let summary = transcode(&src, out.to_str().unwrap(), &options).unwrap();
 	let (reference, _, _) = decode(&src, StreamKind::Video);
-	let (decoded, keys, stream) = decode(out.to_str().unwrap(), StreamKind::Video);
-	assert_eq!(stream.parameters.codec.id, "h264");
-	assert_eq!((stream.parameters.width, stream.parameters.height), (Some(34), Some(18)));
-	// avcC: Constrained Baseline.
-	assert_eq!(&stream.parameters.extradata[1..3], &[66, 0xC0]);
-	assert_eq!(decoded.len(), reference.len());
-	assert_eq!(keys, (0..keys.len()).map(|i| i % 2 == 0).collect::<Vec<_>>());
+	let (decoded, _, stream) = decode(out.to_str().unwrap(), StreamKind::Video);
+	assert_eq!(stream.parameters.extradata[1], 100);
+	assert_eq!(decoded.len(), reference.len(), "{summary:?}");
 	let mse: f64 = reference
 		.iter()
 		.zip(&decoded)
@@ -107,7 +182,7 @@ fn h264_transcode_round_trips() {
 		.sum::<f64>()
 		/ reference.len() as f64;
 	let psnr = 10.0 * (255.0f64.powi(2) / mse.max(1e-9)).log10();
-	assert!(psnr > 38.0, "PSNR {psnr:.1} dB");
+	assert!(psnr > 36.0, "PSNR {psnr:.1} dB");
 }
 
 #[test]
@@ -152,7 +227,10 @@ fn encoders_reject_bad_input_without_panicking() {
 	assert!(enc.encode(&mut state, Frame::Video(frame(yuv444, 32 * 16 * 3))).is_err());
 	let yuv420 = Pixel::from_name("yuv420p").unwrap();
 	assert!(enc.encode(&mut state, Frame::Video(frame(yuv420.clone(), 100))).is_err());
-	let packets = enc.encode(&mut state, Frame::Video(frame(yuv420, 32 * 16 * 3 / 2))).unwrap().value;
+	// The lookahead may hold the picture until the end.
+	let mut packets =
+		enc.encode(&mut state, Frame::Video(frame(yuv420, 32 * 16 * 3 / 2))).unwrap().value;
+	packets.extend(enc.flush(&mut state).unwrap().value);
 	assert_eq!(packets.len(), 1);
 	assert!(packets[0].keyframe);
 }

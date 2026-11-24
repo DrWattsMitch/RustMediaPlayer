@@ -188,6 +188,83 @@ impl Mdct {
 		M.get_or_init(|| Mdct::new(1920, 3))
 	}
 
+	/// `clt_mdct_forward` (float build): windows, folds and transforms
+	/// `input` (`N/2 + overlap` samples, the low-overlap window of CELT)
+	/// into `N/2` coefficients at `out[0], out[stride], ...`. The inverse
+	/// of [`Mdct::backward`] with overlap-add (time-domain aliasing
+	/// cancellation between consecutive blocks).
+	pub fn forward(
+		&self,
+		input: &[f32],
+		out: &mut [f32],
+		window: &[f32],
+		overlap: usize,
+		shift: usize,
+		stride: usize,
+	) {
+		let mut offset = 0;
+		let mut n = self.n;
+		for _ in 0..shift {
+			n >>= 1;
+			offset += n;
+		}
+		let trig = &self.trig[offset..offset + n / 2];
+		let n2 = n / 2;
+		let n4 = n / 4;
+		let scale = 1.0 / n4 as f32;
+		// Window, shuffle and fold the four quarter blocks [a, b, c, d].
+		let mut f = vec![0f32; n2];
+		let half = overlap / 2;
+		let lead = overlap.div_ceil(4);
+		let (mut xp1, mut xp2) = (half, n2 - 1 + half);
+		let (mut wp1, mut wp2) = (half, half as isize - 1);
+		let mut yp = 0;
+		for _ in 0..lead {
+			// Real part -d-cR, imaginary part -b+aR.
+			let w2 = window[wp2 as usize];
+			f[yp] = w2 * input[xp1 + n2] + window[wp1] * input[xp2];
+			f[yp + 1] = window[wp1] * input[xp1] - w2 * input[xp2 - n2];
+			yp += 2;
+			xp1 += 2;
+			xp2 -= 2;
+			wp1 += 2;
+			wp2 -= 2;
+		}
+		let (mut wp1, mut wp2) = (0usize, overlap - 1);
+		for _ in lead..n4 - lead {
+			// Real part a-bR, imaginary part -c-dR.
+			f[yp] = input[xp2];
+			f[yp + 1] = input[xp1];
+			yp += 2;
+			xp1 += 2;
+			xp2 -= 2;
+		}
+		for _ in n4 - lead..n4 {
+			f[yp] = -window[wp1] * input[xp1 - n2] + window[wp2] * input[xp2];
+			f[yp + 1] = window[wp2] * input[xp1] + window[wp1] * input[xp2 + n2];
+			yp += 2;
+			xp1 += 2;
+			xp2 = xp2.wrapping_sub(2);
+			wp1 += 2;
+			wp2 = wp2.wrapping_sub(2);
+		}
+		// Pre-rotation (with the 1/N4 scaling of the float build).
+		let mut buf = vec![Cpx::default(); n4];
+		for (i, slot) in buf.iter_mut().enumerate() {
+			let (re, im) = (f[2 * i], f[2 * i + 1]);
+			let (t0, t1) = (trig[i], trig[n4 + i]);
+			*slot = Cpx { re: (re * t0 - im * t1) * scale, im: (im * t0 + re * t1) * scale };
+		}
+		self.ffts[shift].process(&mut buf);
+		// Post-rotation.
+		for (i, c) in buf.iter().enumerate() {
+			let yr = c.im * trig[n4 + i] - c.re * trig[i];
+			let yi = c.re * trig[n4 + i] + c.im * trig[i];
+			out[2 * i * stride] = yr;
+			out[stride * (n2 - 1 - 2 * i)] = yi;
+		}
+	}
+
 	/// `clt_mdct_backward`: transforms `input[0], input[stride], ...` (N/2
 	/// coefficients) into `out`, overlap-adding with the previous block
 	/// already present at the start of `out` through the TDAC mirror.
@@ -308,6 +385,39 @@ mod tests {
 					"n={n} k={k}"
 				);
 			}
+		}
+	}
+
+	#[test]
+	fn forward_and_backward_reconstruct_the_signal() {
+		use super::super::tables::WINDOW120;
+		let mdct = Mdct::celt();
+		let overlap = 120;
+		for (n, shift) in [(960usize, 0usize), (480, 1), (120, 3)] {
+			let frames = 6;
+			let signal: Vec<f32> = (0..(frames + 1) * n + overlap)
+				.map(|i| (i as f32 * 0.037).sin() * 1000.0 + ((i * 7919) % 101) as f32 - 50.0)
+				.collect();
+			let mut buf = vec![0f32; n + overlap];
+			let mut out = Vec::new();
+			let mut coefs = vec![0f32; n];
+			for k in 0..frames {
+				mdct.forward(
+					&signal[k * n..k * n + n + overlap],
+					&mut coefs,
+					&WINDOW120,
+					overlap,
+					shift,
+					1,
+				);
+				buf.copy_within(n.., 0);
+				mdct.backward(&coefs, &mut buf, &WINDOW120, overlap, shift, 1);
+				out.extend_from_slice(&buf[..n]);
+			}
+			// Output frame k holds signal[k·n .. (k+1)·n] once the previous
+			// block's tail is added (from frame 1 on).
+			let err = (n..frames * n).map(|i| (out[i] - signal[i]).abs()).fold(0f32, f32::max);
+			assert!(err < 0.05, "n {n}: max error {err}");
 		}
 	}
 }

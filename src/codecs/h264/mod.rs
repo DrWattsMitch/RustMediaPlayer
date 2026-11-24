@@ -10,8 +10,9 @@
 //! * `deblock` — loop filter.
 //! * [`dpb`] — POC, reference lists and marking, output order.
 //! * [`decoder`] — picture lifecycle and the [`crate::core::Decoder`] impl.
-//! * [`encoder`] — Constrained Baseline encoder (CAVLC, I/P, quarter-sample
-//!   motion), reconstructing with the decoder's own `recon`/`deblock`.
+//! * [`encoder`] — Constrained Baseline, Main and High encoder (CAVLC or
+//!   CABAC, I/P/B pictures, multiple references, 8x8 transform, trellis,
+//!   lookahead), reconstructing with the decoder's own `recon`/`deblock`.
 //!
 //! Supported: Constrained Baseline, Main, High, High 10 and High 4:2:2
 //! profiles — 4:2:0 and 4:2:2 chroma at 8 to 14 bits (decoded to `u16`

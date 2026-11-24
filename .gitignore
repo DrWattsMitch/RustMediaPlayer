@@ -32,3 +32,6 @@ r
 
 # Ignore various metadata files
 .DS_Store
+
+# Scratch files queued for deletion
+_to_delete/

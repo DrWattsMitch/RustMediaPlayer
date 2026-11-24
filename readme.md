@@ -96,14 +96,27 @@ rmp -i song.flac song.m4a -b:a 192k                # FLAC → AAC-LC
 rmp -i input.mkv output.mp4 -c:a aac               # copy H.264, re-encode audio
 ```
 
-H.264 encoding (Constrained Baseline: plays everywhere) takes a constant
-quantiser or a bit rate:
+H.264 encoding (High profile by default: CABAC, adaptive B pictures,
+three reference pictures, 8x8 transform, trellis; `-profile:v baseline`
+for streams that play everywhere) takes a constant quantiser or a bit rate:
 
 ```bash
-rmp -i frames.y4m video.mp4 -c:v h264              # QP 23
+rmp -i frames.y4m video.mp4 -c:v h264              # QP 23, High
 rmp -i input.mp4 small.mp4 -s 640x360 -b:v 1M      # scale, re-encode at 1 Mb/s
 rmp -i input.mkv out.mp4 -c:v h264 -qp 20 -g 60 -c:a aac -b:a 128k
+rmp -i input.mkv out.mp4 -c:v h264 -profile:v baseline   # CAVLC, I/P only
+rmp -i input.mkv out.mp4 -c:v h264 -bf 0 -refs 1         # High, no B pictures
 ```
+
+Opus encoding (CELT mode, 48 kHz mono or stereo) goes to `.opus`, `.webm`,
+`.ogg`, Matroska, MP4 or MPEG-TS:
+
+```bash
+rmp -i song.flac song.opus -b:a 128k               # default 64k per channel
+rmp -i input.mkv -c:v copy -c:a opus out.mkv
+```
+
+See [docs/H264_HIGH_OPUS_ENCODING.md](docs/H264_HIGH_OPUS_ENCODING.md).
 
 Resampling, remixing and sample-format changes re-encode (as in FFmpeg):
 
@@ -358,14 +371,19 @@ Codecs:
 - **AAC-LC encoder**: block switching, psychoacoustic model, M/S stereo,
   bit reservoir; mono to 7.1 at 8-96 kHz; bit rate within ~0.5% of the
   target and SNR on par with FFmpeg's native `aac` encoder.
-- **H.264 encoder**: Constrained Baseline (CAVLC, I/P, Intra16x16/4x4,
-  P_Skip and 16x16-8x8 partitions, quarter-sample motion, deblocking),
-  constant QP or bit rate; FFmpeg decodes its output bit-exactly to the
-  encoder's own reconstruction.
+- **H.264 encoder**: Constrained Baseline, Main and High profiles: CAVLC
+  or CABAC, I/P/B pictures with a lookahead (adaptive B placement, scene
+  cuts), up to 16 reference pictures, Intra16x16/8x8/4x4, P_Skip and
+  16x16-8x8 partitions, B_Skip/direct and bi-prediction, the 8x8
+  transform, trellis quantisation, quarter-sample motion, deblocking;
+  constant QP or bit rate. RMP's and FFmpeg's decoders both reconstruct
+  its output bit-exactly to the encoder's own reconstruction.
 - **FLAC**: decoder (bit-exact with FFmpeg) and encoder (compression levels
   0–12, FFmpeg's defaults, files within ~3% of FFmpeg's size).
 - **Opus**: decoder for SILK, hybrid and CELT packets, mono, stereo and
-  multichannel (SILK bit-exact with libopus, CELT within float rounding).
+  multichannel (SILK bit-exact with libopus, CELT within float rounding);
+  CELT-mode encoder (mono/stereo, 2.5-20 ms frames, 6-510 kb/s CBR) whose
+  final range-coder state matches the decoder's on every packet.
 - **Vorbis**: decoder for every Vorbis I stream (floor 0 and 1, residue
   types 0–2, channel coupling, up to 255 channels in FFmpeg's channel
   order), within one 16-bit step of FFmpeg's decoder. Ogg Vorbis packets
@@ -461,8 +479,11 @@ rmp -i "<dir>/*.<ext>" [-f fmt] [-j N] [options] <out-dir>/   batch
 | `-j <jobs>` | Files converted at once in batch mode (default: CPU count) |
 | `--show` | When describing an input, also list every packet |
 | `-an`, `-vn`, `-sn` | Drop audio, video or subtitle streams |
-| `-c:a <codec\|copy>` | Audio codec: `flac`, `pcm_s16le`, `pcm_s24le`, `pcm_s32le`, `pcm_f32le`, `pcm_u8`, `pcm_alaw`, `pcm_mulaw`, ..., or `copy` |
-| `-c:v <codec\|copy>` | Video codec: `rawvideo` or `copy` |
+| `-c:a <codec\|copy>` | Audio codec: `aac`, `opus`, `flac`, `pcm_s16le`, `pcm_s24le`, `pcm_s32le`, `pcm_f32le`, `pcm_u8`, `pcm_alaw`, `pcm_mulaw`, ..., or `copy` |
+| `-c:v <codec\|copy>` | Video codec: `h264`, `rawvideo` or `copy` |
+| `-profile:v <p>` | H.264 profile: `high` (default), `main`, `baseline` |
+| `-bf <n>` | H.264 B pictures in a row, 0-8 (default 3; none for baseline) |
+| `-refs <n>` | H.264 reference pictures, 1-16 (default 3; 1 for baseline) |
 | `-c:s copy` | Copy subtitles (Matroska; WebVTT into WebM) |
 | `-c copy` | Copy every stream |
 | `-ar <rate>` | Output sample rate (polyphase resampler) |
@@ -494,16 +515,16 @@ Default codecs per output container (when `-c:a`/`-c:v` aren't given):
 | `.m4a` | copy if MP4 holds it, else `aac` | dropped | dropped |
 | `.mkv` | copy if Matroska holds it, else `flac` | copy | copy |
 | `.mka` | copy if Matroska holds it, else `flac` | dropped | copy |
-| `.webm` | copy (Opus, Vorbis) | copy (VP8, VP9, AV1) | copy (WebVTT) |
+| `.webm` | copy (Opus, Vorbis), else `opus` | copy (VP8, VP9, AV1) | copy (WebVTT) |
 | `.ogg`, `.oga` | copy (Opus, FLAC, Vorbis), else `flac` | dropped | dropped |
-| `.opus` | copy (Opus only) | dropped | dropped |
+| `.opus` | copy if Opus, else `opus` | dropped | dropped |
 
 `-ar`, `-ac` and `-sample_fmt` switch a copy default to a re-encode (AAC in
 MP4/M4A/MOV, FLAC elsewhere); `-s` and `-pix_fmt` switch it to `h264` (to
 `rawvideo` for Y4M, or when the pixel format isn't `yuv420p`), and so do
-`-b:v` and `-qp`. RMP has no Opus, Vorbis, MP3 or VP9 encoder, so WebM,
-`.opus` and `.mp3` output are stream copies; their decoders let those
-streams go to any other format.
+`-b:v` and `-qp`. WebM and `.opus` re-encode audio to Opus. RMP has no
+Vorbis, MP3 or VP9 encoder, so `.mp3` output and WebM video are stream
+copies; their decoders let those streams go to any other format.
 
 ## SIMD
 

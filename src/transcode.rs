@@ -39,6 +39,7 @@ use crate::Message;
 use crate::codecs::aac::{self, AacEncoder};
 use crate::codecs::flac::FlacEncoder;
 use crate::codecs::h264::H264Encoder;
+use crate::codecs::opus::OpusEncoder;
 use crate::codecs::pcm::PcmCodec;
 use crate::codecs::threading;
 use crate::container::mkv::tracks::mux_codec;
@@ -79,6 +80,12 @@ pub struct Options {
 	pub qp: Option<u8>,
 	/// `-g`: H.264 keyframe interval in frames.
 	pub gop: Option<u32>,
+	/// `-profile:v`: H.264 profile (baseline, main, high).
+	pub profile: Option<crate::codecs::h264::encoder::Profile>,
+	/// `-bf`: most consecutive H.264 B pictures (0-8).
+	pub bframes: Option<u32>,
+	/// `-refs`: H.264 reference pictures (1-16).
+	pub refs: Option<u32>,
 	/// `-s WxH`, `-pix_fmt`, `-sws_flags`.
 	pub size: Option<(u32, u32)>,
 	pub pixel: Option<Pixel>,
@@ -163,6 +170,10 @@ impl Options {
 					| "-vb"
 					| "-qp"
 					| "-g"
+					| "-profile:v"
+					| "-vprofile"
+					| "-bf"
+					| "-refs"
 					| "-s"
 					| "-pix_fmt"
 					| "-sws_flags"
@@ -193,8 +204,15 @@ impl Options {
 			"-an" => self.no_audio = true,
 			"-vn" => self.no_video = true,
 			"-sn" => self.no_subtitles = true,
-			"-c:a" | "-acodec" => self.audio_codec = Some(need()?.to_string()),
-			"-c:v" | "-vcodec" => self.video_codec = Some(need()?.to_string()),
+			// FFmpeg's encoder library names select RMP's own encoders.
+			"-c:a" | "-acodec" => {
+				let v = need()?;
+				self.audio_codec = Some(if v == "libopus" { "opus" } else { v }.to_string());
+			}
+			"-c:v" | "-vcodec" => {
+				let v = need()?;
+				self.video_codec = Some(if v == "libx264" { "h264" } else { v }.to_string());
+			}
 			"-c:s" | "-scodec" => self.subtitle_codec = Some(need()?.to_string()),
 			"-c" | "-codec" => {
 				let v = need()?;
@@ -255,6 +273,29 @@ impl Options {
 					return Err(format!("-g must be at least 1: {v}"));
 				}
 				self.gop = Some(n);
+			}
+			"-profile:v" | "-vprofile" => {
+				let v = need()?;
+				self.profile = Some(
+					crate::codecs::h264::encoder::Profile::from_name(v)
+						.ok_or_else(|| format!("unknown H.264 profile: {v} (baseline, main or high)"))?,
+				);
+			}
+			"-bf" => {
+				let v = need()?;
+				let n = number(v)?;
+				if n > crate::codecs::h264::encoder::MAX_BFRAMES {
+					return Err(format!("-bf must be 0-8: {v}"));
+				}
+				self.bframes = Some(n);
+			}
+			"-refs" => {
+				let v = need()?;
+				let n = number(v)?;
+				if !(1..=crate::codecs::h264::encoder::MAX_REFS).contains(&n) {
+					return Err(format!("-refs must be 1-16: {v}"));
+				}
+				self.refs = Some(n);
 			}
 			"-s" => {
 				let v = need()?;
@@ -482,8 +523,20 @@ fn target_precision(codec: &str, out: &Stream, format: SampleFormat) -> u32 {
 
 fn audio_target(stream: &Stream, codec: &str, o: &Options) -> Result<(Stream, AudioSpec)> {
 	let p = &stream.parameters;
-	let rate = o.sample_rate.or(p.sample_rate).ok_or("input audio has no sample rate")?;
-	let channels = o.channels.or(p.channels).ok_or("input audio has no channel count")?;
+	let mut rate = o.sample_rate.or(p.sample_rate).ok_or("input audio has no sample rate")?;
+	let mut channels = o.channels.or(p.channels).ok_or("input audio has no channel count")?;
+	if codec == "opus" {
+		// The encoder codes 48 kHz mono or stereo (as libopus takes
+		// FFmpeg's input after its own resampling).
+		if o.sample_rate.is_some_and(|r| r != 48_000) {
+			return Err(Message::Codec("the opus encoder needs -ar 48000"));
+		}
+		if o.channels.is_some_and(|c| c > 2) {
+			return Err(Message::Codec("the opus encoder codes 1 or 2 channels"));
+		}
+		rate = 48_000;
+		channels = channels.min(2);
+	}
 	let mut out = Stream::audio(StreamId(0), rate, channels, CodecId::new(codec));
 	out.metadata = stream.metadata.clone();
 	let (format, layout) = if codec == "flac" {
@@ -501,9 +554,14 @@ fn audio_target(stream: &Stream, codec: &str, o: &Options) -> Result<(Stream, Au
 		out.parameters.extradata = encoder.extradata(&out.parameters)?;
 		out.parameters.bitrate = Some(encoder.bitrate_for(&out.parameters));
 		(SampleFormat::F32, SampleLayout::Planar)
+	} else if codec == "opus" {
+		let encoder = OpusEncoder::new(StreamId(0)).with_bitrate(o.audio_bitrate);
+		out.parameters.extradata = encoder.extradata(&out.parameters)?;
+		out.parameters.bitrate = Some(encoder.bitrate_for(&out.parameters));
+		(SampleFormat::F32, SampleLayout::Interleaved)
 	} else {
 		let pcm = PcmCodec::from_id(codec).ok_or(Message::Codec(
-			"unsupported audio codec: RMP encodes aac, flac and pcm_* (or use -c:a copy)",
+			"unsupported audio codec: RMP encodes aac, opus, flac and pcm_* (or use -c:a copy)",
 		))?;
 		(pcm.sample_format(), SampleLayout::Interleaved)
 	};
@@ -517,6 +575,13 @@ fn audio_target(stream: &Stream, codec: &str, o: &Options) -> Result<(Stream, Au
 			.metadata
 			.raw
 			.insert("encoder_delay".into(), RawValue::String(aac::encoder::ENCODER_DELAY.to_string()));
+	}
+	if codec == "opus" {
+		// The pre-skip (also in OpusHead), for the muxers' delay fields.
+		out.metadata.raw.insert(
+			"encoder_delay".into(),
+			RawValue::String(crate::codecs::opus::encoder::PRE_SKIP.to_string()),
+		);
 	}
 	let format = o.sample_format.map_or((format, layout), |f| f);
 	Ok((out, AudioSpec::new(rate, channels, format.0, format.1)))
@@ -579,9 +644,10 @@ fn default_audio(ext: &str, stream: &Stream, options: &Options) -> Option<&'stat
 		"mp4" | "m4a" | "mov" if muxer_supports(codec) => "copy",
 		"mp4" | "m4a" | "mov" => "aac",
 		"mkv" | "mka" | "mks" if matroska_holds(stream, false) => "copy",
-		// WebM and .opus only hold codecs RMP can't encode: copy, and let
-		// the muxer explain when the codec doesn't fit.
-		"webm" | "opus" => "copy",
+		// WebM and .opus: copy what they hold, else encode Opus.
+		"webm" if matches!(codec, "opus" | "vorbis") => "copy",
+		"opus" if codec == "opus" => "copy",
+		"webm" | "opus" => "opus",
 		"ogg" | "oga" if matches!(codec, "opus" | "flac" | "vorbis") => "copy",
 		_ => "flac",
 	})
@@ -673,7 +739,8 @@ fn transcode_with(input: &str, output: &str, options: &Options, threads: usize) 
 				if default == "copy" && options.converts_audio() {
 					// Resampling or remixing means re-encoding (as in FFmpeg).
 					default = match ext.as_str() {
-						"webm" | "opus" | "mp3" => {
+						"webm" | "opus" => "opus",
+						"mp3" => {
 							return Err(Message::Codec(
 								"-ar/-ac/-sample_fmt need re-encoding, and RMP has no encoder for this container's audio",
 							));
@@ -711,6 +778,8 @@ fn transcode_with(input: &str, output: &str, options: &Options, threads: usize) 
 						Box::new(FlacEncoder::new(out_id).with_level(options.level.unwrap_or(5)))
 					} else if codec == "aac" {
 						Box::new(AacEncoder::new(out_id).with_bitrate(options.audio_bitrate))
+					} else if codec == "opus" {
+						Box::new(OpusEncoder::new(out_id).with_bitrate(options.audio_bitrate))
 					} else {
 						resolver.encoder_for(&out).ok_or("no encoder")?
 					};
@@ -819,6 +888,9 @@ fn transcode_with(input: &str, output: &str, options: &Options, threads: usize) 
 						let h264 = H264Encoder::new(out_id)
 							.with_rate(options.qp, options.video_bitrate)
 							.with_gop(options.gop)
+							.with_profile(options.profile)
+							.with_bframes(options.bframes)
+							.with_refs(options.refs)
 							.with_time_base(out.time_base);
 						out.parameters.extradata = h264.extradata(&out.parameters)?;
 						out.parameters.bitrate = options.video_bitrate;
@@ -982,6 +1054,15 @@ impl EncodeStage {
 						p.stream_id = r.out;
 						self.packets_out += 1;
 						muxer.write(p)?;
+					}
+				}
+				// Video encoders with a lookahead (H.264 B pictures) hold
+				// pictures back until the end.
+				if let Some(Route::Video(r)) = self.routes.get_mut(&id) {
+					for mut p in r.encoder.flush(&mut r.enc_state)?.value {
+						p.stream_id = r.out;
+						self.packets_out += 1;
+						self.muxer.write(p)?;
 					}
 				}
 			}

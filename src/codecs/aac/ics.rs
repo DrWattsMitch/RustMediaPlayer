@@ -33,8 +33,9 @@ const MAX_QUANT: usize = 8191;
 pub const TNS_MAX_ORDER: usize = 20;
 
 /// Maximum TNS bands per sampling-frequency index (Table 4.155).
-const TNS_MAX_BANDS_LONG: [u8; 13] = [31, 31, 34, 40, 42, 51, 46, 46, 42, 42, 42, 39, 39];
-const TNS_MAX_BANDS_SHORT: [u8; 13] = [9, 9, 10, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14];
+pub(crate) const TNS_MAX_BANDS_LONG: [u8; 13] =
+	[31, 31, 34, 40, 42, 51, 46, 46, 42, 42, 42, 39, 39];
+pub(crate) const TNS_MAX_BANDS_SHORT: [u8; 13] = [9, 9, 10, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WindowSequence {
@@ -614,7 +615,7 @@ pub fn apply_tns(ch: &mut Channel) {
 }
 
 /// Step-up recursion from reflection to direct-form coefficients.
-fn parcor_to_lpc(parcor: &[f32]) -> [f32; TNS_MAX_ORDER] {
+pub(crate) fn parcor_to_lpc(parcor: &[f32]) -> [f32; TNS_MAX_ORDER] {
 	let mut lpc = [0.0f32; TNS_MAX_ORDER];
 	for (i, &r) in parcor.iter().enumerate() {
 		lpc[i] = r;

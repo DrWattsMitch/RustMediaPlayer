@@ -729,6 +729,12 @@ impl OpusDecoderState {
 		self.next_pts = None;
 	}
 
+	/// Final range-coder state of the last packet, XORed over the streams
+	/// (`OPUS_GET_FINAL_RANGE`): an encoder's must match it.
+	pub fn final_range(&self) -> u32 {
+		self.streams.iter().fold(0, |r, s| r ^ s.range_final)
+	}
+
 	/// Samples per channel of the last decode or concealment
 	/// (`OPUS_GET_LAST_PACKET_DURATION`).
 	pub fn last_packet_duration(&self) -> usize {
