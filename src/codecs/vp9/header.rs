@@ -386,9 +386,6 @@ pub fn parse_uncompressed(
 		return Err(invalid("vp9: invalid compressed header size"));
 	}
 	h.header_size = b.pos().div_ceil(8);
-	if h.color.bit_depth != 8 {
-		return Err(invalid("vp9: only 8-bit profiles (0 and 1) are supported"));
-	}
 	Ok(h)
 }
 

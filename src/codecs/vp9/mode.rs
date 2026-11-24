@@ -119,7 +119,7 @@ fn lower_mv_precision(mv: &mut Mv, allow_hp: bool) {
 	}
 }
 
-impl FrameDecoder {
+impl<P: super::pixel::Px> FrameDecoder<P> {
 	fn above_mi(&self, p: &BlockPos) -> Option<ModeInfo> {
 		p.have_above.then(|| self.mi[(p.row - 1) * self.mi_cols + p.col])
 	}

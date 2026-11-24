@@ -416,10 +416,10 @@ mod tests {
 			let mut b = a.clone();
 			let (x, y) = (16 + 8 * rng.range(0, 2) as usize, 16 + 8 * rng.range(0, 2) as usize);
 			if vertical {
-				vertical_scalar(&mut a, x, y, &t, taps);
+				vertical_scalar(&mut a, x, y, &t, taps, 0);
 				super::vertical(&mut b, x, y, &t, taps);
 			} else {
-				horizontal_scalar(&mut a, x, y, &t, taps);
+				horizontal_scalar(&mut a, x, y, &t, taps, 0);
 				super::horizontal(&mut b, x, y, &t, taps);
 			}
 			assert_eq!(a.data, b.data, "taps {taps} vertical {vertical} {t:?}");
@@ -439,7 +439,7 @@ mod tests {
 			let l = rng.range(50, 200);
 			let mut a = plane(32, 32, |x, _| (l + if x >= 16 { 3 } else { 0 }) as u8);
 			let mut b = a.clone();
-			vertical_scalar(&mut a, 16, 8, &t, 16);
+			vertical_scalar(&mut a, 16, 8, &t, 16, 0);
 			super::vertical(&mut b, 16, 8, &t, 16);
 			assert_eq!(a.data, b.data);
 			// p3 (x = 12) changes only under the 15-tap filter.
@@ -484,7 +484,7 @@ mod tests {
 			let init: Vec<u8> = (0..96 * 80).map(|_| rng.next() as u8).collect();
 			let mut a = init.clone();
 			let mut b = init;
-			predict_scalar(&mut s1, &src, &mut a, 96, x, y, w, h, mv_row, mv_col, filter, avg);
+			predict_scalar(&mut s1, &src, &mut a, 96, x, y, w, h, mv_row, mv_col, filter, avg, 255);
 			super::predict(&mut s2, &src, &mut b, 96, x, y, w, h, mv_row, mv_col, filter, avg);
 			assert_eq!(a, b, "{w}x{h} mv ({mv_row},{mv_col}) filter {filter} avg {avg}");
 		}

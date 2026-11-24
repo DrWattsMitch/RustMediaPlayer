@@ -4,6 +4,7 @@
 //! decoded neighbours. The first three tree nodes (EOB, ZERO, ONE) have
 //! adaptive probabilities; the rest come from the Pareto model of the
 //! third. Values are dequantized as they are read (32x32 halves them).
+//! The largest token carries 14, 16 or 18 extra bits at 8, 10 or 12 bits.
 
 use super::range::BoolDecoder;
 use super::tables;
@@ -13,7 +14,19 @@ const CAT2: [u8; 2] = [165, 145];
 const CAT3: [u8; 3] = [173, 148, 140];
 const CAT4: [u8; 4] = [176, 155, 140, 135];
 const CAT5: [u8; 5] = [180, 157, 141, 134, 130];
-const CAT6: [u8; 14] = [254, 254, 254, 252, 249, 243, 230, 196, 177, 153, 140, 133, 130, 129];
+/// Cat6 extra bits for 12-bit streams (libvpx `vp9_cat6_prob_high12`):
+/// 18 bits; 10-bit streams skip the first two, 8-bit ones the first four.
+const CAT6_HIGH12: [u8; 18] =
+	[255, 255, 255, 255, 254, 254, 254, 252, 249, 243, 230, 196, 177, 153, 140, 133, 130, 129];
+
+/// The cat6 probabilities of a bit depth.
+pub fn cat6(bit_depth: u8) -> &'static [u8] {
+	match bit_depth {
+		12 => &CAT6_HIGH12,
+		10 => &CAT6_HIGH12[2..],
+		_ => &CAT6_HIGH12[4..],
+	}
+}
 
 /// A scan order and its context neighbours.
 pub struct Scan {
@@ -57,7 +70,8 @@ pub struct TokenCounts<'a> {
 
 /// Decodes the tokens of one transform block into `coefs` (raster order,
 /// dequantized); returns the end of block. `probs` are the block's
-/// `[band][context][node]` probabilities, `dq` its DC and AC quantizers.
+/// `[band][context][node]` probabilities, `dq` its DC and AC quantizers,
+/// `cat6` the extra-bit probabilities of the largest token ([`cat6`]).
 #[allow(clippy::too_many_arguments)]
 pub fn decode_coefs(
 	r: &mut BoolDecoder,
@@ -68,6 +82,7 @@ pub fn decode_coefs(
 	dq: [i16; 2],
 	mut ctx: usize,
 	sc: &Scan,
+	cat6: &[u8],
 ) -> usize {
 	let max_eob = 16usize << (tx_size << 1);
 	let band_of: &[u8] = if tx_size == 0 { &tables::COEFBAND_4X4 } else { &tables::COEFBAND_8X8PLUS };
@@ -121,7 +136,7 @@ pub fn decode_coefs(
 				let val = if r.read(pareto[3]) {
 					token_cache[pos] = 5;
 					if r.read(pareto[5]) {
-						if r.read(pareto[7]) { 67 + extra(r, &CAT6) } else { 35 + extra(r, &CAT5) }
+						if r.read(pareto[7]) { 67 + extra(r, cat6) } else { 35 + extra(r, &CAT5) }
 					} else if r.read(pareto[6]) {
 						19 + extra(r, &CAT4)
 					} else {
@@ -148,4 +163,17 @@ pub fn decode_coefs(
 		dqv = i32::from(dq[1]);
 	}
 	c
+}
+
+#[cfg(test)]
+mod tests {
+	use super::cat6;
+
+	#[test]
+	fn cat6_bits_grow_with_the_bit_depth() {
+		assert_eq!(cat6(8), &[254, 254, 254, 252, 249, 243, 230, 196, 177, 153, 140, 133, 130, 129]);
+		assert_eq!((cat6(10).len(), cat6(12).len()), (16, 18));
+		assert_eq!(&cat6(10)[2..], cat6(8));
+		assert_eq!(&cat6(12)[..4], &[255; 4]);
+	}
 }

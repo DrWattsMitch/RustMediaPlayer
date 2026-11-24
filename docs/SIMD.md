@@ -105,6 +105,7 @@ rather than a closure.
 | VP9 | loop filter: 4-, 8- and 16-wide, both directions | `vp9/simd.rs` | mask/flat/flat2 per lane; 15-tap running sum |
 | VP9 | 8-tap sub-pixel convolution (+ compound average) | `vp9/simd.rs` | tap pairs through `madd`; 16- and 8-wide paths |
 | VP9 | DC-only inverse transform (`vpx_idctNxN_1_add`) | `vp9/transform.rs`, `vp9/simd.rs` | `eob == 1` shortcut, proven equal to the full transform |
+| VP9 | (10/12-bit streams and scaled references use the scalar code; the kernels above are 8-bit) | `vp9/pixel.rs` | `Px` picks the vector kernel for `u8` only |
 | AAC, Vorbis | radix-2 FFT stages; IMDCT pre/post twiddle | `dsp/simd.rs` | shared `dsp::Imdct` (also the AAC encoder's MDCT) |
 | Opus | CELT mixed-radix FFT combining loop | `opus/mdct.rs` | vectorised over `k`; twiddle table hoisted out of the loop |
 | FLAC | LPC restore | `flac/decoder.rs` | scalar, monomorphised per order (see below) |

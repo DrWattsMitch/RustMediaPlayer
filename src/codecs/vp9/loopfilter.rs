@@ -6,10 +6,12 @@
 //! vertical edge (left to right in each 8-pixel row), then every
 //! horizontal edge. Edges follow transform boundaries; the filter length
 //! (4, 8 or 16 taps) comes from the transform size, and each 8x8 block's
-//! level from its segment, reference frame and mode.
+//! level from its segment, reference frame and mode. High bit depths use
+//! the same masks with thresholds scaled by `1 << (bit_depth - 8)`.
 
 use super::decoder::Plane;
 use super::mode::ModeInfo;
+use super::pixel::Px;
 use super::{NUM_4X4_HIGH, NUM_4X4_WIDE, NUM_8X8_HIGH, NUM_8X8_WIDE, uv_tx_size};
 
 /// Limits for one filter level.
@@ -61,75 +63,80 @@ pub fn level(levels: &[[[u8; 2]; 4]; 8], mi: &ModeInfo) -> u8 {
 }
 
 #[inline]
-fn d(a: u8, b: u8) -> u8 {
-	a.abs_diff(b)
+fn d<P: Px>(a: P, b: P) -> i32 {
+	(a.into() - b.into()).abs()
 }
 
+/// `signed_char_clamp` / `signed_char_clamp_high`: the signed range of the
+/// bit depth (`shift` = `bit_depth - 8`).
 #[inline]
-fn sclamp(v: i32) -> i32 {
-	v.clamp(-128, 127)
+fn sclamp(v: i32, shift: u32) -> i32 {
+	v.clamp(-128 << shift, (128 << shift) - 1)
 }
 
 /// The 4-tap filter (`filter4`) on `[p1, p0, q0, q1]`, once the mask passed.
 #[inline]
-fn filter4(px: &mut [u8], hev_thr: u8) {
+fn filter4<P: Px>(px: &mut [P], hev_thr: i32, shift: u32) {
 	let [p1, p0, q0, q1] = [px[0], px[1], px[2], px[3]];
 	let hev = d(p1, p0) > hev_thr || d(q1, q0) > hev_thr;
-	let s = |v: u8| i32::from(v) - 128;
+	let bias = 0x80 << shift;
+	let s = |v: P| v.into() - bias;
 	let (ps1, ps0, qs0, qs1) = (s(p1), s(p0), s(q0), s(q1));
-	let mut filter = if hev { sclamp(ps1 - qs1) } else { 0 };
-	filter = sclamp(filter + 3 * (qs0 - ps0));
-	let filter1 = sclamp(filter + 4) >> 3;
-	let filter2 = sclamp(filter + 3) >> 3;
-	px[2] = (sclamp(qs0 - filter1) + 128) as u8;
-	px[1] = (sclamp(ps0 + filter2) + 128) as u8;
+	let mut filter = if hev { sclamp(ps1 - qs1, shift) } else { 0 };
+	filter = sclamp(filter + 3 * (qs0 - ps0), shift);
+	let filter1 = sclamp(filter + 4, shift) >> 3;
+	let filter2 = sclamp(filter + 3, shift) >> 3;
+	px[2] = P::of(sclamp(qs0 - filter1, shift) + bias);
+	px[1] = P::of(sclamp(ps0 + filter2, shift) + bias);
 	if !hev {
 		let f = (filter1 + 1) >> 1;
-		px[3] = (sclamp(qs1 - f) + 128) as u8;
-		px[0] = (sclamp(ps1 + f) + 128) as u8;
+		px[3] = P::of(sclamp(qs1 - f, shift) + bias);
+		px[0] = P::of(sclamp(ps1 + f, shift) + bias);
 	}
 }
 
 /// Filters across one edge. `px` holds `p3..p0 q0..q3` (8 pixels) or, for
-/// the 16-wide filter, `p7..p0 q0..q7` (16 pixels).
+/// the 16-wide filter, `p7..p0 q0..q7` (16 pixels). At high bit depths
+/// every threshold is shifted left by `shift` (libvpx `highbd_filter_mask`,
+/// `highbd_flat_mask4`, `highbd_hev_mask`).
 #[inline]
-fn filter_edge(px: &mut [u8], t: &Thresholds, taps: u8) {
+fn filter_edge<P: Px>(px: &mut [P], t: &Thresholds, taps: u8, shift: u32) {
 	let c = px.len() / 2;
 	let p = |i: usize| px[c - 1 - i];
 	let q = |i: usize| px[c + i];
-	let lim = t.lim;
+	let lim = i32::from(t.lim) << shift;
 	let mask = d(p(3), p(2)) <= lim
 		&& d(p(2), p(1)) <= lim
 		&& d(p(1), p(0)) <= lim
 		&& d(q(1), q(0)) <= lim
 		&& d(q(2), q(1)) <= lim
 		&& d(q(3), q(2)) <= lim
-		&& u32::from(d(p(0), q(0))) * 2 + u32::from(d(p(1), q(1))) / 2 <= u32::from(t.mblim);
+		&& d(p(0), q(0)) * 2 + d(p(1), q(1)) / 2 <= i32::from(t.mblim) << shift;
 	if !mask {
 		return;
 	}
 	let (p0, q0) = (p(0), q(0));
-	let flat = taps >= 8 && (1..=3).all(|i| d(p(i), p0) <= 1 && d(q(i), q0) <= 1);
-	if taps == 16 && flat && (4..=7).all(|i| d(p(i), p0) <= 1 && d(q(i), q0) <= 1) {
+	let one = 1 << shift;
+	let flat = taps >= 8 && (1..=3).all(|i| d(p(i), p0) <= one && d(q(i), q0) <= one);
+	if taps == 16 && flat && (4..=7).all(|i| d(p(i), p0) <= one && d(q(i), q0) <= one) {
 		// 15-tap filter [1, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1]: a
 		// running sum over the window, with the ends repeated.
-		let v: [u32; 16] = std::array::from_fn(|i| u32::from(px[i]));
+		let v: [i32; 16] = std::array::from_fn(|i| px[i].into());
 		let mut sum = v[0] * 7 + v[1] * 2 + v[2] + v[3] + v[4] + v[5] + v[6] + v[7] + v[8];
-		let mut out = [0u8; 14];
-		out[0] = ((sum + 8) >> 4) as u8;
+		let mut out = [P::default(); 14];
+		out[0] = P::of((sum + 8) >> 4);
 		for k in 1..14 {
 			// The window of pixel k + 1 drops pixel k - 7 (repeating p7),
 			// takes in pixel k + 8 (repeating q7), and its doubled centre
 			// moves from pixel k to k + 1.
 			sum = sum + v[(k + 8).min(15)] - v[k.saturating_sub(7)] + v[k + 1] - v[k];
-			out[k] = ((sum + 8) >> 4) as u8;
+			out[k] = P::of((sum + 8) >> 4);
 		}
 		px[1..15].copy_from_slice(&out);
 	} else if flat {
 		let b = c - 4;
-		let [p3, p2, p1, p0, q0, q1, q2, q3] =
-			std::array::from_fn::<u32, 8, _>(|i| u32::from(px[b + i]));
-		let r = |v: u32| ((v + 4) >> 3) as u8;
+		let [p3, p2, p1, p0, q0, q1, q2, q3] = std::array::from_fn::<i32, 8, _>(|i| px[b + i].into());
+		let r = |v: i32| P::of((v + 4) >> 3);
 		px[b + 1] = r(p3 + p3 + p3 + 2 * p2 + p1 + p0 + q0);
 		px[b + 2] = r(p3 + p3 + p2 + 2 * p1 + p0 + q0 + q1);
 		px[b + 3] = r(p3 + p2 + p1 + 2 * p0 + q0 + q1 + q2);
@@ -137,7 +144,7 @@ fn filter_edge(px: &mut [u8], t: &Thresholds, taps: u8) {
 		px[b + 5] = r(p1 + p0 + q0 + 2 * q1 + q2 + q3 + q3);
 		px[b + 6] = r(p0 + q0 + q1 + 2 * q2 + q3 + q3 + q3);
 	} else {
-		filter4(&mut px[c - 2..c + 2], t.hev);
+		filter4(&mut px[c - 2..c + 2], i32::from(t.hev) << shift, shift);
 	}
 }
 
@@ -146,45 +153,42 @@ fn reach(taps: u8) -> usize {
 	if taps == 16 { 8 } else { 4 }
 }
 
-/// Filters an 8-pixel stretch of a vertical edge at (`x`, `y`).
-fn vertical(plane: &mut Plane, x: usize, y: usize, t: &Thresholds, taps: u8) {
-	if crate::simd::enabled() {
-		super::simd::vertical(plane, x, y, t, taps)
-	} else {
-		vertical_scalar(plane, x, y, t, taps)
-	}
-}
-
-/// Scalar version of [`vertical`]: the fallback and the reference.
-pub(super) fn vertical_scalar(plane: &mut Plane, x: usize, y: usize, t: &Thresholds, taps: u8) {
+/// Scalar vertical edge: 8 rows at (`x`, `y`). The 10/12-bit path, the
+/// 8-bit fallback and the reference for the vector code.
+pub(super) fn vertical_scalar<P: Px>(
+	plane: &mut Plane<P>,
+	x: usize,
+	y: usize,
+	t: &Thresholds,
+	taps: u8,
+	shift: u32,
+) {
 	let n = reach(taps);
 	let stride = plane.stride;
 	for r in 0..8 {
 		let at = (y + r) * stride + x;
-		filter_edge(&mut plane.data[at - n..at + n], t, taps);
+		filter_edge(&mut plane.data[at - n..at + n], t, taps, shift);
 	}
 }
 
-/// Filters an 8-pixel stretch of a horizontal edge at (`x`, `y`).
-fn horizontal(plane: &mut Plane, x: usize, y: usize, t: &Thresholds, taps: u8) {
-	if crate::simd::enabled() {
-		super::simd::horizontal(plane, x, y, t, taps)
-	} else {
-		horizontal_scalar(plane, x, y, t, taps)
-	}
-}
-
-/// Scalar version of [`horizontal`]: the fallback and the reference.
-pub(super) fn horizontal_scalar(plane: &mut Plane, x: usize, y: usize, t: &Thresholds, taps: u8) {
+/// Scalar horizontal edge: 8 columns at (`x`, `y`).
+pub(super) fn horizontal_scalar<P: Px>(
+	plane: &mut Plane<P>,
+	x: usize,
+	y: usize,
+	t: &Thresholds,
+	taps: u8,
+	shift: u32,
+) {
 	let n = reach(taps);
 	let stride = plane.stride;
-	let mut px = [0u8; 16];
+	let mut px = [P::default(); 16];
 	for c in 0..8 {
 		let base = (y - n) * stride + x + c;
 		for (i, v) in px[..2 * n].iter_mut().enumerate() {
 			*v = plane.data[base + i * stride];
 		}
-		filter_edge(&mut px[..2 * n], t, taps);
+		filter_edge(&mut px[..2 * n], t, taps, shift);
 		for (i, &v) in px[..2 * n].iter().enumerate() {
 			plane.data[base + i * stride] = v;
 		}
@@ -193,8 +197,8 @@ pub(super) fn horizontal_scalar(plane: &mut Plane, x: usize, y: usize, t: &Thres
 
 /// Filters one plane of the superblock at (`mi_row`, `mi_col`).
 #[allow(clippy::too_many_arguments)]
-pub fn filter_superblock(
-	plane: &mut Plane,
+pub fn filter_superblock<P: Px>(
+	plane: &mut Plane<P>,
 	cells: &[LfCell],
 	mi_rows: usize,
 	mi_cols: usize,
@@ -203,6 +207,7 @@ pub fn filter_superblock(
 	ss_x: usize,
 	ss_y: usize,
 	thr: &[Thresholds; 64],
+	shift: u32,
 ) {
 	let row_step = 1 << ss_y;
 	let col_step = 1 << ss_x;
@@ -294,14 +299,14 @@ pub fn filter_superblock(
 			let t = &thr[usize::from(lfl[(r << 3) + k])];
 			let x = x_base + 8 * k;
 			if m16c >> k & 1 == 1 {
-				vertical(plane, x, y, t, 16);
+				P::lf_vertical(plane, x, y, t, 16, shift);
 			} else if m8c >> k & 1 == 1 {
-				vertical(plane, x, y, t, 8);
+				P::lf_vertical(plane, x, y, t, 8, shift);
 			} else if m4c >> k & 1 == 1 {
-				vertical(plane, x, y, t, 4);
+				P::lf_vertical(plane, x, y, t, 4, shift);
 			}
 			if mask_4_int[r] >> k & 1 == 1 {
-				vertical(plane, x + 4, y, t, 4);
+				P::lf_vertical(plane, x + 4, y, t, 4, shift);
 			}
 		}
 		r += row_step;
@@ -321,14 +326,14 @@ pub fn filter_superblock(
 			let t = &thr[usize::from(lfl[(r << 3) + k])];
 			let x = x_base + 8 * k;
 			if m16 >> k & 1 == 1 {
-				horizontal(plane, x, y, t, 16);
+				P::lf_horizontal(plane, x, y, t, 16, shift);
 			} else if m8 >> k & 1 == 1 {
-				horizontal(plane, x, y, t, 8);
+				P::lf_horizontal(plane, x, y, t, 8, shift);
 			} else if m4 >> k & 1 == 1 {
-				horizontal(plane, x, y, t, 4);
+				P::lf_horizontal(plane, x, y, t, 4, shift);
 			}
 			if int >> k & 1 == 1 {
-				horizontal(plane, x, y + 4, t, 4);
+				P::lf_horizontal(plane, x, y + 4, t, 4, shift);
 			}
 		}
 		r += row_step;
@@ -354,7 +359,7 @@ mod tests {
 		// A flat 8-tap edge: p = 10, q = 12 → the 7-tap filter blends.
 		let mut row = [10u8, 10, 10, 10, 12, 12, 12, 12];
 		let t = Thresholds { mblim: 30, lim: 5, hev: 0 };
-		filter_edge(&mut row, &t, 8);
+		filter_edge(&mut row, &t, 8, 0);
 		assert_eq!(row, [10, 10, 11, 11, 11, 12, 12, 12]);
 	}
 
@@ -385,7 +390,7 @@ mod tests {
 		let expect_q3 =
 			r4(p(3) + p(2) + p(1) + p(0) + q(0) + q(1) + q(2) + q(3) * 2 + q(4) + q(5) + q(6) + q(7) * 4);
 		let expect_q6 = r4(p(0) + q(0) + q(1) + q(2) + q(3) + q(4) + q(5) + q(6) * 2 + q(7) * 7);
-		filter_edge(&mut px, &Thresholds { mblim: 60, lim: 10, hev: 0 }, 16);
+		filter_edge(&mut px, &Thresholds { mblim: 60, lim: 10, hev: 0 }, 16, 0);
 		assert_eq!((px[1], px[7], px[11], px[14]), (expect_p6, expect_p0, expect_q3, expect_q6));
 	}
 }

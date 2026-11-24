@@ -2,8 +2,9 @@
 //! every shown frame, `ffmpeg -c:v vp9 -i X -f framecrc`), so a match is
 //! bit-exact. Streams are libvpx encodes covering hidden alt-ref frames and
 //! superframes, compound prediction, odd sizes, profile 1 (4:2:2, sRGB
-//! 4:4:4), lossless, tiles, segmentation, error resilience and
-//! frame-parallel mode.
+//! 4:4:4), lossless, tiles, segmentation, error resilience,
+//! frame-parallel mode, profiles 2 and 3 (10 and 12 bits) and frame size
+//! changes without key frames (prediction from scaled references).
 
 use crate::common::{fixture, memory};
 use rmp::codecs::vp9::Vp9DecoderState;
@@ -67,15 +68,27 @@ fn planar(frame: &VideoFrame) -> Vec<u8> {
 }
 
 fn assert_bit_exact(name: &str, size: (u32, u32), format: PixelFormat) {
+	assert_bit_exact_at(name, &[size], format, 8);
+}
+
+/// Like [`assert_bit_exact`] for a stream of `depth` bits whose frames take
+/// the sizes of `sizes` in turn (one entry: every frame has that size).
+fn assert_bit_exact_at(name: &str, sizes: &[(u32, u32)], format: PixelFormat, depth: u8) {
 	let frames = decode(name);
 	let reference = reference(name);
 	assert_eq!(frames.len(), reference.len(), "{name}: frame count");
+	let mut seen = Vec::new();
 	for (i, (frame, &(bytes, hash))) in frames.iter().zip(&reference).enumerate() {
-		assert_eq!((frame.width, frame.height, frame.pixel.format), (size.0, size.1, format), "{name}");
+		let size = (frame.width, frame.height);
+		if seen.last() != Some(&size) {
+			seen.push(size);
+		}
+		assert_eq!((frame.pixel.format, frame.pixel.depth), (format, depth), "{name}");
 		let data = planar(frame);
 		assert_eq!(data.len(), bytes, "{name} frame {i}: size");
 		assert_eq!(adler32(&data), hash, "{name} frame {i} differs from FFmpeg");
 	}
+	assert_eq!(seen, sizes, "{name}: frame sizes");
 	assert_eq!(frames[0].keyframe, Keyframe::Key);
 	// Every frame keeps its packet's timestamp, in order.
 	let pts: Vec<u64> = frames.iter().map(|f| f.pts.unwrap().ticks()).collect();
@@ -118,6 +131,60 @@ fn frame_parallel_mode_is_bit_exact() {
 }
 
 #[test]
+fn profile_2_10bit_with_altrefs_is_bit_exact() {
+	assert_bit_exact_at("p2_420_10bit_176x144", &[(176, 144)], PixelFormat::YUV420, 10);
+}
+
+#[test]
+fn profile_2_12bit_with_odd_size_is_bit_exact() {
+	assert_bit_exact_at("p2_420_12bit_99x61", &[(99, 61)], PixelFormat::YUV420, 12);
+}
+
+#[test]
+fn profile_3_444_10bit_is_bit_exact() {
+	assert_bit_exact_at("p3_444_10bit_96x64", &[(96, 64)], PixelFormat::YUV444, 10);
+}
+
+#[test]
+fn profile_3_422_12bit_is_bit_exact() {
+	assert_bit_exact_at("p3_422_12bit_96x64", &[(96, 64)], PixelFormat::YUV422, 12);
+}
+
+#[test]
+fn lossless_10bit_is_bit_exact() {
+	assert_bit_exact_at("lossless_10bit_64x48", &[(64, 48)], PixelFormat::YUV420, 10);
+}
+
+#[test]
+fn tiles_10bit_are_bit_exact() {
+	assert_bit_exact_at("tiles_10bit_512x128", &[(512, 128)], PixelFormat::YUV420, 10);
+}
+
+/// One key frame, then inter frames of new sizes predicted from the
+/// references of the old ones: down by 3/4 and 1/2, back up 2x (to the
+/// key frame's size, whose golden reference is unscaled again), then an
+/// odd size.
+#[test]
+fn resolution_changes_without_key_frames_are_bit_exact() {
+	let sizes = [(176, 144), (132, 108), (88, 72), (176, 144), (131, 77)];
+	assert_bit_exact_at("resize_420_176x144", &sizes, PixelFormat::YUV420, 8);
+	let frames = decode("resize_420_176x144");
+	assert_eq!(frames.iter().filter(|f| f.keyframe == Keyframe::Key).count(), 1);
+}
+
+#[test]
+fn resolution_changes_in_444_are_bit_exact() {
+	let sizes = [(128, 96), (96, 72), (64, 48), (100, 75)];
+	assert_bit_exact_at("resize_444_128x96", &sizes, PixelFormat::YUV444, 8);
+}
+
+#[test]
+fn resolution_changes_at_10bit_are_bit_exact() {
+	let sizes = [(160, 96), (120, 72), (80, 48), (160, 96), (104, 60)];
+	assert_bit_exact_at("resize_10bit_160x96", &sizes, PixelFormat::YUV420, 10);
+}
+
+#[test]
 fn webm_fixture_matches_ffmpeg_and_needs_a_key_frame() {
 	let mut demuxer = MkvDemuxer::new(memory(fixture("mkv/vp9_opus_vtt.webm"))).unwrap();
 	let stream = demuxer.streams().by_kind(StreamKind::Video)[0].clone();
@@ -157,6 +224,11 @@ fn tile_and_row_threading_are_bit_exact() {
 		"odd_444_99x61",
 		"p1_422_96x64",
 		"rt_aq_errres_160x96",
+		"p2_420_10bit_176x144",
+		"p3_422_12bit_96x64",
+		"tiles_10bit_512x128",
+		"resize_420_176x144",
+		"resize_10bit_160x96",
 	] {
 		let serial = decode_with(name, Vp9DecoderState::new());
 		assert_eq!(serial.len(), reference(name).len(), "{name}");

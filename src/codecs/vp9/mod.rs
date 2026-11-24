@@ -1,13 +1,13 @@
 //! VP9 video decoder (VP9 Bitstream & Decoding Process Specification v0.6;
 //! libvpx `vp9/decoder`, `vp9/common`, `vpx_dsp`).
 //!
-//! Profiles 0 and 1 (8-bit; 4:2:0, 4:2:2, 4:4:0 and 4:4:4), every frame
-//! type (key, inter, intra-only, hidden frames and `show_existing_frame`),
-//! tiles, segmentation, loop-filter deltas, compound prediction, switchable
-//! interpolation filters, lossless (WHT) frames, backward probability
-//! adaptation and superframes. Output is bit-exact with libvpx / FFmpeg.
-//! Not supported (decoding fails with an error): 10/12-bit profiles 2 and
-//! 3, and inter prediction from a reference of a different size.
+//! Every profile: 0 and 1 (8-bit), 2 and 3 (10- and 12-bit), in 4:2:0,
+//! 4:2:2, 4:4:0 and 4:4:4; every frame type (key, inter, intra-only, hidden
+//! frames and `show_existing_frame`), frame size changes inside a stream
+//! (prediction from scaled references), tiles, segmentation, loop-filter
+//! deltas, compound prediction, switchable interpolation filters, lossless
+//! (WHT) frames, backward probability adaptation and superframes. Output is
+//! bit-exact with libvpx / FFmpeg.
 //!
 //! Layout:
 //! - [`range`]: the boolean (arithmetic) decoder;
@@ -17,7 +17,8 @@
 //!   motion vectors and their candidate search);
 //! - [`residual`]: coefficient tokens;
 //! - [`transform`]: inverse DCT / ADST / WHT;
-//! - [`intra`], [`inter`]: prediction;
+//! - [`intra`], [`inter`]: prediction (including scaled references);
+//! - [`pixel`]: the sample types (`u8` for 8-bit, `u16` for 10/12-bit);
 //! - [`loopfilter`]: the deblocking filter;
 //! - [`decoder`]: frames, tiles, partitions, references and the
 //!   [`crate::core::Decoder`] implementation.
@@ -30,6 +31,7 @@ mod inter;
 mod intra;
 mod loopfilter;
 mod mode;
+mod pixel;
 mod probs;
 pub mod range;
 mod residual;
@@ -37,7 +39,7 @@ mod simd;
 mod tables;
 mod transform;
 
-pub use decoder::{Vp9Decoder, Vp9DecoderState};
+pub use decoder::{DecodedPicture, Picture, Plane, Vp9Decoder, Vp9DecoderState};
 
 /// Block sizes (`BLOCK_SIZE`), in libvpx order.
 pub(crate) mod bs {

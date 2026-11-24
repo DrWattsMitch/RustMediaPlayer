@@ -6,6 +6,11 @@
 //! libvpx's 32-bit wrapping (`WRAPLOW`) so every stream decodes bit-exactly.
 //! The 2-D transforms run rows then columns and add the rounded result to
 //! the prediction. Lossless frames use the 4x4 Walsh-Hadamard transform.
+//!
+//! High bit depths run the same butterflies (libvpx `vpx_highbd_*`), clip
+//! to `(1 << bit_depth) - 1`, and, like libvpx, zero the output of a 1-D
+//! transform whose input holds a value of 2^25 or more (only damaged
+//! streams get there).
 #![allow(clippy::too_many_lines, unused_assignments, unused_mut, clippy::identity_op)]
 
 const COSPI_1_64: i64 = 16364;
@@ -872,14 +877,33 @@ fn idct32(input: &[i32], output: &mut [i32]) {
 
 type Transform1d = fn(&[i32], &mut [i32]);
 
+use super::pixel::Px;
+
 #[inline]
-fn add_clip(dst: &mut u8, v: i64) {
-	*dst = (i64::from(*dst) + v).clamp(0, 255) as u8;
+fn add_clip<P: Px>(dst: &mut P, v: i64, max: i32) {
+	*dst = P::of((i64::from((*dst).into()) + v).clamp(0, i64::from(max)) as i32);
+}
+
+/// libvpx's `detect_invalid_highbd_input`, run before every high-bit-depth
+/// 1-D transform.
+#[inline]
+fn invalid_highbd_input(input: &[i32]) -> bool {
+	input.iter().any(|&c| c.unsigned_abs() >= 1 << 25)
+}
+
+/// One 1-D transform; at high bit depths an out-of-range input gives zeros.
+#[inline]
+fn run_1d<P: Px>(t: Transform1d, input: &[i32], output: &mut [i32]) {
+	if P::WIDE && invalid_highbd_input(input) {
+		output.fill(0);
+	} else {
+		t(input, output);
+	}
 }
 
 /// 4x4 inverse Walsh-Hadamard transform of lossless frames
 /// (`vpx_iwht4x4_16_add`).
-fn iwht4x4(input: &[i32], dst: &mut [u8], stride: usize) {
+fn iwht4x4<P: Px>(input: &[i32], dst: &mut [P], stride: usize, max: i32) {
 	let mut out = [0i64; 16];
 	for i in 0..4 {
 		let ip = &input[4 * i..4 * i + 4];
@@ -909,20 +933,22 @@ fn iwht4x4(input: &[i32], dst: &mut [u8], stride: usize) {
 		a1 -= b1;
 		d1 += c1;
 		for (j, v) in [a1, b1, c1, d1].into_iter().enumerate() {
-			add_clip(&mut dst[j * stride + i], wl(v));
+			add_clip(&mut dst[j * stride + i], wl(v), max);
 		}
 	}
 }
 
 /// Adds `v` to every pixel of the `n` x `n` block, clipped.
-fn add_constant(dst: &mut [u8], stride: usize, n: usize, v: i64) {
-	if crate::simd::enabled() {
+fn add_constant<P: Px>(dst: &mut [P], stride: usize, n: usize, v: i64, max: i32) {
+	if let Some(dst) = P::narrow_mut(dst)
+		&& crate::simd::enabled()
+	{
 		super::simd::add_constant(dst, stride, n, v);
 		return;
 	}
 	for r in 0..n {
 		for p in &mut dst[r * stride..r * stride + n] {
-			add_clip(p, v);
+			add_clip(p, v, max);
 		}
 	}
 }
@@ -932,17 +958,19 @@ fn add_constant(dst: &mut [u8], stride: usize, n: usize, v: i64) {
 /// spot DC-only blocks; the result is the same as the full transform).
 /// `tx_type` selects ADST in the vertical (1) or horizontal (2) direction
 /// or both (3); 32x32 is always a DCT.
-pub fn inverse_transform_add(
+#[allow(clippy::too_many_arguments)]
+pub fn inverse_transform_add<P: Px>(
 	coefs: &[i32],
-	dst: &mut [u8],
+	dst: &mut [P],
 	stride: usize,
 	tx_size: u8,
 	tx_type: u8,
 	lossless: bool,
 	eob: usize,
+	max: i32,
 ) {
 	if lossless {
-		iwht4x4(coefs, dst, stride);
+		iwht4x4(coefs, dst, stride, max);
 		return;
 	}
 	if eob == 1 && tx_type == 0 {
@@ -959,7 +987,7 @@ pub fn inverse_transform_add(
 		let a = wl(rs(i64::from(coefs[0]) * COSPI_16_64));
 		let b = wl(rs(a * COSPI_16_64));
 		let v = (b + (1 << (shift - 1))) >> shift;
-		add_constant(dst, stride, n, v);
+		add_constant(dst, stride, n, v, max);
 		return;
 	}
 	let (n, shift) = match tx_size {
@@ -979,22 +1007,23 @@ pub fn inverse_transform_add(
 	// Scratch sized to the transform: zeroing a 32x32 buffer for every 4x4
 	// block was the decoder's single largest `memset`.
 	match n {
-		4 => transform_2d::<4, 16>(coefs, dst, stride, rows, cols, shift),
-		8 => transform_2d::<8, 64>(coefs, dst, stride, rows, cols, shift),
-		16 => transform_2d::<16, 256>(coefs, dst, stride, rows, cols, shift),
-		_ => transform_2d::<32, 1024>(coefs, dst, stride, rows, cols, shift),
+		4 => transform_2d::<P, 4, 16>(coefs, dst, stride, rows, cols, shift, max),
+		8 => transform_2d::<P, 8, 64>(coefs, dst, stride, rows, cols, shift, max),
+		16 => transform_2d::<P, 16, 256>(coefs, dst, stride, rows, cols, shift, max),
+		_ => transform_2d::<P, 32, 1024>(coefs, dst, stride, rows, cols, shift, max),
 	}
 }
 
 /// Rows then columns of an `N` x `N` (`NN` = `N * N`) transform, added to
 /// `dst` with rounding `shift`.
-fn transform_2d<const N: usize, const NN: usize>(
+fn transform_2d<P: Px, const N: usize, const NN: usize>(
 	coefs: &[i32],
-	dst: &mut [u8],
+	dst: &mut [P],
 	stride: usize,
 	rows: Transform1d,
 	cols: Transform1d,
 	shift: u32,
+	max: i32,
 ) {
 	let n = N;
 	let mut out = [0i32; NN];
@@ -1002,7 +1031,7 @@ fn transform_2d<const N: usize, const NN: usize>(
 		let row = &coefs[i * n..(i + 1) * n];
 		// The transform of a zero row is zero.
 		if row.iter().any(|&c| c != 0) {
-			rows(row, &mut out[i * n..(i + 1) * n]);
+			run_1d::<P>(rows, row, &mut out[i * n..(i + 1) * n]);
 		}
 	}
 	let mut temp_in = [0i32; N];
@@ -1012,9 +1041,9 @@ fn transform_2d<const N: usize, const NN: usize>(
 		for j in 0..n {
 			temp_in[j] = out[j * n + i];
 		}
-		cols(&temp_in, &mut temp_out);
+		run_1d::<P>(cols, &temp_in, &mut temp_out);
 		for j in 0..n {
-			add_clip(&mut dst[j * stride + i], (i64::from(temp_out[j]) + round) >> shift);
+			add_clip(&mut dst[j * stride + i], (i64::from(temp_out[j]) + round) >> shift, max);
 		}
 	}
 }
@@ -1031,7 +1060,7 @@ mod tests {
 			let mut coefs = [0i32; 64];
 			coefs[0] = dc;
 			let mut dst = [128u8; 64];
-			inverse_transform_add(&coefs, &mut dst, 8, 1, 0, false, 64);
+			inverse_transform_add(&coefs, &mut dst, 8, 1, 0, false, 64, 255);
 			let out = rs(i64::from(dc) * COSPI_16_64);
 			let out = rs(out * COSPI_16_64);
 			let a1 = (out + 16) >> 5;
@@ -1045,7 +1074,7 @@ mod tests {
 		let mut coefs = [0i32; 16];
 		coefs[0] = 40;
 		let mut dst = [100u8; 16];
-		inverse_transform_add(&coefs, &mut dst, 4, 0, 0, true, 16);
+		inverse_transform_add(&coefs, &mut dst, 4, 0, 0, true, 16, 255);
 		// vpx_iwht4x4_1_add: a1 = 10, e1 = 5 → row 0 [5, 5, 5, 5] ... first
 		// column split again: [3, 2, 2, 2] for 5 and [3, 2, 2, 2] for e1 = 5.
 		assert_eq!(dst[0], 103);
@@ -1074,10 +1103,35 @@ mod tests {
 				let mut full = init.clone();
 				let mut fast = init;
 				// eob = n * n forces the full transform.
-				inverse_transform_add(&coefs, &mut full, n, tx_size, 0, false, n * n);
-				inverse_transform_add(&coefs, &mut fast, n, tx_size, 0, false, 1);
+				inverse_transform_add(&coefs, &mut full, n, tx_size, 0, false, n * n, 255);
+				inverse_transform_add(&coefs, &mut fast, n, tx_size, 0, false, 1, 255);
 				assert_eq!(full, fast, "{n}x{n} dc {dc}");
 			}
 		}
+	}
+
+	#[test]
+	fn high_bit_depth_clips_to_its_range_and_drops_invalid_input() {
+		// 10-bit: the same DC shortcut, clipped at 1023 instead of 255.
+		let mut coefs = [0i32; 16];
+		coefs[0] = 4000;
+		let mut dst = [1000u16; 16];
+		inverse_transform_add(&coefs, &mut dst, 4, 0, 0, false, 1, 1023);
+		assert!(dst.iter().all(|&p| p == 1023));
+		let mut dst8 = [200u8; 16];
+		inverse_transform_add(&coefs, &mut dst8, 4, 0, 0, false, 1, 255);
+		assert!(dst8.iter().all(|&p| p == 255));
+		// A coefficient of 2^25 makes libvpx's high-bit-depth row transform
+		// output zeros: only the other rows contribute.
+		let mut coefs = [0i32; 16];
+		coefs[0] = 1 << 25;
+		coefs[4] = 64;
+		let mut wide = [500u16; 16];
+		inverse_transform_add(&coefs, &mut wide, 4, 0, 0, false, 16, 1023);
+		let mut only_second = [0i32; 16];
+		only_second[4] = 64;
+		let mut expect = [500u16; 16];
+		inverse_transform_add(&only_second, &mut expect, 4, 0, 0, false, 16, 1023);
+		assert_eq!(wide, expect);
 	}
 }

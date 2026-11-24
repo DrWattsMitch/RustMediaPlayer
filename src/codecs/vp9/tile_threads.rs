@@ -21,53 +21,86 @@ use std::sync::mpsc;
 use std::sync::{Condvar, Mutex};
 
 use super::loopfilter::{self, LfCell};
-use super::{BoolDecoder, FrameDecoder, ModeInfo, MvRef, Picture, Plane, Result, corrupt, inter};
+use super::{
+	BoolDecoder, FrameDecoder, ModeInfo, MvRef, Picture, Plane, Px, Result, corrupt, inter,
+};
 use crate::core::{Pooled, VecPool};
 
 /// Reusable buffers of one tile column (the big arrays of a
 /// [`FrameDecoder`]).
-#[derive(Default)]
-pub(super) struct TileArrays {
+pub(super) struct TileArrays<P> {
 	mi: Vec<ModeInfo>,
 	lf_cells: Vec<LfCell>,
 	cur_mvs: Vec<MvRef>,
 	seg_map: Vec<u8>,
-	planes: [Vec<u8>; 3],
+	planes: [Vec<P>; 3],
 	above_nz: [Vec<u8>; 3],
 	above_partition: Vec<u8>,
 	coefs: Vec<i32>,
-	scratch: Option<inter::Scratch>,
+	scratch: Option<inter::Scratch<P>>,
+}
+
+impl<P> Default for TileArrays<P> {
+	fn default() -> Self {
+		Self {
+			mi: Vec::new(),
+			lf_cells: Vec::new(),
+			cur_mvs: Vec::new(),
+			seg_map: Vec::new(),
+			planes: Default::default(),
+			above_nz: Default::default(),
+			above_partition: Vec::new(),
+			coefs: Vec::new(),
+			scratch: None,
+		}
+	}
 }
 
 /// Tile workspaces kept between frames. Cloning a decoder state gives the
 /// clone an empty pool (the buffers are only scratch space).
-#[derive(Default)]
-pub struct TilePool(Vec<TileArrays>, ChunkPools);
+pub struct TilePool<P>(Vec<TileArrays<P>>, ChunkPools<P>);
+
+impl<P> Default for TilePool<P> {
+	fn default() -> Self {
+		Self(Vec::new(), ChunkPools::default())
+	}
+}
 
 /// Buffers of the row hand-over ([`Chunk`]s), recycled once merged.
-#[derive(Default, Clone)]
-struct ChunkPools {
-	samples: VecPool<u8>,
+struct ChunkPools<P> {
+	samples: VecPool<P>,
 	lf_cells: VecPool<LfCell>,
 }
 
-impl Clone for TilePool {
+impl<P> Default for ChunkPools<P> {
+	fn default() -> Self {
+		Self { samples: VecPool::default(), lf_cells: VecPool::default() }
+	}
+}
+
+impl<P> Clone for ChunkPools<P> {
+	fn clone(&self) -> Self {
+		Self { samples: self.samples.clone(), lf_cells: self.lf_cells.clone() }
+	}
+}
+
+impl<P> Clone for TilePool<P> {
 	fn clone(&self) -> Self {
 		Self::default()
 	}
 }
 
-impl std::fmt::Debug for TilePool {
+impl<P> std::fmt::Debug for TilePool<P> {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		write!(f, "TilePool({} workspaces)", self.0.len())
 	}
 }
 
 /// One finished superblock row of one tile column.
-struct Chunk {
+struct Chunk<P> {
 	tile_col: usize,
 	mi_row: usize,
-	planes: [Pooled<u8>; 3],
+	planes: [Pooled<P>; 3],
 	lf_cells: Pooled<LfCell>,
 }
 
@@ -77,7 +110,7 @@ fn sized<T: Clone>(mut v: Vec<T>, len: usize, fill: T) -> Vec<T> {
 	v
 }
 
-impl FrameDecoder {
+impl<P: Px> FrameDecoder<P> {
 	/// Sample columns of tile column `tile_col` in `plane`. The last column
 	/// also owns the padding up to the stride.
 	fn tile_x_range(&self, plane: usize, tile_col: usize) -> (usize, usize) {
@@ -101,7 +134,7 @@ impl FrameDecoder {
 	/// A workspace for tile column `tile_col`: shares the frame's headers,
 	/// contexts and references, and starts with that column of every array
 	/// exactly as this (not yet decoded) frame has it.
-	fn fork(&self, ws: TileArrays, tile_col: usize) -> FrameDecoder {
+	fn fork(&self, ws: TileArrays<P>, tile_col: usize) -> FrameDecoder<P> {
 		let cells = self.mi_rows * self.mi_cols;
 		let (c0, c1) = self.tile_mi_cols(tile_col);
 		// Every block writes its mode info and filter inputs, and blocks tile
@@ -126,11 +159,11 @@ impl FrameDecoder {
 		let [d0, d1, d2] = ws.planes;
 		let planes = [d0, d1, d2].into_iter().enumerate().map(|(i, data)| {
 			let src = &self.pic.planes[i];
-			let mut data = sized(data, src.data.len(), 0);
+			let mut data = sized(data, src.data.len(), P::default());
 			let (x0, x1) = self.tile_x_range(i, tile_col);
 			// A new picture starts zeroed (`Picture::new`).
 			for row in data.chunks_exact_mut(src.stride.max(1)) {
-				row[x0..x1].fill(0);
+				row[x0..x1].fill(P::default());
 			}
 			Plane {
 				data: data.into(),
@@ -141,8 +174,8 @@ impl FrameDecoder {
 				aligned_h: src.aligned_h,
 			}
 		});
-		let planes: Vec<Plane> = planes.collect();
-		let Ok(planes) = <[Plane; 3]>::try_from(planes) else {
+		let planes: Vec<Plane<P>> = planes.collect();
+		let Ok(planes) = <[Plane<P>; 3]>::try_from(planes) else {
 			unreachable!("three planes");
 		};
 		let [a0, a1, a2] = ws.above_nz;
@@ -188,10 +221,14 @@ impl FrameDecoder {
 				height: self.pic.height,
 				ss_x: self.pic.ss_x,
 				ss_y: self.pic.ss_y,
+				bit_depth: self.pic.bit_depth,
 				key_frame: self.pic.key_frame,
 				rgb: self.pic.rgb,
 			},
 			refs: self.refs.clone(),
+			ref_scale: self.ref_scale,
+			bit_depth: self.bit_depth,
+			max: self.max,
 			dequant: self.dequant,
 			lf_table: self.lf_table,
 			coefs,
@@ -200,7 +237,7 @@ impl FrameDecoder {
 	}
 
 	/// Gives the workspace's buffers back for the next frame.
-	fn into_arrays(self) -> TileArrays {
+	fn into_arrays(self) -> TileArrays<P> {
 		let [p0, p1, p2] = self.pic.planes;
 		TileArrays {
 			mi: self.mi,
@@ -216,7 +253,7 @@ impl FrameDecoder {
 	}
 
 	/// Copies out the superblock row at `mi_row` of tile column `tile_col`.
-	fn take_chunk(&self, tile_col: usize, mi_row: usize, pools: &ChunkPools) -> Chunk {
+	fn take_chunk(&self, tile_col: usize, mi_row: usize, pools: &ChunkPools<P>) -> Chunk<P> {
 		let (c0, c1) = self.tile_mi_cols(tile_col);
 		let r1 = (mi_row + 8).min(self.mi_rows);
 		let mut lf_cells = pools.lf_cells.take_empty((r1 - mi_row) * (c1 - c0));
@@ -239,7 +276,7 @@ impl FrameDecoder {
 
 	/// Copies tile column `tile_col`'s motion and segment map (not needed
 	/// until the frame is done) from its workspace.
-	fn gather_column(&mut self, ws: &FrameDecoder, tile_col: usize) {
+	fn gather_column(&mut self, ws: &FrameDecoder<P>, tile_col: usize) {
 		let (c0, c1) = self.tile_mi_cols(tile_col);
 		for row in 0..self.mi_rows {
 			let (a, b) = (row * self.mi_cols + c0, row * self.mi_cols + c1);
@@ -251,7 +288,7 @@ impl FrameDecoder {
 	}
 
 	/// Copies a chunk into the frame.
-	fn put_chunk(&mut self, c: &Chunk) {
+	fn put_chunk(&mut self, c: &Chunk<P>) {
 		let (c0, c1) = self.tile_mi_cols(c.tile_col);
 		let w = c1 - c0;
 		let r1 = (c.mi_row + 8).min(self.mi_rows);
@@ -279,7 +316,7 @@ impl FrameDecoder {
 		&mut self,
 		data: &[u8],
 		threads: usize,
-		pool: &mut TilePool,
+		pool: &mut TilePool<P>,
 	) -> Result<()> {
 		let tile_cols = 1usize << self.h.log2_tile_cols;
 		let tile_rows = 1usize << self.h.log2_tile_rows;
@@ -320,7 +357,7 @@ impl FrameDecoder {
 			thr: loopfilter::thresholds(self.h.sharpness),
 		};
 		let main_decodes = tile_cols > helpers;
-		let (tx, rx) = mpsc::channel::<Chunk>();
+		let (tx, rx) = mpsc::channel::<Chunk<P>>();
 		std::thread::scope(|scope| {
 			for _ in 0..helpers {
 				let tx = tx.clone();
@@ -392,7 +429,7 @@ struct Merger {
 }
 
 impl Merger {
-	fn accept(&mut self, fd: &mut FrameDecoder, chunk: &Chunk) {
+	fn accept<P: Px>(&mut self, fd: &mut FrameDecoder<P>, chunk: &Chunk<P>) {
 		fd.put_chunk(chunk);
 		self.delivered[chunk.mi_row / 8] += 1;
 		while self.next < self.delivered.len() && self.delivered[self.next] == self.tile_cols {
@@ -406,41 +443,41 @@ impl Merger {
 
 /// A tile column in progress: its workspace, its position and the bool
 /// decoder of its current tile.
-struct Column<'d> {
+struct Column<'d, P> {
 	tile_col: usize,
-	fd: FrameDecoder,
+	fd: FrameDecoder<P>,
 	reader: Option<BoolDecoder<'d>>,
 	tile_row: usize,
 	mi_row: usize,
 }
 
-struct SchedState<'d> {
+struct SchedState<'d, P> {
 	/// Columns waiting for a thread, longest-waiting first.
-	tasks: VecDeque<Column<'d>>,
+	tasks: VecDeque<Column<'d, P>>,
 	/// Columns not yet complete (queued or being decoded).
 	remaining: usize,
 	failed: Option<crate::Message>,
-	finished: Vec<(usize, FrameDecoder)>,
+	finished: Vec<(usize, FrameDecoder<P>)>,
 }
 
 /// Hands out tile columns one superblock row at a time. The least
 /// advanced column goes first, so columns advance together (the filter can
 /// follow) and any free thread picks up whichever column is behind.
-struct Sched<'s, 'd> {
-	state: Mutex<SchedState<'d>>,
+struct Sched<'s, 'd, P> {
+	state: Mutex<SchedState<'d, P>>,
 	wake: Condvar,
 	buffers: &'s [&'d [u8]],
-	chunks: ChunkPools,
+	chunks: ChunkPools<P>,
 	tile_rows: usize,
 	tile_cols: usize,
 }
 
-impl<'d> Sched<'_, 'd> {
+impl<'d, P: Px> Sched<'_, 'd, P> {
 	/// The next column to work on; `None` when all are done (or decoding
 	/// failed). With `wait`, blocks while every column is busy elsewhere.
 	/// Picks the least advanced waiting column, and among equals the one
 	/// this thread had last (`last`), which is still in its cache.
-	fn take(&self, wait: bool, last: usize) -> Option<Column<'d>> {
+	fn take(&self, wait: bool, last: usize) -> Option<Column<'d, P>> {
 		let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
 		loop {
 			if s.failed.is_some() || s.remaining == 0 {
@@ -463,7 +500,7 @@ impl<'d> Sched<'_, 'd> {
 	}
 
 	/// Returns a column after [`Sched::step`].
-	fn put_back(&self, col: Column<'d>, result: Result<bool>) {
+	fn put_back(&self, col: Column<'d, P>, result: Result<bool>) {
 		let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
 		match result {
 			Ok(true) => s.tasks.push_back(col),
@@ -482,7 +519,7 @@ impl<'d> Sched<'_, 'd> {
 
 	/// Decodes one superblock row of `col` and emits it; `Ok(false)` once
 	/// the column is complete.
-	fn step(&self, col: &mut Column<'d>, emit: &mut dyn FnMut(Chunk)) -> Result<bool> {
+	fn step(&self, col: &mut Column<'d, P>, emit: &mut dyn FnMut(Chunk<P>)) -> Result<bool> {
 		loop {
 			if col.tile_row >= self.tile_rows {
 				return Ok(false);

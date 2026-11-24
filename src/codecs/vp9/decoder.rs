@@ -12,6 +12,7 @@ use super::inter::{self, RefPlane};
 use super::intra::{self, Edges, MODE_TO_TX_TYPE};
 use super::loopfilter;
 use super::mode::{ModeInfo, MvRef};
+use super::pixel::Px;
 use super::probs::{self, Counts, FrameContext};
 use super::range::BoolDecoder;
 use super::residual::{self, DCT_DCT, TokenCounts};
@@ -20,13 +21,13 @@ use super::transform;
 use super::{Mv, PARTITION_CONTEXT, PARTITION_TREE, SS_SIZE, SUBSIZE, bs, uv_tx_size};
 use crate::core::{
 	self, BufferPool, CodecPrivate, CodecState, DecodeOut, Frame, FrameBuffer, Keyframe, Packet,
-	Parameters, PlaneRef, Pooled, State, VideoFrame, VideoState, video,
+	Parameters, PlaneRef, Pooled, State, VecPool, VideoFrame, VideoState, video,
 };
 use crate::message::{Message, Result};
 
 #[path = "tile_threads.rs"]
 mod tile_threads;
-use tile_threads::TilePool;
+pub(super) use tile_threads::TilePool;
 
 fn corrupt(what: &'static str) -> Message {
 	Message::Codec(what)
@@ -34,11 +35,12 @@ fn corrupt(what: &'static str) -> Message {
 
 /// One plane of a picture. The buffer covers whole superblocks, so blocks
 /// that cross the picture's edge can be written in full. The samples come
-/// from the decoder's [`BufferPool`] and go back to it when the last
-/// reference to the picture (slot or output frame) is dropped.
+/// from the decoder's pools and go back to them when the last reference to
+/// the picture (slot or output frame) is dropped. `P` is `u8` for 8-bit
+/// streams and `u16` for 10- and 12-bit ones.
 #[derive(Debug, Clone)]
-pub struct Plane {
-	pub data: Pooled<u8>,
+pub struct Plane<P = u8> {
+	pub data: Pooled<P>,
 	pub stride: usize,
 	/// Visible size.
 	pub width: usize,
@@ -50,26 +52,34 @@ pub struct Plane {
 
 /// A decoded picture.
 #[derive(Debug, Clone)]
-pub struct Picture {
-	pub planes: [Plane; 3],
+pub struct Picture<P = u8> {
+	pub planes: [Plane<P>; 3],
 	pub width: u32,
 	pub height: u32,
 	pub ss_x: usize,
 	pub ss_y: usize,
+	pub bit_depth: u8,
 	pub key_frame: bool,
 	/// sRGB colour space: the planes hold G, B and R.
 	pub rgb: bool,
 }
 
-impl Picture {
-	fn new(pool: &BufferPool, width: u32, height: u32, ss_x: usize, ss_y: usize) -> Self {
+impl<P: Px> Picture<P> {
+	fn new(
+		pool: &VecPool<P>,
+		width: u32,
+		height: u32,
+		ss_x: usize,
+		ss_y: usize,
+		bit_depth: u8,
+	) -> Self {
 		let (w, h) = (width as usize, height as usize);
 		let (aw, ah) = (w.next_multiple_of(8), h.next_multiple_of(8));
 		let (sw, sh) = (w.next_multiple_of(64), h.next_multiple_of(64));
 		let plane = |sx: usize, sy: usize| {
 			let stride = sw >> sx;
 			Plane {
-				data: pool.take_filled(stride * (sh >> sy), 0),
+				data: pool.take_filled(stride * (sh >> sy), P::default()),
 				stride,
 				width: (w + sx) >> sx,
 				height: (h + sy) >> sy,
@@ -83,29 +93,53 @@ impl Picture {
 			height,
 			ss_x,
 			ss_y,
+			bit_depth,
 			key_frame: false,
 			rgb: false,
 		}
 	}
 
+	/// The visible picture as bytes: planar YUV (two bytes per sample,
+	/// little-endian, above 8 bits), or for sRGB streams packed RGB24 at 8
+	/// bits and planar G, B, R (FFmpeg's `gbrp10le` / `gbrp12le`) above.
+	pub(crate) fn bytes(&self) -> Vec<u8> {
+		if self.rgb && !P::WIDE {
+			let [g, b, r] = &self.planes;
+			let mut out = Vec::with_capacity(g.width * g.height * 3);
+			for y in 0..g.height {
+				for x in 0..g.width {
+					let at = |p: &Plane<P>| p.data[y * p.stride + x].into() as u8;
+					out.extend_from_slice(&[at(r), at(g), at(b)]);
+				}
+			}
+			return out;
+		}
+		let size: usize = self.planes.iter().map(|p| p.width * p.height).sum();
+		let mut out = Vec::with_capacity(size * if P::WIDE { 2 } else { 1 });
+		for p in &self.planes {
+			for r in 0..p.height {
+				let row = &p.data[r * p.stride..r * p.stride + p.width];
+				if P::WIDE {
+					for &v in row {
+						out.extend_from_slice(&(v.into() as u16).to_le_bytes());
+					}
+				} else {
+					out.extend(row.iter().map(|&v| v.into() as u8));
+				}
+			}
+		}
+		out
+	}
+}
+
+impl Picture<u8> {
 	/// The visible picture as an output frame. YUV planes are views into
 	/// this picture (no copy); sRGB pictures (planes G, B, R) are packed
 	/// into RGB24, which needs one pass over the samples.
-	pub fn to_frame(
-		self: &Arc<Self>,
-		pixel: video::Pixel,
-		pts: Option<crate::core::Time>,
-	) -> VideoFrame {
+	fn frame(self: &Arc<Self>, pixel: video::Pixel, pts: Option<crate::core::Time>) -> VideoFrame {
 		let keyframe = if self.key_frame { Keyframe::Key } else { Keyframe::NonKey };
 		if self.rgb {
-			return VideoFrame::from_packed(
-				self.to_bytes(),
-				self.width,
-				self.height,
-				pixel,
-				keyframe,
-				pts,
-			);
+			return VideoFrame::from_packed(self.bytes(), self.width, self.height, pixel, keyframe, pts);
 		}
 		fn plane0(p: &Picture) -> &[u8] {
 			&p.planes[0].data
@@ -122,28 +156,90 @@ impl Picture {
 		});
 		VideoFrame::from_planes(planes, self.width, self.height, pixel, keyframe, pts)
 	}
+}
 
-	/// The visible picture as planar 8-bit YUV, or packed RGB24 for sRGB
-	/// streams (whose planes are G, B, R).
+/// A decoded picture of either sample type: what reference slots hold and
+/// what [`Vp9DecoderState::decode_packet`] returns. Cloning is cheap (the
+/// samples are shared).
+#[derive(Debug, Clone)]
+pub enum DecodedPicture {
+	/// Profiles 0 and 1.
+	Narrow(Arc<Picture<u8>>),
+	/// Profiles 2 and 3 (10 or 12 bits in `u16` samples).
+	Wide(Arc<Picture<u16>>),
+}
+
+macro_rules! either {
+	($self:expr, $p:ident => $e:expr) => {
+		match $self {
+			DecodedPicture::Narrow($p) => $e,
+			DecodedPicture::Wide($p) => $e,
+		}
+	};
+}
+
+impl DecodedPicture {
+	pub fn width(&self) -> u32 {
+		either!(self, p => p.width)
+	}
+
+	pub fn height(&self) -> u32 {
+		either!(self, p => p.height)
+	}
+
+	pub fn bit_depth(&self) -> u8 {
+		either!(self, p => p.bit_depth)
+	}
+
+	/// Chroma subsampling `(ss_x, ss_y)`.
+	pub fn subsampling(&self) -> (usize, usize) {
+		either!(self, p => (p.ss_x, p.ss_y))
+	}
+
+	pub fn key_frame(&self) -> bool {
+		either!(self, p => p.key_frame)
+	}
+
+	/// sRGB colour space (planes G, B, R).
+	pub fn rgb(&self) -> bool {
+		either!(self, p => p.rgb)
+	}
+
+	/// The RMP pixel layout of [`Self::to_frame`], if there is one (there
+	/// is no 4:4:0 layout, nor a high-bit-depth RGB one).
+	pub fn pixel(&self) -> Option<video::Pixel> {
+		let depth = self.bit_depth();
+		if self.rgb() {
+			return (depth == 8).then_some(video::Pixel { depth: 8, format: video::PixelFormat::RGB24 });
+		}
+		let format = match self.subsampling() {
+			(1, 1) => video::PixelFormat::YUV420,
+			(1, 0) => video::PixelFormat::YUV422,
+			(0, 0) => video::PixelFormat::YUV444,
+			_ => return None,
+		};
+		Some(video::Pixel { depth, format })
+	}
+
+	/// The visible picture as bytes: planar YUV (two bytes per sample,
+	/// little-endian, above 8 bits; FFmpeg's `yuv420p10le` and so on), or
+	/// for sRGB streams packed RGB24 at 8 bits and planar G, B, R
+	/// (`gbrp10le` / `gbrp12le`) above.
 	pub fn to_bytes(&self) -> Vec<u8> {
-		if self.rgb {
-			let [g, b, r] = &self.planes;
-			let mut out = Vec::with_capacity(g.width * g.height * 3);
-			for y in 0..g.height {
-				for x in 0..g.width {
-					let at = |p: &Plane| p.data[y * p.stride + x];
-					out.extend_from_slice(&[at(r), at(g), at(b)]);
-				}
-			}
-			return out;
-		}
-		let mut out = Vec::new();
-		for p in &self.planes {
-			for r in 0..p.height {
-				out.extend_from_slice(&p.data[r * p.stride..r * p.stride + p.width]);
+		either!(self, p => p.bytes())
+	}
+
+	/// The visible picture as an output frame. 8-bit YUV planes are views
+	/// into the picture (no copy); 10/12-bit samples are written out as
+	/// little-endian bytes, RMP's layout for deep samples.
+	pub fn to_frame(&self, pixel: video::Pixel, pts: Option<crate::core::Time>) -> VideoFrame {
+		match self {
+			DecodedPicture::Narrow(p) => p.frame(pixel, pts),
+			DecodedPicture::Wide(p) => {
+				let keyframe = if p.key_frame { Keyframe::Key } else { Keyframe::NonKey };
+				VideoFrame::from_packed(p.bytes(), p.width, p.height, pixel, keyframe, pts)
 			}
 		}
-		out
 	}
 }
 
@@ -178,8 +274,64 @@ fn tile_offset(i: usize, mis: usize, log2: u32) -> usize {
 	(((i * sb) >> log2) << 3).min(mis)
 }
 
+/// libvpx's `struct scale_factors`: how a reference of another size maps
+/// onto the frame being decoded (`vp9_setup_scale_factors_for_frame`).
+/// Positions scale by `ref_size / frame_size` in 14-bit fixed point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefScale {
+	x_fp: i64,
+	y_fp: i64,
+	/// Source step per output pixel, in 1/16 (16 when not scaled).
+	pub step_x: i32,
+	pub step_y: i32,
+	/// Within 2x smaller and 16x larger than the reference.
+	pub valid: bool,
+}
+
+const REF_SCALE_SHIFT: u32 = 14;
+const REF_NO_SCALE: i64 = 1 << REF_SCALE_SHIFT;
+
+impl Default for RefScale {
+	fn default() -> Self {
+		Self { x_fp: REF_NO_SCALE, y_fp: REF_NO_SCALE, step_x: 16, step_y: 16, valid: true }
+	}
+}
+
+impl RefScale {
+	/// Scale factors of a `ref_w` x `ref_h` reference for a `w` x `h` frame.
+	pub fn new(ref_w: u32, ref_h: u32, w: u32, h: u32) -> Self {
+		let valid = 2 * w >= ref_w && 2 * h >= ref_h && w <= 16 * ref_w && h <= 16 * ref_h;
+		if !valid || w == 0 || h == 0 {
+			return Self { valid: false, ..Self::default() };
+		}
+		let x_fp = (i64::from(ref_w) << REF_SCALE_SHIFT) / i64::from(w);
+		let y_fp = (i64::from(ref_h) << REF_SCALE_SHIFT) / i64::from(h);
+		let mut s = Self { x_fp, y_fp, step_x: 16, step_y: 16, valid };
+		s.step_x = s.x(16) as i32;
+		s.step_y = s.y(16) as i32;
+		s
+	}
+
+	/// `vp9_is_scaled`.
+	pub fn scaled(&self) -> bool {
+		self.valid && (self.x_fp != REF_NO_SCALE || self.y_fp != REF_NO_SCALE)
+	}
+
+	/// `scaled_x`: a horizontal position or offset in reference units.
+	#[inline]
+	pub fn x(&self, v: i64) -> i64 {
+		(v * self.x_fp) >> REF_SCALE_SHIFT
+	}
+
+	/// `scaled_y`.
+	#[inline]
+	pub fn y(&self, v: i64) -> i64 {
+		(v * self.y_fp) >> REF_SCALE_SHIFT
+	}
+}
+
 /// State of the frame being decoded.
-pub struct FrameDecoder {
+pub struct FrameDecoder<P = u8> {
 	pub h: FrameHeader,
 	pub ch: CompressedHeader,
 	pub fc: FrameContext,
@@ -200,17 +352,22 @@ pub struct FrameDecoder {
 	left_nz: [[u8; 16]; 3],
 	above_partition: Vec<u8>,
 	left_partition: [u8; 8],
-	pic: Picture,
-	refs: [Option<Arc<Picture>>; 3],
+	pic: Picture<P>,
+	refs: [Option<Arc<Picture<P>>>; 3],
+	/// Scale factors of the three references.
+	ref_scale: [RefScale; 3],
+	bit_depth: u8,
+	/// Largest sample value, `(1 << bit_depth) - 1`.
+	max: i32,
 	/// `[segment][luma, chroma][dc, ac]`.
 	dequant: [[[i16; 2]; 2]; 8],
 	/// Loop filter level `[segment][ref frame][mode delta]`.
 	lf_table: [[[u8; 2]; 4]; 8],
 	coefs: Vec<i32>,
-	scratch: inter::Scratch,
+	scratch: inter::Scratch<P>,
 }
 
-impl FrameDecoder {
+impl<P: Px> FrameDecoder<P> {
 	fn plane_ss(&self, plane: usize) -> (usize, usize) {
 		if plane == 0 { (0, 0) } else { (self.pic.ss_x, self.pic.ss_y) }
 	}
@@ -499,7 +656,7 @@ impl FrameDecoder {
 						frame_height: pl.aligned_h,
 					};
 					let stride = pl.stride;
-					intra::predict(&mut pl.data, stride, x, y, tx_size, mode, &edges);
+					intra::predict(&mut pl.data, stride, x, y, tx_size, mode, &edges, self.bit_depth);
 					if plane == 0 && !lossless {
 						tx_type = MODE_TO_TX_TYPE[usize::from(mode)];
 					}
@@ -519,6 +676,7 @@ impl FrameDecoder {
 							tx_type,
 							lossless,
 							eob,
+							self.max,
 						);
 						// A DC-only block wrote just its first coefficient.
 						if eob == 1 {
@@ -567,7 +725,9 @@ impl FrameDecoder {
 			coef: &mut self.counts.coef[usize::from(tx_size)][plane_type][reference],
 			eob_branch: &mut self.counts.eob_branch[usize::from(tx_size)][plane_type][reference],
 		});
-		let eob = residual::decode_coefs(r, probs, counts, &mut self.coefs, tx_size, dq, ctx, &sc);
+		let cat6 = residual::cat6(self.bit_depth);
+		let eob =
+			residual::decode_coefs(r, probs, counts, &mut self.coefs, tx_size, dq, ctx, &sc, cat6);
 		let nz = u8::from(eob > 0);
 		for k in 0..n {
 			let v = if tx_size > 0 && clip_w != 0 && col + k >= clip_w { 0 } else { nz };
@@ -587,12 +747,14 @@ impl FrameDecoder {
 	fn predict_inter(&mut self, p: &BlockPos, mi: &ModeInfo) -> Result<()> {
 		let refs = 1 + usize::from(mi.has_second_ref());
 		for k in 0..refs {
-			let reference = self.refs[(mi.ref_frame[k] - 1) as usize]
-				.clone()
-				.ok_or(corrupt("vp9: block uses a missing reference"))?;
-			if reference.width != self.pic.width || reference.height != self.pic.height {
-				return Err(Message::Codec("vp9: scaled reference frames are not supported"));
+			let idx = (mi.ref_frame[k] - 1) as usize;
+			let reference =
+				self.refs[idx].clone().ok_or(corrupt("vp9: block uses a missing reference"))?;
+			let scale = self.ref_scale[idx];
+			if !scale.valid {
+				return Err(corrupt("vp9: reference frame has invalid dimensions"));
 			}
+			let scaled = scale.scaled();
 			for plane in 0..3 {
 				let (sx, sy) = self.plane_ss(plane);
 				let src = &reference.planes[plane];
@@ -604,47 +766,43 @@ impl FrameDecoder {
 				let y0 = (p.row * 8) >> sy;
 				let n4w = (p.bw * 2) >> sx;
 				let n4h = (p.bh * 2) >> sy;
-				let scale =
-					|mv: Mv| (i32::from(mv.row) * (2 - sy as i32), i32::from(mv.col) * (2 - sx as i32));
+				let filter = mi.interp_filter;
+				let avg = k == 1;
+				let max = self.max;
+				let one = |sc: &mut inter::Scratch<P>, dst: &mut [P], x: usize, y: usize, w, h, mv| {
+					if scaled {
+						let pos = scaled_position(p, &scale, mv, sx, sy, n4w * 4, n4h * 4, x, y);
+						inter::predict_scaled(
+							sc,
+							&src,
+							dst,
+							stride,
+							x0 + x,
+							y0 + y,
+							w,
+							h,
+							pos,
+							filter,
+							avg,
+							max,
+						);
+					} else {
+						let (mr, mc) =
+							(i32::from(mv.row) * (2 - sy as i32), i32::from(mv.col) * (2 - sx as i32));
+						inter::predict(sc, &src, dst, stride, x0 + x, y0 + y, w, h, mr, mc, filter, avg, max);
+					}
+				};
 				if mi.sb_type < bs::B8X8 {
 					let mut i = 0;
 					for y in 0..n4h {
 						for x in 0..n4w {
 							let mv = average_split_mv(mi, k, i, sx, sy);
 							i += 1;
-							let (mr, mc) = scale(mv);
-							inter::predict(
-								&mut self.scratch,
-								&src,
-								&mut dst.data,
-								stride,
-								x0 + 4 * x,
-								y0 + 4 * y,
-								4,
-								4,
-								mr,
-								mc,
-								mi.interp_filter,
-								k == 1,
-							);
+							one(&mut self.scratch, &mut dst.data, 4 * x, 4 * y, 4, 4, mv);
 						}
 					}
 				} else {
-					let (mr, mc) = scale(mi.mv[k]);
-					inter::predict(
-						&mut self.scratch,
-						&src,
-						&mut dst.data,
-						stride,
-						x0,
-						y0,
-						n4w * 4,
-						n4h * 4,
-						mr,
-						mc,
-						mi.interp_filter,
-						k == 1,
-					);
+					one(&mut self.scratch, &mut dst.data, 0, 0, n4w * 4, n4h * 4, mi.mv[k]);
 				}
 			}
 		}
@@ -677,10 +835,59 @@ impl FrameDecoder {
 					sx,
 					sy,
 					thr,
+					u32::from(self.bit_depth - 8),
 				);
 			}
 			mi_col += 8;
 		}
+	}
+}
+
+/// Where the prediction of the `w` x `h` part at offset (`x`, `y`) of a
+/// block's plane starts in a scaled reference (libvpx
+/// `dec_build_inter_predictors`, `is_scaled` path). `bw` x `bh` is the
+/// block's size in the plane.
+///
+/// The motion vector is first clamped so it points at most 4 pixels plus
+/// the block size past the picture (`clamp_mv_to_umv_border_sb`). The
+/// block's position is scaled as an integer, the vector in 1/16, and the
+/// phase of the scaled position added to the vector; for chroma that phase
+/// comes from the *luma* block position plus the chroma offset
+/// (`vp9_scale_mv(&mv_q4, mi_x + x, mi_y + y, sf)`), a libvpx quirk every
+/// decoder reproduces.
+#[allow(clippy::too_many_arguments)]
+fn scaled_position(
+	p: &BlockPos,
+	scale: &RefScale,
+	mv: Mv,
+	sx: usize,
+	sy: usize,
+	bw: usize,
+	bh: usize,
+	x: usize,
+	y: usize,
+) -> inter::ScaledPos {
+	// C's clamp(v, lo, hi): lo wins if the bounds cross.
+	let clamp = |v: i32, lo: i32, hi: i32| if v < lo { lo } else { v.min(hi) };
+	let spel_left = (4 + bw as i32) << 4;
+	let spel_top = (4 + bh as i32) << 4;
+	let (mx, my) = (1i32 << (1 - sx), 1i32 << (1 - sy));
+	let col =
+		clamp(i32::from(mv.col) * mx, p.to_left * mx - spel_left, p.to_right * mx + spel_left - 16);
+	let row =
+		clamp(i32::from(mv.row) * my, p.to_top * my - spel_top, p.to_bottom * my + spel_top - 16);
+	let x_start = ((-p.to_left) >> (3 + sx)) as i64 + x as i64;
+	let y_start = ((-p.to_top) >> (3 + sy)) as i64 + y as i64;
+	let (mi_x, mi_y) = ((p.col * 8 + x) as i64, (p.row * 8 + y) as i64);
+	let mv_col = scale.x(i64::from(col)) + (scale.x(mi_x << 4) & 15);
+	let mv_row = scale.y(i64::from(row)) + (scale.y(mi_y << 4) & 15);
+	inter::ScaledPos {
+		x: scale.x(x_start) + (mv_col >> 4),
+		y: scale.y(y_start) + (mv_row >> 4),
+		phase_x: (mv_col & 15) as i32,
+		phase_y: (mv_row & 15) as i32,
+		step_x: scale.step_x,
+		step_y: scale.step_y,
 	}
 }
 
@@ -708,7 +915,7 @@ fn average_split_mv(mi: &ModeInfo, k: usize, block: usize, sx: usize, sy: usize)
 #[derive(Debug, Clone, Default)]
 pub struct Vp9DecoderState {
 	persistent: Box<Persistent>,
-	slots: [Option<Arc<Picture>>; 8],
+	slots: [Option<DecodedPicture>; 8],
 	color: ColorConfig,
 	/// Size, type and visibility of the previous decoded frame.
 	last_size: (u32, u32),
@@ -724,9 +931,11 @@ pub struct Vp9DecoderState {
 	/// the calling thread.
 	threads: usize,
 	/// Per-tile-column buffers reused from frame to frame.
-	tile_pool: TilePool,
+	pub(super) tile_pool: TilePool<u8>,
+	pub(super) tile_pool_wide: TilePool<u16>,
 	/// Picture planes, recycled once no slot or output frame uses them.
-	planes: BufferPool,
+	pub(super) planes: BufferPool,
+	pub(super) planes_wide: VecPool<u16>,
 	/// Per-frame arrays reused from frame to frame.
 	scratch: FrameScratch,
 	/// Also pipeline decode and loop filter for single-tile-column frames.
@@ -760,7 +969,7 @@ fn refill<T: Clone>(mut v: Vec<T>, len: usize, value: T) -> Vec<T> {
 
 impl RefInfo for Vp9DecoderState {
 	fn ref_size(&self, slot: usize) -> Option<(u32, u32)> {
-		self.slots.get(slot)?.as_ref().map(|p| (p.width, p.height))
+		self.slots.get(slot)?.as_ref().map(|p| (p.width(), p.height()))
 	}
 }
 
@@ -780,10 +989,15 @@ impl Vp9DecoderState {
 		self.threads.max(1)
 	}
 
-	/// Allocation counters of the picture-plane pool (see
-	/// [`crate::codecs::h264::H264DecoderState::pool_stats`]).
+	/// Allocation counters of the picture-plane pools, 8-bit and 10/12-bit
+	/// together (see [`crate::codecs::h264::H264DecoderState::pool_stats`]).
 	pub fn pool_stats(&self) -> crate::core::PoolStats {
-		self.planes.stats()
+		let (a, b) = (self.planes.stats(), self.planes_wide.stats());
+		crate::core::PoolStats {
+			allocated: a.allocated + b.allocated,
+			reused: a.reused + b.reused,
+			idle: a.idle + b.idle,
+		}
 	}
 
 	/// Runs the loop filter on its own thread, one superblock row behind
@@ -801,7 +1015,7 @@ impl Vp9DecoderState {
 
 	/// Decodes one packet (a frame or a superframe); returns the pictures
 	/// to show, in order.
-	pub fn decode_packet(&mut self, data: &[u8]) -> Result<Vec<Arc<Picture>>> {
+	pub fn decode_packet(&mut self, data: &[u8]) -> Result<Vec<DecodedPicture>> {
 		let mut shown = Vec::new();
 		for frame in header::split_superframe(data) {
 			if let Some(pic) = self.decode_frame(frame)? {
@@ -811,7 +1025,7 @@ impl Vp9DecoderState {
 		Ok(shown)
 	}
 
-	fn decode_frame(&mut self, data: &[u8]) -> Result<Option<Arc<Picture>>> {
+	fn decode_frame(&mut self, data: &[u8]) -> Result<Option<DecodedPicture>> {
 		let mut persistent = std::mem::take(&mut self.persistent);
 		let parsed = header::parse_uncompressed(data, &mut persistent, self, self.color);
 		let h = match parsed {
@@ -832,6 +1046,19 @@ impl Vp9DecoderState {
 		if h.intra_only_frame() {
 			self.color = h.color;
 		}
+		if h.color.bit_depth == 8 {
+			self.decode_samples::<u8>(data, h)
+		} else {
+			self.decode_samples::<u16>(data, h)
+		}
+	}
+
+	/// The rest of [`Self::decode_frame`], once the sample type is known.
+	fn decode_samples<P: Px>(
+		&mut self,
+		data: &[u8],
+		h: FrameHeader,
+	) -> Result<Option<DecodedPicture>> {
 		let (ss_x, ss_y) = (usize::from(h.color.ss_x), usize::from(h.color.ss_y));
 		let mi_cols = h.width.div_ceil(8) as usize;
 		let mi_rows = h.height.div_ceil(8) as usize;
@@ -850,22 +1077,23 @@ impl Vp9DecoderState {
 			&& self.last_show_frame
 			&& !self.last_key_frame;
 
-		let mut refs: [Option<Arc<Picture>>; 3] = [None, None, None];
+		let mut refs: [Option<Arc<Picture<P>>>; 3] = [None, None, None];
+		let mut ref_scale = [RefScale::default(); 3];
 		if !h.intra_only_frame() {
 			for (i, slot) in h.ref_slot.iter().enumerate() {
-				let r = self.slots[*slot].clone().ok_or(corrupt("vp9: missing reference frame"))?;
+				let r = self.slots[*slot].as_ref().ok_or(corrupt("vp9: missing reference frame"))?;
+				let r = P::unwrap(r)
+					.filter(|r| r.bit_depth == h.color.bit_depth)
+					.ok_or(corrupt("vp9: reference frame has another bit depth"))?;
 				if (r.ss_x, r.ss_y) != (ss_x, ss_y) {
 					return Err(corrupt("vp9: reference frame has another chroma format"));
 				}
-				refs[i] = Some(r);
+				ref_scale[i] = RefScale::new(r.width, r.height, h.width, h.height);
+				refs[i] = Some(r.clone());
 			}
-			let valid = refs.iter().flatten().any(|r| {
-				2 * h.width >= r.width
-					&& 2 * h.height >= r.height
-					&& h.width <= 16 * r.width
-					&& h.height <= 16 * r.height
-			});
-			if !valid {
+			// At least one reference must be usable; blocks that use an
+			// unusable one fail (libvpx `setup_frame_size_with_refs`).
+			if !ref_scale.iter().any(|s| s.valid) {
 				return Err(corrupt("vp9: referenced frames have invalid sizes"));
 			}
 		}
@@ -901,8 +1129,11 @@ impl Vp9DecoderState {
 			left_nz: [[0; 16]; 3],
 			above_partition: vec![0; mi_cols.next_multiple_of(8) + 8],
 			left_partition: [0; 8],
-			pic: Picture::new(&self.planes, h.width, h.height, ss_x, ss_y),
+			pic: Picture::new(P::pools(self).0, h.width, h.height, ss_x, ss_y, h.color.bit_depth),
 			refs,
+			ref_scale,
+			bit_depth: h.color.bit_depth,
+			max: (1 << h.color.bit_depth) - 1,
 			dequant: [[[0; 2]; 2]; 8],
 			lf_table: [[[0; 2]; 4]; 8],
 			coefs: vec![0; 32 * 32],
@@ -914,7 +1145,7 @@ impl Vp9DecoderState {
 		let threads = self.threads.max(1);
 		if threads > 1 && (fd.h.log2_tile_cols > 0 || (self.row_pipeline && fd.h.filter_level != 0)) {
 			// Tile columns on worker threads, loop filter here, row by row.
-			fd.decode_tiles_threaded(&data[end..], threads, &mut self.tile_pool)?;
+			fd.decode_tiles_threaded(&data[end..], threads, P::pools(self).1)?;
 		} else {
 			fd.mi = refill(std::mem::take(&mut self.scratch.mi), cells, ModeInfo::default());
 			fd.decode_tiles(&data[end..])?;
@@ -944,7 +1175,7 @@ impl Vp9DecoderState {
 		self.scratch.lf_cells = lf_cells;
 		pic.key_frame = h.key_frame;
 		pic.rgb = h.color.color_space == 7;
-		let pic = Arc::new(pic);
+		let pic = P::wrap(Arc::new(pic));
 		for (i, slot) in self.slots.iter_mut().enumerate() {
 			if h.refresh >> i & 1 == 1 {
 				*slot = Some(pic.clone());
@@ -972,7 +1203,7 @@ impl Vp9DecoderState {
 	}
 }
 
-impl FrameDecoder {
+impl<P: Px> FrameDecoder<P> {
 	/// Per-segment quantizers and loop filter levels
 	/// (`setup_segmentation_dequant`, `vp9_loop_filter_frame_init`).
 	fn setup_segment_tables(&mut self, persistent: &Persistent) {
@@ -988,7 +1219,8 @@ impl FrameDecoder {
 				let d = i32::from(seg.data(s, SEG_ALT_Q));
 				qindex = (if seg.abs_delta { d } else { qindex + d }).clamp(0, 255);
 			}
-			let (dc, ac) = (&DC_QLOOKUP[0], &AC_QLOOKUP[0]);
+			let depth = usize::from((h.color.bit_depth - 8) / 2).min(2);
+			let (dc, ac) = (&DC_QLOOKUP[depth], &AC_QLOOKUP[depth]);
 			self.dequant[usize::from(s)] = [
 				[q(qindex, h.y_dc_delta, dc), q(qindex, 0, ac)],
 				[q(qindex, h.uv_dc_delta, dc), q(qindex, h.uv_ac_delta, ac)],
@@ -1023,19 +1255,6 @@ impl Vp9Decoder {
 	pub fn new() -> Self {
 		Self
 	}
-}
-
-fn pixel_of(pic: &Picture) -> Option<video::Pixel> {
-	if pic.rgb {
-		return Some(video::Pixel { depth: 8, format: video::PixelFormat::RGB24 });
-	}
-	let format = match (pic.ss_x, pic.ss_y) {
-		(1, 1) => video::PixelFormat::YUV420,
-		(1, 0) => video::PixelFormat::YUV422,
-		(0, 0) => video::PixelFormat::YUV444,
-		_ => return None,
-	};
-	Some(video::Pixel { depth: 8, format })
 }
 
 impl core::Decoder for Vp9Decoder {
@@ -1073,11 +1292,15 @@ impl core::Decoder for Vp9Decoder {
 		let pictures = dec.decode_packet(&packet.data)?;
 		let mut frames = Vec::with_capacity(pictures.len());
 		for pic in pictures {
-			let pixel = pixel_of(&pic).ok_or(Message::Codec("vp9: 4:4:0 output is not supported"))?;
-			video.width = pic.width;
-			video.height = pic.height;
+			let pixel = pic.pixel().ok_or(Message::Codec(if pic.rgb() {
+				"vp9: 10/12-bit sRGB output is not supported"
+			} else {
+				"vp9: 4:4:0 output is not supported"
+			}))?;
+			video.width = pic.width();
+			video.height = pic.height();
 			video.pixel = pixel.clone();
-			video.has_keyframe |= pic.key_frame;
+			video.has_keyframe |= pic.key_frame();
 			frames.push(Frame::Video(pic.to_frame(pixel, packet.pts)));
 		}
 		Ok(DecodeOut { value: frames })

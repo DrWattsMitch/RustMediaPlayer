@@ -370,11 +370,12 @@ Codecs:
   types 0–2, channel coupling, up to 255 channels in FFmpeg's channel
   order), within one 16-bit step of FFmpeg's decoder. Ogg Vorbis packets
   get exact timestamps and durations from the granule positions.
-- **VP9**: decoder for profiles 0 and 1 (8-bit 4:2:0, 4:2:2, 4:4:4 and
-  sRGB): every frame type including hidden alt-refs, superframes and
-  `show_existing_frame`, tiles, segmentation, compound prediction,
-  lossless frames and backward probability adaptation. Bit-exact with
-  libvpx / FFmpeg.
+- **VP9**: decoder for every profile (8-bit profiles 0 and 1, 10/12-bit
+  profiles 2 and 3; 4:2:0, 4:2:2, 4:4:4 and sRGB): every frame type
+  including hidden alt-refs, superframes and `show_existing_frame`,
+  resolution changes without key frames (scaled references), tiles,
+  segmentation, compound prediction, lossless frames and backward
+  probability adaptation. Bit-exact with libvpx / FFmpeg.
 - **VP8**: decoder for every VP8 stream (WebM's original codec): golden
   and alt-ref references with sign bias, hidden alt-ref frames, B_PRED and
   split motion vectors, token partitions, segmentation, the normal and
@@ -401,6 +402,7 @@ See [docs/WAV_Y4M.md](docs/WAV_Y4M.md), [docs/MP3_MP4.md](docs/MP3_MP4.md),
 [docs/TS_HLS_OUTPUT.md](docs/TS_HLS_OUTPUT.md),
 [docs/OPUS_PLC.md](docs/OPUS_PLC.md),
 [docs/VORBIS_VP9.md](docs/VORBIS_VP9.md),
+[docs/VP9_HIGH_BITDEPTH_SCALING.md](docs/VP9_HIGH_BITDEPTH_SCALING.md),
 [docs/SUBTITLES_VP8_ALAC.md](docs/SUBTITLES_VP8_ALAC.md) and
 [docs/THREADING.md](docs/THREADING.md) (H.264 and HEVC frame threads, HEVC
 WPP rows, VP9 tile threads, the transcode pipeline and how they compare with FFmpeg) and

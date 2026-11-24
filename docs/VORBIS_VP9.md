@@ -16,7 +16,7 @@ bit-exact with libvpx and FFmpeg. Read it before changing
 | --- | --- | --- |
 | **Vorbis decoder** | Every Vorbis I stream: codebooks (all lookup types), floor 0 and floor 1, residue types 0/1/2, square-polar coupling, submaps, short/long blocks with window switching. Planar `F32` in FFmpeg's channel order, within one 16-bit step of FFmpeg's float decoder. | `codecs::vorbis::{VorbisDecoder, VorbisDecoderState}` |
 | **Ogg Vorbis timestamps** | Per-packet durations from the block sizes, pts walked back from the granule positions, end trimming from the last granule, correct timing after a seek. Matches `ffprobe -show_packets` packet for packet. | `container::ogg::demuxer` + `codecs::vorbis::VorbisParser` |
-| **VP9 decoder** | Profiles 0 and 1 (8-bit 4:2:0, 4:2:2, 4:4:4, sRGB): key, inter, intra-only and hidden frames, superframes, `show_existing_frame`, tiles, segmentation (incl. temporal prediction), loop-filter deltas, compound prediction, switchable filters, lossless (WHT), error-resilient and frame-parallel modes, backward adaptation. Bit-exact with libvpx/FFmpeg. | `codecs::vp9::{Vp9Decoder, Vp9DecoderState}` |
+| **VP9 decoder** | Profiles 0 and 1 (8-bit 4:2:0, 4:2:2, 4:4:4, sRGB; profiles 2 and 3 and resolution changes came later, see `VP9_HIGH_BITDEPTH_SCALING.md`): key, inter, intra-only and hidden frames, superframes, `show_existing_frame`, tiles, segmentation (incl. temporal prediction), loop-filter deltas, compound prediction, switchable filters, lossless (WHT), error-resilient and frame-parallel modes, backward adaptation. Bit-exact with libvpx/FFmpeg. | `codecs::vp9::{Vp9Decoder, Vp9DecoderState}` |
 | **Transcoding** | `rmp -i in.webm out.y4m` decodes VP9; `.mp4`/`.mov` output re-encodes VP9 to H.264 by default (MP4 can't hold VP9 here); Vorbis decodes to any audio output. | `transcode.rs` default codec table |
 
 Both decoders are registered in `core::Resolver`, so `decoder_for`,
@@ -149,8 +149,8 @@ Vorbis decodes at ~400x real time.
 
 | Not supported | Where to start |
 | --- | --- |
-| VP9 profiles 2 and 3 (10/12-bit). Headers parse; decoding stops with an error. | Make `Plane` hold `u16`, use the `[1]`/`[2]` rows of `DC_QLOOKUP`/`AC_QLOOKUP`, the 18-bit cat6 token, and `clip_pixel_highbd`. |
-| Inter prediction from a reference of another size (resolution switching inside a stream). Fails with "scaled reference frames are not supported". | libvpx `dec_build_inter_predictors` (`is_scaled` path) and `vpx_scaled_2d`; FFmpeg's `mc_luma_scaled` documents the libvpx rounding it must match. |
+| ~~VP9 profiles 2 and 3 (10/12-bit)~~ | Done: `VP9_HIGH_BITDEPTH_SCALING.md`. |
+| ~~Inter prediction from a reference of another size~~ | Done: `VP9_HIGH_BITDEPTH_SCALING.md`. |
 | 4:4:0 output (decodes, but RMP has no 4:4:0 pixel format). | `PixelFormat` + the scaler. |
 | Frame or tile threading. | Tiles of a row are independent apart from the counts; the loop filter can trail decoding by a superblock row as libvpx does. |
 | Error concealment: a corrupt frame is an error and does not refresh any reference. | libvpx keeps decoding with `corrupted` flags. |

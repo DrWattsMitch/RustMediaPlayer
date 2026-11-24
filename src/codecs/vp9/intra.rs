@@ -5,9 +5,13 @@
 //! edges are 127 (above) or 129 (left); past the frame's 8-aligned size the
 //! last pixel repeats; "above-right" pixels are real only for 4x4
 //! transforms inside the block, and repeat the last above pixel otherwise.
+//! At high bit depths the missing-edge values scale with the depth
+//! (`base - 1` / `base + 1`, `base = 128 << (bit_depth - 8)`; libvpx
+//! `build_intra_predictors_high`); the predictors are the same.
 
 #![allow(clippy::needless_range_loop)] // index arithmetic mirrors the specification
 
+use super::pixel::Px;
 use super::pm;
 
 /// Where a transform block sits and which edges exist.
@@ -44,29 +48,34 @@ const EXTEND_MODES: [u8; 10] = [
 pub const MODE_TO_TX_TYPE: [u8; 10] = [0, 1, 2, 0, 3, 1, 2, 2, 1, 3];
 
 #[inline]
-fn avg2(a: u8, b: u8) -> u8 {
-	((u16::from(a) + u16::from(b) + 1) >> 1) as u8
+fn avg2<P: Px>(a: P, b: P) -> P {
+	P::of((a.into() + b.into() + 1) >> 1)
 }
 
 #[inline]
-fn avg3(a: u8, b: u8, c: u8) -> u8 {
-	((u16::from(a) + 2 * u16::from(b) + u16::from(c) + 2) >> 2) as u8
+fn avg3<P: Px>(a: P, b: P, c: P) -> P {
+	P::of((a.into() + 2 * b.into() + c.into() + 2) >> 2)
 }
 
-/// Predicts the `4 << tx_size` square at (`x`, `y`) of a plane.
-pub fn predict(
-	plane: &mut [u8],
+/// Predicts the `4 << tx_size` square at (`x`, `y`) of a plane whose
+/// samples have `bit_depth` bits.
+#[allow(clippy::too_many_arguments)]
+pub fn predict<P: Px>(
+	plane: &mut [P],
 	stride: usize,
 	x: usize,
 	y: usize,
 	tx_size: u8,
 	mode: u8,
 	e: &Edges,
+	bit_depth: u8,
 ) {
 	let bs = 4usize << tx_size;
-	let mut left = [0u8; 32];
+	let base = 128i32 << (bit_depth - 8);
+	let max = (1i32 << bit_depth) - 1;
+	let mut left = [P::default(); 32];
 	// above[0] is the top-left pixel; the row starts at above[1].
-	let mut above_buf = [0u8; 65];
+	let mut above_buf = [P::default(); 65];
 	let need = EXTEND_MODES[usize::from(mode)];
 
 	if need & NEED_LEFT != 0 {
@@ -77,7 +86,7 @@ pub fn predict(
 				*l = plane[(y + r) * stride + x - 1];
 			}
 		} else {
-			left[..bs].fill(129);
+			left[..bs].fill(P::of(base + 1));
 		}
 	}
 	let above_at = |i: usize| plane[(y - 1) * stride + x + i];
@@ -94,27 +103,28 @@ pub fn predict(
 			}
 			let last = above[n - 1];
 			above[n..width].fill(last);
-			above_buf[0] = if e.have_left { plane[(y - 1) * stride + x - 1] } else { 129 };
+			above_buf[0] = if e.have_left { plane[(y - 1) * stride + x - 1] } else { P::of(base + 1) };
 		} else {
-			above_buf[..=width].fill(127);
+			above_buf[..=width].fill(P::of(base - 1));
 		}
 	}
 	let top_left = above_buf[0];
 	let above = &above_buf[1..];
 
-	let mut out = [0u8; 32 * 32];
-	let mut put = |c: usize, r: usize, v: u8| out[r * 32 + c] = v;
+	let mut out = [P::default(); 32 * 32];
+	let mut put = |c: usize, r: usize, v: P| out[r * 32 + c] = v;
 	match mode {
 		pm::DC => {
-			let sum_above: u32 = above[..bs].iter().map(|&v| u32::from(v)).sum();
-			let sum_left: u32 = left[..bs].iter().map(|&v| u32::from(v)).sum();
-			let n = bs as u32;
+			let sum_above: i32 = above[..bs].iter().map(|&v| v.into()).sum();
+			let sum_left: i32 = left[..bs].iter().map(|&v| v.into()).sum();
+			let n = bs as i32;
 			let v = match (e.have_left, e.have_top) {
 				(true, true) => (sum_above + sum_left + n) / (2 * n),
 				(true, false) => (sum_left + n / 2) / n,
 				(false, true) => (sum_above + n / 2) / n,
-				(false, false) => 128,
-			} as u8;
+				(false, false) => base,
+			};
+			let v = P::of(v);
 			for r in 0..bs {
 				for c in 0..bs {
 					put(c, r, v);
@@ -138,14 +148,14 @@ pub fn predict(
 		pm::TM => {
 			for r in 0..bs {
 				for c in 0..bs {
-					let v = i32::from(left[r]) + i32::from(above[c]) - i32::from(top_left);
-					put(c, r, v.clamp(0, 255) as u8);
+					let v = left[r].into() + above[c].into() - top_left.into();
+					put(c, r, P::clip(v, max));
 				}
 			}
 		}
 		_ if bs == 4 => predict_4x4(mode, above, top_left, &left, &mut put),
 		pm::D207 => {
-			let mut col = |c: usize, r: usize, v: u8| out[r * 32 + c] = v;
+			let mut col = |c: usize, r: usize, v: P| out[r * 32 + c] = v;
 			for r in 0..bs - 1 {
 				col(0, r, avg2(left[r], left[r + 1]));
 			}
@@ -220,7 +230,7 @@ pub fn predict(
 			}
 		}
 		pm::D135 => {
-			let mut border = [0u8; 63];
+			let mut border = [P::default(); 63];
 			for i in 0..bs - 2 {
 				border[i] = avg3(left[bs - 3 - i], left[bs - 2 - i], left[bs - 1 - i]);
 			}
@@ -263,12 +273,12 @@ pub fn predict(
 
 /// The 4x4 directional predictors, which libvpx specialises (they use the
 /// above-right pixels differently from the larger sizes).
-fn predict_4x4(
+fn predict_4x4<P: Px>(
 	mode: u8,
-	above: &[u8],
-	top_left: u8,
-	left: &[u8],
-	put: &mut impl FnMut(usize, usize, u8),
+	above: &[P],
+	top_left: P,
+	left: &[P],
+	put: &mut impl FnMut(usize, usize, P),
 ) {
 	let (a, b, c, d, e, f, g, h) =
 		(above[0], above[1], above[2], above[3], above[4], above[5], above[6], above[7]);

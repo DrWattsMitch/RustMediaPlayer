@@ -121,7 +121,29 @@ ff -f lavfi -i testsrc2=s=96x64:r=25:d=0.6 -pix_fmt yuv422p -c:v libvpx-vp9 -b:v
 ff -f lavfi -i "testsrc2=s=160x96:r=30:d=0.8,noise=alls=12:allf=t" -c:v libvpx-vp9 -deadline realtime -cpu-used 8 \
 	-aq-mode 3 -error-resilient 1 -b:v 150k vp9/rt_aq_errres_160x96.webm
 ff -f lavfi -i "mandelbrot=s=128x72:r=30" -t 0.6 -pix_fmt yuv420p -c:v libvpx-vp9 -frame-parallel 1 -b:v 120k vp9/frame_parallel_128x72.webm
-for f in vp9/*.webm; do ff -c:v vp9 -i "$f" -f framecrc "${f%.webm}.framecrc"; done
+
+# VP9 profiles 2/3 and scaled references (docs/VP9_HIGH_BITDEPTH_SCALING.md).
+# The libvpx behind FFmpeg must be built with high bit depth.
+ff -f lavfi -i testsrc2=s=176x144:r=25:d=1 -pix_fmt yuv420p10le -c:v libvpx-vp9 -b:v 200k -g 25 -auto-alt-ref 1 -lag-in-frames 10 vp9/p2_420_10bit_176x144.webm
+ff -f lavfi -i "mandelbrot=s=99x61:r=25" -t 0.6 -pix_fmt yuv420p12le -c:v libvpx-vp9 -crf 30 -b:v 0 vp9/p2_420_12bit_99x61.webm
+ff -f lavfi -i testsrc2=s=96x64:r=25:d=0.6 -pix_fmt yuv444p10le -c:v libvpx-vp9 -b:v 150k vp9/p3_444_10bit_96x64.webm
+ff -f lavfi -i "testsrc2=s=96x64:r=25:d=0.6,noise=alls=10:allf=t" -pix_fmt yuv422p12le -c:v libvpx-vp9 -b:v 300k vp9/p3_422_12bit_96x64.webm
+ff -f lavfi -i testsrc2=s=64x48:r=25:d=0.4 -pix_fmt yuv420p10le -c:v libvpx-vp9 -lossless 1 vp9/lossless_10bit_64x48.webm
+ff -f lavfi -i testsrc2=s=512x128:r=25:d=0.4 -pix_fmt yuv420p10le -c:v libvpx-vp9 -b:v 300k -tile-columns 1 -tile-rows 1 vp9/tiles_10bit_512x128.webm
+# Size changes without key frames: libvpx's encoder API driven directly
+# ($LIBVPX: a libvpx.so; PyAV's bundled one is 8-bit only, so the 10-bit
+# stream needs a high-bit-depth build such as Debian/Ubuntu's libvpx).
+raw() { ff -f lavfi -i "testsrc2=s=$1:r=25:d=1$3" -pix_fmt "$2" -f rawvideo "/tmp/rmp_rz_$1_$2.yuv"; }
+for s in 176x144 132x108 88x72 131x77; do raw $s yuv420p; done
+for s in 128x96 96x72 64x48 100x75; do raw $s yuv444p ",noise=alls=6:allf=t"; done
+for s in 160x96 120x72 80x48 104x60; do raw $s yuv420p10le ",noise=alls=5:allf=t"; done
+rz() { out=$1 fmt=$2 pix=$3; shift 3; args=(); for seg in "$@"; do args+=("$seg:/tmp/rmp_rz_${seg%%:*}_$pix.yuv"); done
+	python3 -I ../../tools/vp9_resize_enc.py "$LIBVPX" /tmp/rmp_rz.ivf "$fmt" "${args[@]}" && ff -i /tmp/rmp_rz.ivf -c copy "vp9/$out.webm"; }
+rz resize_420_176x144 8 yuv420p 176x144:6 132x108:5 88x72:5 176x144:5 131x77:5
+rz resize_444_128x96 8:444 yuv444p 128x96:5 96x72:4 64x48:4 100x75:4
+rz resize_10bit_160x96 10 yuv420p10le 160x96:5 120x72:4 80x48:4 160x96:4 104x60:4
+# -autoscale 0 keeps each frame at its own size.
+for f in vp9/*.webm; do ff -c:v vp9 -i "$f" -autoscale 0 -f framecrc "${f%.webm}.framecrc"; done
 
 # Opus decoder references: libopus through FFmpeg, pre-skip kept.
 ff -i /tmp/rmp_voice_mono.wav -t 1 -ar 8000 -c:a libopus -b:a 8k -application voip opus/silk_nb_mono.webm

@@ -164,6 +164,10 @@ fn vp9_decoder_survives_corrupted_frames() {
 		"lossless_64x48",
 		"tiles_512x128",
 		"rt_aq_errres_160x96",
+		"p2_420_10bit_176x144",
+		"p3_422_12bit_96x64",
+		"resize_420_176x144",
+		"resize_10bit_160x96",
 	];
 	let mut rng = Rng::new(seed() ^ 17);
 	for (n, name) in names.iter().enumerate() {
