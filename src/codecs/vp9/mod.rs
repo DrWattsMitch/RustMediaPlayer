@@ -26,6 +26,7 @@
 //! See `docs/VORBIS_VP9.md`.
 
 pub mod decoder;
+pub mod encoder;
 pub mod header;
 mod inter;
 mod intra;
@@ -40,6 +41,7 @@ mod tables;
 mod transform;
 
 pub use decoder::{DecodedPicture, Picture, Plane, Vp9Decoder, Vp9DecoderState};
+pub use encoder::{Vp9Encoder, Vp9EncoderState};
 
 /// Block sizes (`BLOCK_SIZE`), in libvpx order.
 pub(crate) mod bs {

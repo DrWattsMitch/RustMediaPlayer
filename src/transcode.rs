@@ -78,6 +78,8 @@ pub struct Options {
 	pub video_bitrate: Option<u32>,
 	/// `-qp`: constant H.264 quantiser (0-51).
 	pub qp: Option<u8>,
+	/// `-crf`: VP9 / AV1 quantizer on libvpx's and libaom's 0-63 scale.
+	pub crf: Option<u8>,
 	/// `-g`: H.264 keyframe interval in frames.
 	pub gop: Option<u32>,
 	/// `-profile:v`: H.264 profile (baseline, main, high).
@@ -169,6 +171,7 @@ impl Options {
 					| "-b:v"
 					| "-vb"
 					| "-qp"
+					| "-crf"
 					| "-g"
 					| "-profile:v"
 					| "-vprofile"
@@ -211,7 +214,13 @@ impl Options {
 			}
 			"-c:v" | "-vcodec" => {
 				let v = need()?;
-				self.video_codec = Some(if v == "libx264" { "h264" } else { v }.to_string());
+				let v = match v {
+					"libx264" => "h264",
+					"libvpx-vp9" => "vp9",
+					"libaom-av1" | "libsvtav1" | "librav1e" => "av1",
+					v => v,
+				};
+				self.video_codec = Some(v.to_string());
 			}
 			"-c:s" | "-scodec" => self.subtitle_codec = Some(need()?.to_string()),
 			"-c" | "-codec" => {
@@ -264,6 +273,16 @@ impl Options {
 						.ok()
 						.filter(|&q| q <= 51)
 						.ok_or_else(|| format!("-qp must be 0-51: {v}"))?,
+				);
+			}
+			"-crf" => {
+				let v = need()?;
+				let n = number(v)?;
+				self.crf = Some(
+					u8::try_from(n)
+						.ok()
+						.filter(|&q| q <= 63)
+						.ok_or_else(|| format!("-crf must be 0-63: {v}"))?,
 				);
 			}
 			"-g" => {
@@ -812,6 +831,17 @@ fn transcode_with(input: &str, output: &str, options: &Options, threads: usize) 
 				let yuv420 = options.pixel.as_ref().is_none_or(|p| p.name() == "yuv420p");
 				let default = match ext.as_str() {
 					"y4m" => "rawvideo",
+					// WebM holds VP8, VP9 and AV1 only.
+					"webm"
+						if (options.converts_video()
+							|| options.video_bitrate.is_some()
+							|| options.crf.is_some()
+							|| !matroska_holds(stream, true))
+							&& resolver.has_decoder(&codec_in) =>
+					{
+						"vp9"
+					}
+					_ if options.crf.is_some() => "vp9",
 					_ if options.video_bitrate.is_some() || options.qp.is_some() => "h264",
 					// MP4 can't hold the codec (VP9 from WebM, say): decode and
 					// re-encode when RMP has a decoder.
@@ -839,8 +869,14 @@ fn transcode_with(input: &str, output: &str, options: &Options, threads: usize) 
 					routes.insert(stream.id, Route::Copy { out: out_id });
 					summary.streams.push(format!("stream {}: video {codec_in} (copy)", stream.id.0));
 				} else {
-					if codec != "rawvideo" && codec != "h264" {
-						return Err(Message::Codec("RMP encodes h264 and rawvideo (or use -c:v copy)"));
+					if !matches!(codec.as_str(), "rawvideo" | "h264" | "vp9" | "av1") {
+						return Err(Message::Codec(
+							"RMP encodes h264, vp9, av1 and rawvideo (or use -c:v copy)",
+						));
+					}
+					#[cfg(not(feature = "av1"))]
+					if codec == "av1" {
+						return Err(Message::Codec("this build has no AV1 support (feature `av1`)"));
 					}
 					if !resolver.has_decoder(&codec_in) {
 						return Err(Message::Codec(
@@ -858,11 +894,13 @@ fn transcode_with(input: &str, output: &str, options: &Options, threads: usize) 
 					}
 					let p = &stream.parameters;
 					let (w, h) = options.size.unwrap_or((p.width.unwrap_or(0), p.height.unwrap_or(0)));
-					let pixel = if codec == "h264" {
-						// The encoder takes 8-bit 4:2:0.
+					let pixel = if codec != "rawvideo" {
+						// The encoders take 8-bit 4:2:0.
 						let yuv420p = Pixel::from_name("yuv420p").unwrap_or_default();
 						if options.pixel.as_ref().is_some_and(|p| *p != yuv420p) {
-							return Err(Message::Codec("the h264 encoder supports only -pix_fmt yuv420p"));
+							return Err(Message::Codec(
+								"the h264, vp9 and av1 encoders support only -pix_fmt yuv420p",
+							));
 						}
 						yuv420p
 					} else {
@@ -895,6 +933,17 @@ fn transcode_with(input: &str, output: &str, options: &Options, threads: usize) 
 						out.parameters.extradata = h264.extradata(&out.parameters)?;
 						out.parameters.bitrate = options.video_bitrate;
 						Box::new(h264)
+					} else if codec == "vp9" {
+						out.parameters.bitrate = options.video_bitrate;
+						Box::new(
+							crate::codecs::vp9::Vp9Encoder::new(out_id)
+								.with_rate(options.crf, options.video_bitrate)
+								.with_gop(options.gop)
+								.with_time_base(out.time_base),
+						)
+					} else if codec == "av1" {
+						out.parameters.bitrate = options.video_bitrate;
+						av1_encoder(out_id, options, &mut out)?
 					} else {
 						resolver.encoder_for(&out).ok_or("no encoder")?
 					};
@@ -947,6 +996,22 @@ fn transcode_with(input: &str, output: &str, options: &Options, threads: usize) 
 	summary.frames = frames;
 	summary.packets = packets;
 	Ok(summary)
+}
+
+/// The AV1 encoder for an output stream (sets its `av1C` extradata).
+#[cfg(feature = "av1")]
+fn av1_encoder(out_id: StreamId, options: &Options, out: &mut Stream) -> Result<Box<dyn Encoder>> {
+	let enc = crate::codecs::av1::encoder::Av1Encoder::new(out_id)
+		.with_rate(options.crf, options.video_bitrate)
+		.with_gop(options.gop)
+		.with_time_base(out.time_base);
+	out.parameters.extradata = enc.extradata(&out.parameters)?;
+	Ok(Box::new(enc))
+}
+
+#[cfg(not(feature = "av1"))]
+fn av1_encoder(_: StreamId, _: &Options, _: &mut Stream) -> Result<Box<dyn Encoder>> {
+	Err(Message::Codec("this build has no AV1 support (feature `av1`)"))
 }
 
 /// What the decode stage hands to the encode stage, in input order.

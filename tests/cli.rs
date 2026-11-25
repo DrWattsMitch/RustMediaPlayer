@@ -115,7 +115,7 @@ fn refuses_to_overwrite_and_cleans_up_failures() {
 	assert!(rmp(&["-y", "-i", &input, out.to_str().unwrap()]).0);
 
 	let bad = tmp(&dir, "bad.webm");
-	let (ok, _, err) = rmp(&["-i", &input, bad.to_str().unwrap()]);
+	let (ok, _, err) = rmp(&["-i", &input, "-c:v", "copy", bad.to_str().unwrap()]);
 	assert!(!ok && err.contains("webm only holds"), "{err}");
 	assert!(!bad.exists(), "failed output removed");
 
@@ -426,4 +426,26 @@ fn vp8_alac_and_text_subtitles_convert() {
 	assert_eq!(text(srt.to_str().unwrap()), text(&fixture("subtitles/sample.srt")));
 	assert!(rmp(&["-i", &fixture("subtitles/sample.ass"), ass.to_str().unwrap()]).0);
 	assert_eq!(kinds(&ass), [(StreamKind::Subtitle, "ass".to_string())]);
+}
+
+#[test]
+fn encodes_vp9_and_av1_with_crf() {
+	let dir = tempfile::tempdir().unwrap();
+	let input = fixture("y4m/yuv420p_34x18.y4m");
+	let mut cases = vec![("vp9", "v.webm"), ("libvpx-vp9", "v.mkv")];
+	if cfg!(feature = "av1") {
+		cases.extend([("av1", "a.mkv"), ("libaom-av1", "a.mp4"), ("av1", "a.webm")]);
+	}
+	for (codec, name) in cases {
+		let out = tmp(&dir, name);
+		let (ok, _, err) =
+			rmp(&["-i", &input, "-c:v", codec, "-crf", "20", "-g", "2", out.to_str().unwrap()]);
+		assert!(ok, "{codec} -> {name}: {err}");
+		let input = Input::open(out.to_str().unwrap()).unwrap();
+		let p = &input.streams().streams[0].parameters;
+		assert_eq!((p.width, p.height), (Some(34), Some(18)), "{name}");
+	}
+	let (ok, _, err) =
+		rmp(&["-i", &input, "-c:v", "vp9", "-crf", "64", tmp(&dir, "x.webm").to_str().unwrap()]);
+	assert!(!ok, "crf 64 should be rejected: {err}");
 }

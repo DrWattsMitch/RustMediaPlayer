@@ -64,7 +64,7 @@ impl ModeInfo {
 	}
 
 	/// Luma mode of sub-block `b` (`get_y_mode`).
-	fn y_mode(&self, b: usize) -> u8 {
+	pub(super) fn y_mode(&self, b: usize) -> u8 {
 		if self.sb_type < bs::B8X8 { self.sub_modes[b] } else { self.mode }
 	}
 }
@@ -78,7 +78,7 @@ pub struct MvRef {
 
 /// Neighbour positions (row, col) searched for candidate motion vectors,
 /// by block size (`mv_ref_blocks`).
-const MV_REF_BLOCKS: [[(i8, i8); 8]; 13] = [
+pub(super) const MV_REF_BLOCKS: [[(i8, i8); 8]; 13] = [
 	[(-1, 0), (0, -1), (-1, -1), (-2, 0), (0, -2), (-2, -1), (-1, -2), (-2, -2)],
 	[(-1, 0), (0, -1), (-1, -1), (-2, 0), (0, -2), (-2, -1), (-1, -2), (-2, -2)],
 	[(-1, 0), (0, -1), (-1, -1), (-2, 0), (0, -2), (-2, -1), (-1, -2), (-2, -2)],
@@ -104,11 +104,11 @@ const COUNTER_TO_CONTEXT: [u8; 19] = [2, 3, 4, 1, 3, 9, 0, 9, 9, 5, 5, 9, 5, 9, 
 /// uses: `[block][neighbour is left]` (`idx_n_column_to_subblock`).
 const IDX_N_COLUMN_TO_SUBBLOCK: [[usize; 2]; 4] = [[1, 2], [1, 3], [3, 2], [3, 3]];
 
-fn use_mv_hp(mv: Mv) -> bool {
+pub(super) fn use_mv_hp(mv: Mv) -> bool {
 	i32::from(mv.row).abs() < 64 && i32::from(mv.col).abs() < 64
 }
 
-fn lower_mv_precision(mv: &mut Mv, allow_hp: bool) {
+pub(super) fn lower_mv_precision(mv: &mut Mv, allow_hp: bool) {
 	if !(allow_hp && use_mv_hp(*mv)) {
 		if mv.row & 1 != 0 {
 			mv.row += if mv.row > 0 { -1 } else { 1 };
@@ -120,11 +120,11 @@ fn lower_mv_precision(mv: &mut Mv, allow_hp: bool) {
 }
 
 impl<P: super::pixel::Px> FrameDecoder<P> {
-	fn above_mi(&self, p: &BlockPos) -> Option<ModeInfo> {
+	pub(super) fn above_mi(&self, p: &BlockPos) -> Option<ModeInfo> {
 		p.have_above.then(|| self.mi[(p.row - 1) * self.mi_cols + p.col])
 	}
 
-	fn left_mi(&self, p: &BlockPos) -> Option<ModeInfo> {
+	pub(super) fn left_mi(&self, p: &BlockPos) -> Option<ModeInfo> {
 		p.have_left.then(|| self.mi[p.row * self.mi_cols + p.col - 1])
 	}
 
@@ -410,7 +410,11 @@ impl<P: super::pixel::Px> FrameDecoder<P> {
 
 	// --- Reference frames (vp9_pred_common.c) ---
 
-	fn reference_mode_context(&self, above: Option<ModeInfo>, left: Option<ModeInfo>) -> usize {
+	pub(super) fn reference_mode_context(
+		&self,
+		above: Option<ModeInfo>,
+		left: Option<ModeInfo>,
+	) -> usize {
 		let fixed = self.ch.comp_fixed_ref;
 		match (above, left) {
 			(Some(a), Some(l)) => {
@@ -435,7 +439,7 @@ impl<P: super::pixel::Px> FrameDecoder<P> {
 		}
 	}
 
-	fn comp_ref_context(&self, above: Option<ModeInfo>, left: Option<ModeInfo>) -> usize {
+	pub(super) fn comp_ref_context(&self, above: Option<ModeInfo>, left: Option<ModeInfo>) -> usize {
 		let fixed = self.ch.comp_fixed_ref;
 		let var = self.ch.comp_var_ref;
 		let fix_idx = usize::from(self.h.sign_bias[fixed as usize]);
@@ -497,7 +501,7 @@ impl<P: super::pixel::Px> FrameDecoder<P> {
 		}
 	}
 
-	fn single_ref_p1_context(above: Option<ModeInfo>, left: Option<ModeInfo>) -> usize {
+	pub(super) fn single_ref_p1_context(above: Option<ModeInfo>, left: Option<ModeInfo>) -> usize {
 		let has_last = |m: &ModeInfo| m.ref_frame[0] == LAST_FRAME || m.ref_frame[1] == LAST_FRAME;
 		match (above, left) {
 			(Some(a), Some(l)) => {
@@ -542,7 +546,7 @@ impl<P: super::pixel::Px> FrameDecoder<P> {
 		}
 	}
 
-	fn single_ref_p2_context(above: Option<ModeInfo>, left: Option<ModeInfo>) -> usize {
+	pub(super) fn single_ref_p2_context(above: Option<ModeInfo>, left: Option<ModeInfo>) -> usize {
 		let has_golden =
 			|m: &ModeInfo| m.ref_frame[0] == GOLDEN_FRAME || m.ref_frame[1] == GOLDEN_FRAME;
 		match (above, left) {
@@ -659,7 +663,7 @@ impl<P: super::pixel::Px> FrameDecoder<P> {
 		pm::NEARESTMV + m
 	}
 
-	fn mi_at(&self, p: &BlockPos, (dr, dc): (i8, i8)) -> Option<ModeInfo> {
+	pub(super) fn mi_at(&self, p: &BlockPos, (dr, dc): (i8, i8)) -> Option<ModeInfo> {
 		let row = p.row as isize + isize::from(dr);
 		let col = p.col as isize + isize::from(dc);
 		let inside = row >= 0
@@ -669,7 +673,7 @@ impl<P: super::pixel::Px> FrameDecoder<P> {
 		inside.then(|| self.mi[row as usize * self.mi_cols + col as usize])
 	}
 
-	fn mode_context(&self, p: &BlockPos, sb_type: u8) -> usize {
+	pub(super) fn mode_context(&self, p: &BlockPos, sb_type: u8) -> usize {
 		let search = &MV_REF_BLOCKS[usize::from(sb_type)];
 		let counter: usize = search[..2]
 			.iter()
@@ -689,7 +693,7 @@ impl<P: super::pixel::Px> FrameDecoder<P> {
 
 	/// Candidate motion vectors for `ref_frame` (`dec_find_mv_refs`).
 	/// Returns the list and how many entries are meaningful.
-	fn find_mv_refs(
+	pub(super) fn find_mv_refs(
 		&self,
 		p: &BlockPos,
 		sb_type: u8,

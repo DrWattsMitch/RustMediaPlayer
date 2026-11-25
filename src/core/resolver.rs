@@ -84,7 +84,7 @@ impl Resolver {
 	}
 
 	/// Picks an encoder producing the stream's codec. PCM codecs, FLAC, AAC,
-	/// Opus and H.264 (AAC, Opus and H.264 at `parameters.bitrate`, if set) get a real
+	/// Opus, H.264, VP9 and AV1 (all but FLAC at `parameters.bitrate`, if set) get a real
 	/// encoder; everything else falls back to raw pass-through.
 	pub fn encoder_for(&self, stream: &Stream) -> Option<Box<dyn Encoder>> {
 		if let Some(encoder) = pcm::PcmEncoder::for_id(stream.id, &stream.parameters.codec.id) {
@@ -103,6 +103,20 @@ impl Resolver {
 			"h264" => {
 				let bitrate = stream.parameters.bitrate.filter(|&b| b > 0);
 				let encoder = h264::H264Encoder::new(stream.id)
+					.with_rate(None, bitrate)
+					.with_time_base(stream.time_base);
+				return Some(Box::new(encoder));
+			}
+			"vp9" => {
+				let bitrate = stream.parameters.bitrate.filter(|&b| b > 0);
+				let encoder =
+					vp9::Vp9Encoder::new(stream.id).with_rate(None, bitrate).with_time_base(stream.time_base);
+				return Some(Box::new(encoder));
+			}
+			#[cfg(feature = "av1")]
+			"av1" => {
+				let bitrate = stream.parameters.bitrate.filter(|&b| b > 0);
+				let encoder = crate::codecs::av1::encoder::Av1Encoder::new(stream.id)
 					.with_rate(None, bitrate)
 					.with_time_base(stream.time_base);
 				return Some(Box::new(encoder));

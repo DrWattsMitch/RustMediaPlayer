@@ -877,6 +877,21 @@ fn idct32(input: &[i32], output: &mut [i32]) {
 
 type Transform1d = fn(&[i32], &mut [i32]);
 
+/// One 8-bit 1-D inverse transform of `n` (4, 8, 16 or 32) points, DCT or
+/// (below 32) ADST. The encoder measures the basis it must invert from it.
+pub(super) fn inverse_1d(n: usize, adst: bool, input: &[i32], output: &mut [i32]) {
+	let t: Transform1d = match (n, adst) {
+		(4, false) => idct4,
+		(4, true) => iadst4,
+		(8, false) => idct8,
+		(8, true) => iadst8,
+		(16, false) => idct16,
+		(16, true) => iadst16,
+		_ => idct32,
+	};
+	t(input, output);
+}
+
 use super::pixel::Px;
 
 #[inline]

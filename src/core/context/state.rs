@@ -43,10 +43,13 @@ pub enum CodecPrivate {
 	Vorbis(Box<crate::codecs::vorbis::VorbisDecoderState>),
 	Vp8(Box<crate::codecs::vp8::Vp8DecoderState>),
 	Vp9(Box<crate::codecs::vp9::Vp9DecoderState>),
+	Vp9Encoder(Box<crate::codecs::vp9::Vp9EncoderState>),
 	Ac3(Box<crate::codecs::ac3::Ac3DecoderState>),
 	Hevc(Box<crate::codecs::hevc::HevcDecoderState>),
 	#[cfg(feature = "av1")]
 	Av1(Box<crate::codecs::av1::Av1DecoderState>),
+	#[cfg(feature = "av1")]
+	Av1Encoder(Box<crate::codecs::av1::encoder::Av1EncoderState>),
 }
 
 #[derive(Debug, Clone)]

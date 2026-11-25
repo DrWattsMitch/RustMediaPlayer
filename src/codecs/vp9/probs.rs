@@ -231,7 +231,7 @@ impl Counts {
 }
 
 /// Magnitude class of `z = |v| - 1` (`vp9_get_mv_class`).
-fn mv_class(z: usize) -> usize {
+pub(super) fn mv_class(z: usize) -> usize {
 	if z >= 2 * 4096 {
 		return 10;
 	}
@@ -286,6 +286,11 @@ pub fn diff_update(r: &mut BoolDecoder, p: &mut u8) {
 		let v = r.literal(7);
 		(if v < 65 { v } else { (v << 1) - 65 + u32::from(r.bit()) }) + 64
 	};
+	apply_diff(p, d);
+}
+
+/// Applies a decoded update code `d` to `p` (`inv_remap_prob`).
+pub fn apply_diff(p: &mut u8, d: u32) {
 	let v = i32::from(INV_MAP[(d as usize).min(254)]);
 	let m = i32::from(*p);
 	*p = if m <= 128 {

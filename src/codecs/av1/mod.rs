@@ -7,6 +7,7 @@
 //! frames. Enabled by the default `av1` feature.
 
 mod dav1d;
+pub mod encoder;
 
 pub use dav1d::{Layout, Picture};
 

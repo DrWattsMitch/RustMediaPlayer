@@ -65,7 +65,7 @@ pub struct Picture<P = u8> {
 }
 
 impl<P: Px> Picture<P> {
-	fn new(
+	pub(super) fn new(
 		pool: &VecPool<P>,
 		width: u32,
 		height: u32,
@@ -340,7 +340,7 @@ pub struct FrameDecoder<P = u8> {
 	pub mi_cols: usize,
 	pub mi: Vec<ModeInfo>,
 	/// Loop filter inputs per 8x8 cell.
-	lf_cells: Vec<loopfilter::LfCell>,
+	pub(super) lf_cells: Vec<loopfilter::LfCell>,
 	pub cur_mvs: Vec<MvRef>,
 	pub prev_mvs: Option<Arc<Vec<MvRef>>>,
 	pub seg_map: Vec<u8>,
@@ -348,27 +348,27 @@ pub struct FrameDecoder<P = u8> {
 	pub counts: Box<Counts>,
 	pub counting: bool,
 	pub tile: TileBounds,
-	above_nz: [Vec<u8>; 3],
-	left_nz: [[u8; 16]; 3],
-	above_partition: Vec<u8>,
-	left_partition: [u8; 8],
-	pic: Picture<P>,
-	refs: [Option<Arc<Picture<P>>>; 3],
+	pub(super) above_nz: [Vec<u8>; 3],
+	pub(super) left_nz: [[u8; 16]; 3],
+	pub(super) above_partition: Vec<u8>,
+	pub(super) left_partition: [u8; 8],
+	pub(super) pic: Picture<P>,
+	pub(super) refs: [Option<Arc<Picture<P>>>; 3],
 	/// Scale factors of the three references.
-	ref_scale: [RefScale; 3],
-	bit_depth: u8,
+	pub(super) ref_scale: [RefScale; 3],
+	pub(super) bit_depth: u8,
 	/// Largest sample value, `(1 << bit_depth) - 1`.
-	max: i32,
+	pub(super) max: i32,
 	/// `[segment][luma, chroma][dc, ac]`.
-	dequant: [[[i16; 2]; 2]; 8],
+	pub(super) dequant: [[[i16; 2]; 2]; 8],
 	/// Loop filter level `[segment][ref frame][mode delta]`.
-	lf_table: [[[u8; 2]; 4]; 8],
-	coefs: Vec<i32>,
-	scratch: inter::Scratch<P>,
+	pub(super) lf_table: [[[u8; 2]; 4]; 8],
+	pub(super) coefs: Vec<i32>,
+	pub(super) scratch: inter::Scratch<P>,
 }
 
 impl<P: Px> FrameDecoder<P> {
-	fn plane_ss(&self, plane: usize) -> (usize, usize) {
+	pub(super) fn plane_ss(&self, plane: usize) -> (usize, usize) {
 		if plane == 0 { (0, 0) } else { (self.pic.ss_x, self.pic.ss_y) }
 	}
 
@@ -809,7 +809,7 @@ impl<P: Px> FrameDecoder<P> {
 		Ok(())
 	}
 
-	fn loop_filter(&mut self) {
+	pub(super) fn loop_filter(&mut self) {
 		let thr = loopfilter::thresholds(self.h.sharpness);
 		let mut mi_row = 0;
 		while mi_row < self.mi_rows {
@@ -1206,7 +1206,7 @@ impl Vp9DecoderState {
 impl<P: Px> FrameDecoder<P> {
 	/// Per-segment quantizers and loop filter levels
 	/// (`setup_segmentation_dequant`, `vp9_loop_filter_frame_init`).
-	fn setup_segment_tables(&mut self, persistent: &Persistent) {
+	pub(super) fn setup_segment_tables(&mut self, persistent: &Persistent) {
 		let h = &self.h;
 		let seg = &self.seg;
 		let q = |base: i32, delta: i8, table: &[i16; 256]| {
